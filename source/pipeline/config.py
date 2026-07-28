@@ -280,7 +280,7 @@ class RecordingSettings:
     jpeg_quality: int = 90
     chunks_size: int = 1000
     # front/wrist 由 IsaacLab runtime 采集；overview 可由固定相机或展示录像器保存。
-    camera_keys: tuple[str, ...] = ("front", "wrist", "overview")
+    camera_keys: tuple[str, ...] = ("front", "wrist")
     primary_camera_key: str = "front"
     overview_camera_prim_path: str = DEFAULT_OVERVIEW_CAMERA_PRIM_PATH
     save_raw_images: bool = True

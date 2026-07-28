@@ -29,8 +29,10 @@ $ISAAC_PYTHON -B scripts/pipeline/run_full_physics_pipeline.py \
 - `liangzhu`：从 box1 拿起可乐并放到 box2；PCT identity 坐标，默认联合随机化。
 - `multi_floor`：别墅 F1 到 F2 苹果搬运；保留楼梯锚点、阶段相机和原 locomotion 逻辑。
 
-两个 profile 均默认开启 `composite` 展示视频：overview 位于左侧 2/3，front
-和 wrist 分别在右上/右下，三路来自同一 simulation step，默认 1280×720、25 fps。
+默认只采集 `front` 和 `wrist` 训练相机，不制作展示视频。需要 overview 训练视角
+和 `composite` 展示视频时显式传 `--overview`；composite 中 overview 位于左侧
+2/3，front 和 wrist 分别在右上/右下，三路来自同一 simulation step，默认
+1280×720、25 fps。
 
 ## 良渚随机化
 

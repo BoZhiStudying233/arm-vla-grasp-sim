@@ -307,12 +307,19 @@ def _build_parser() -> argparse.ArgumentParser:
         help="是否使用 ANSI 颜色打印 batch 进度；默认开启，可用 --no-color 关闭。",
     )
     parser.add_argument(
+        "--overview",
+        action="store_true",
+        help=(
+            "启用 overview 数采视角并制作展示视频；默认不采集 overview，"
+            "也不制作视频。"
+        ),
+    )
+    parser.add_argument(
         "--record-video",
         action=argparse.BooleanOptionalAction,
         default=None,
         help=(
-            "转发视频录制开关；完整 pipeline 默认录制 composite，"
-            "可用 --no-record-video 显式关闭。"
+            "转发低层视频录制开关；默认关闭。日常数采建议使用 --overview。"
         ),
     )
     parser.add_argument(
@@ -320,7 +327,10 @@ def _build_parser() -> argparse.ArgumentParser:
         nargs="+",
         choices=("front", "wrist", "overview"),
         default=None,
-        help="转发训练数据相机流；默认由单 episode pipeline 使用 front wrist overview。",
+        help=(
+            "转发训练数据相机流；默认由单 episode pipeline 使用 front wrist，"
+            "传 --overview 时自动追加 overview。"
+        ),
     )
     parser.add_argument(
         "--video-mode",
@@ -1024,6 +1034,8 @@ def _build_child_command(
     ]
     if args.task_json:
         command.extend(["--task-json", str(_project_path(args.task_json))])
+    if args.overview:
+        command.append("--overview")
     if args.dataset_camera_keys is not None:
         command.append("--dataset-camera-keys")
         command.extend(str(value) for value in args.dataset_camera_keys)
@@ -1379,6 +1391,18 @@ def _summary_elapsed_seconds(summary: dict[str, object] | None) -> float:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parse_args(argv)
+    if (
+        args.dataset_camera_keys is not None
+        and "overview" in args.dataset_camera_keys
+        and not args.overview
+    ):
+        raise SystemExit("--dataset-camera-keys overview 需要同时传 --overview。")
+    if args.record_video is True and not args.overview:
+        raise SystemExit("--record-video 需要同时传 --overview。")
+    if args.overview and args.record_video is False:
+        raise SystemExit("--overview 会制作视频，请不要同时传 --no-record-video。")
+    if args.record_video is None:
+        args.record_video = bool(args.overview)
     if args.num_episodes < 1:
         raise SystemExit("--num-episodes must be positive.")
     if not args.headless and args.num_episodes > 1:

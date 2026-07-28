@@ -184,7 +184,7 @@ class LeRobotRecordingConfig:
     image_width: int = 640
     jpeg_quality: int = 90
     chunks_size: int = 1000
-    camera_keys: tuple[str, ...] = ("front", "wrist", "overview")
+    camera_keys: tuple[str, ...] = ("front", "wrist")
     primary_camera_key: str = "front"
     save_raw_images: bool = True
     debug_per_episode_lerobot: bool = True

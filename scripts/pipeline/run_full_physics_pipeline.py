@@ -474,12 +474,20 @@ def _build_parser() -> argparse.ArgumentParser:
         help="camera light 的 SphereLight 半径。",
     )
     parser.add_argument(
+        "--overview",
+        action="store_true",
+        help=(
+            "启用 overview 数采视角并制作展示视频；默认不采集 overview，"
+            "也不制作视频。"
+        ),
+    )
+    parser.add_argument(
         "--record-video",
         action=argparse.BooleanOptionalAction,
         default=None,
         help=(
-            "启用展示视频；完整 pipeline 默认录制 overview/front/wrist "
-            "三视角拼接视频，可用 --no-record-video 关闭。"
+            "低层视频录制开关；默认关闭。日常数采建议使用 --overview 同时启用 "
+            "overview 数据相机和展示视频。"
         ),
     )
     parser.add_argument(
@@ -492,10 +500,10 @@ def _build_parser() -> argparse.ArgumentParser:
         "--dataset-camera-keys",
         nargs="+",
         choices=("front", "wrist", "overview"),
-        default=list(RecordingSettings().camera_keys),
+        default=None,
         help=(
-            "训练数据相机流，默认 front wrist overview；至少包含 front。"
-            "可用于隔离特定渲染后端问题。"
+            "训练数据相机流，默认 front wrist；传 --overview 时自动追加 "
+            "overview。可用于隔离特定渲染后端问题。"
         ),
     )
     parser.add_argument(
@@ -1018,10 +1026,22 @@ def _resolve_runtime_defaults(args: argparse.Namespace) -> argparse.Namespace:
         raise SystemExit("--stair-locomotion-smoke 只支持 PCT 全局规划器。")
     if args.keep_window_open is None:
         args.keep_window_open = bool(stair_locomotion_smoke and not args.headless)
+    if (
+        args.dataset_camera_keys is not None
+        and "overview" in args.dataset_camera_keys
+        and not args.overview
+    ):
+        raise SystemExit("--dataset-camera-keys overview 需要同时传 --overview。")
+    if args.record_video is True and not args.overview:
+        raise SystemExit("--record-video 需要同时传 --overview。")
+    if args.overview and args.record_video is False:
+        raise SystemExit("--overview 会制作视频，请不要同时传 --no-record-video。")
+    if args.dataset_camera_keys is None:
+        args.dataset_camera_keys = ["front", "wrist"]
+    if args.overview and "overview" not in args.dataset_camera_keys:
+        args.dataset_camera_keys = [*args.dataset_camera_keys, "overview"]
     if args.record_video is None:
-        args.record_video = bool(
-            str(args.mode) == "full_physics" or stair_locomotion_smoke
-        )
+        args.record_video = bool(args.overview)
     args.runtime_preset = f"scene_profile:{profile.name}"
 
     if args.check_scene_assets:

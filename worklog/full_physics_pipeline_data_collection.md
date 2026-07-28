@@ -84,10 +84,10 @@ smoke 模式会截断或替换其中一部分阶段。例如 `--navigation-smoke
 - `frames.jsonl`: 每个 pipeline step 的轻量诊断帧，不把像素直接写入 JSONL。
 - `data.csv`: DWA 兼容的人工可读采样表，包含 base、TCP、关节、action、图片路径和 pipeline_state。
 - `samples.jsonl`: LeRobot 原始样本，每条含 state、action、object_state、tcp_pose、camera frame metadata、action semantics。
-- `images/<camera_key>/*.jpg`: 原始图片，默认相机为 `front`、`wrist`、`overview`。
+- `images/<camera_key>/*.jpg`: 原始图片，默认相机为 `front`、`wrist`；传 `--overview` 时追加 `overview`。
 - `recording_videos/*.mp4`: LeRobot video feature 的 staging 视频。
 - `summary.json`: 最终成功、失败、训练质量门禁、LeRobot export、性能报告和关键路径汇总。
-- `overview_videos/*.mp4`: 如果启用 `--record-video`，保存展示视频；默认 full-physics 为 composite 三视角视频。
+- `overview_videos/*.mp4`: 传 `--overview` 时保存展示视频；默认不制作视频。
 
 full-physics 实际使用的是 `source.recording.JsonlEpisodeRecorder` 和 `source.recording.lerobot_dataset.DwaEpisodeWriter`。`source.data.episode_recorder.EpisodeRecorder` 是更早的 phase CSV/image recorder，不是当前 full-physics 主采集路径。
 
@@ -156,7 +156,7 @@ python -B scripts/pipeline/run_full_physics_pipeline.py \
   --seed 5000 \
   --headless \
   --record-dataset \
-  --record-video
+  --overview
 ```
 
 如果只想快速验证流程，不保存训练数据：
@@ -229,7 +229,7 @@ python -B scripts/pipeline/run_full_physics_batch.py \
   --seed 7000 \
   --headless \
   --record-dataset \
-  --record-video \
+  --overview \
   --video-mode composite
 ```
 
@@ -323,7 +323,8 @@ python -B scripts/pipeline/validate_lerobot_episode.py \
 
 相机与数据：
 
-- `--dataset-camera-keys front wrist overview`
+- `--overview`
+- `--dataset-camera-keys front wrist`
 - `--record-dataset` / `--no-record-dataset`
 - `--record-video` / `--no-record-video`
 - `--video-mode overview|front|wrist|composite|all`
@@ -369,4 +370,3 @@ python -B scripts/pipeline/validate_lerobot_episode.py \
 4. 用 3 到 5 条 full-physics 小批量检查 `summary.json`、视频和 `samples.jsonl`。
 5. 固定通过的小批配置，使用 `run_full_physics_batch.py --num-episodes N --seed S` 批采。
 6. 只把 `success=true` 且 `training_quality_gate_passed=true` 的 episode 纳入训练。
-

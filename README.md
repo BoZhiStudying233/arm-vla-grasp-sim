@@ -298,7 +298,9 @@ $ISAAC_PYTHON -B scripts/pipeline/run_full_physics_pipeline.py \
   --headless
 ```
 
-默认会导出 LeRobot 三路相机与同步`overview + front + wrist` composite MP4。当前 8 GB RTX 4060 Laptop 实测中，
+默认会导出 LeRobot `front + wrist` 两路训练相机，不制作展示视频；显式传
+`--overview` 时才追加 overview 训练相机并输出同步 `overview + front + wrist`
+composite MP4。当前 8 GB RTX 4060 Laptop 实测中，
 `full` 能够加载 Gaussian/NUREC 并启动 PhysX，但首帧 headless 三相机渲染会触发 `cudaErrorIllegalAddress (700)`，因此 profile 的量产默认保持`collision`。这不是 CUDA 不可用；GUI 可显式使用 `full` 调试，两种视觉来源不应无标记混合。
 
 
@@ -326,7 +328,9 @@ $ISAAC_PYTHON -B scripts/pipeline/run_full_physics_pipeline.py \
 
 该 smoke 会关闭 stair-float，只测试低层 policy 的纯物理楼梯执行。dog-only policy 可能报告 `stair_locomotion_stalled`。默认多楼层 pipeline 启用stair-float，该模式的结果不等同于纯物理跨层 locomotion 成功。
 
-full-physics 默认保存 LeRobot 数据，并录制 profile 指定的视频流。如果只做物理诊断，可以添加 `--no-record-dataset --no-record-video` 减少磁盘占用。
+full-physics 默认保存 LeRobot 数据，但只采集 `front/wrist` 训练相机且不制作展示视频。
+需要 overview 训练视角和展示视频时传 `--overview`。如果只做物理诊断，可以添加
+`--no-record-dataset` 减少磁盘占用。
 
 ### 2.3 批量采集
 
@@ -726,10 +730,11 @@ smoke 测试和调试。
 | `--policy-profile`                                   | `pct_multifloor`       | 复用已验证的 RL locomotion profile                                                                                      |
 | `--locomotion-checkpoint`                            | Go2-X5 model_26000     | 默认使用仓库 checkpoint                                                                                                 |
 | `--require-locomotion-checkpoint`                    | 默认开启               | checkpoint 缺失时立即失败                                                                                               |
-| `--record-video`                                     | full-physics 默认开启  | 可用`--no-record-video` 关闭；展示视频固定为 25 FPS                                                                     |
+| `--overview`                                         | 关闭                   | 启用 overview 训练视角并制作展示视频；默认不采 overview、不制作视频                                                     |
+| `--record-video`                                     | 关闭                   | 低层视频开关；日常数采使用 `--overview`，单独传 `--record-video` 会被拒绝                                                |
 | `--record-dataset`                                   | 默认开启               | 保存同步帧与 LeRobot 数据；GUI 检查可用`--no-record-dataset`                                                            |
-| `--dataset-camera-keys`                              | `front wrist overview` | 选择训练数据相机流；主要用于渲染后端诊断，至少包含 front                                                                |
-| `--video-mode`                                       | 由 profile 提供        | 两个 profile 默认均为`composite`；同步拼接 overview/front/wrist，也可只选单路或 `all`                                   |
+| `--dataset-camera-keys`                              | `front wrist`          | 选择训练数据相机流；`overview` 需要同时传 `--overview`，至少包含 front                                                   |
+| `--video-mode`                                       | 由 profile 提供        | 传 `--overview` 时默认使用 profile 的 `composite`；同步拼接 overview/front/wrist，也可只选单路或 `all`                   |
 | `--video-out`                                        | 可选                   | 视频输出目录或单个`.mp4`；多路或多 episode 需要传目录                                                                   |
 | `--video-width` / `--video-height`                   | `1280` / `720`         | overview 捕获分辨率；不改变 front/wrist observation                                                                     |
 | `--overview-camera-mode`                             | 由 profile 提供        | 良渚为`fixed`；别墅为 `auto`，并按 schedule 切换                                                                        |
@@ -782,8 +787,9 @@ smoke 测试和调试。
 | `--place-plan-json`                                  | 可选                   | 非 full-physics smoke 可转发离线 place plan                                  |
 | `--progress-interval-s`                              | `5.0`                  | 真实状态 heartbeat 间隔；startup/pending 低信息状态最多每 30 秒打印一次      |
 | `--color` / `--no-color`                             | 默认开启               | 是否使用 ANSI 彩色输出；保存 CI 日志时建议关闭                               |
-| `--record-video`                                     | full-physics 默认开启  | 沿用单 episode/profile 默认；可用`--no-record-video` 关闭                    |
-| `--dataset-camera-keys`                              | `front wrist overview` | 转发训练数据相机流；可用`--dataset-camera-keys front wrist` 做诊断           |
+| `--overview`                                         | 关闭                   | 转发到单 episode：启用 overview 训练视角并制作展示视频                       |
+| `--record-video`                                     | 关闭                   | 低层视频开关；日常数采使用 `--overview`，单独传 `--record-video` 会被拒绝     |
+| `--dataset-camera-keys`                              | `front wrist`          | 转发训练数据相机流；`overview` 需要同时传 `--overview`                       |
 | `--video-mode`                                       | 由 profile 提供        | profile 默认为`all`；`font` 是 `front` 的兼容别名                            |
 | `--video-out`                                        | 可选                   | 视频输出根目录；batch 写入其下的`episode_XXXXXX/` 子目录，不支持单个 `.mp4`  |
 | `--video-width` / `--video-height`                   | `1280` / `720`         | overview 捕获分辨率；不改变 front/wrist observation                          |
