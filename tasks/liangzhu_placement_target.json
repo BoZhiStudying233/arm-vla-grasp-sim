@@ -295,12 +295,12 @@
           ],
           "fixed_world_yaw_rad": 0.0,
           "center_x_offset_range_m": [
-            -0.12,
-            0.12
+            -0.5,
+            0.5
           ],
           "center_y_offset_range_m": [
-            -0.12,
-            0.12
+            -0.5,
+            0.5
           ],
           "asset_path": "source/scene/objects/box/box.usd",
           "asset_sha256": "6c97b54099fdcc09fa83dea0bb786c18d24d7c60e8bf0b3d952bb7f477c4513b"
@@ -325,12 +325,12 @@
           ],
           "fixed_world_yaw_rad": 0.0,
           "center_x_offset_range_m": [
-            -0.12,
-            0.12
+            -0.5,
+            0.5
           ],
           "center_y_offset_range_m": [
-            -0.12,
-            0.12
+            -0.5,
+            0.5
           ],
           "asset_path": "source/scene/objects/box2/box2.usd",
           "asset_sha256": "34dbfe8e8df09250255723c8ca739cd6004409f44ae3353c5d1601fbf673b608"
