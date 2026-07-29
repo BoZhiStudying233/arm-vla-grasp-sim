@@ -1359,6 +1359,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             debug_per_episode_lerobot=(
                 os.environ.get("FULL_PHYSICS_DEFER_LEROBOT_EXPORT") != "1"
             ),
+            write_staged_videos=bool(args.record_video),
             overview_camera_prim_path=str(args.overview_camera_prim_path),
         ),
         lighting=SceneLightingSettings(

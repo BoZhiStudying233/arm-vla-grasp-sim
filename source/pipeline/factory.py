@@ -277,6 +277,9 @@ def create_full_physics_pipeline(
                 ),
                 unified_dataset=full_physics_config.recording.unified_dataset,
                 validate_export=full_physics_config.recording.validate_export,
+                write_staged_videos=(
+                    full_physics_config.recording.write_staged_videos
+                ),
                 async_encoding_and_write=(
                     full_physics_config.recording.async_encoding_and_write
                 ),

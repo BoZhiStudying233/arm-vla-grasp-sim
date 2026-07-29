@@ -75,10 +75,28 @@ LEGACY_DWA_CSV_COLUMNS = (
 # 保留 DWA 数值列，同时显式记录 pipeline state，便于离线按阶段筛选。
 # wrist 图像本来已经进入 samples.jsonl/LeRobot video feature；这里补齐 raw CSV 的人工可读列。
 DWA_CSV_COLUMNS_WITHOUT_WRIST = (*LEGACY_DWA_CSV_COLUMNS, "pipeline_state")
-DWA_CSV_COLUMNS = (*LEGACY_DWA_CSV_COLUMNS, "腕部摄像头图像", "pipeline_state")
+CAMERA_POSE_KEYS = ("front", "wrist")
+CAMERA_POSE_COMPONENTS = ("x", "y", "z", "qw", "qx", "qy", "qz")
+CAMERA_POSE_CSV_COLUMNS = tuple(
+    f"{camera_key}_camera_world_{component}"
+    for camera_key in CAMERA_POSE_KEYS
+    for component in CAMERA_POSE_COMPONENTS
+)
+DWA_CSV_COLUMNS_WITH_WRIST_NO_CAMERA_POSE = (
+    *LEGACY_DWA_CSV_COLUMNS,
+    "腕部摄像头图像",
+    "pipeline_state",
+)
+DWA_CSV_COLUMNS = (
+    *LEGACY_DWA_CSV_COLUMNS,
+    "腕部摄像头图像",
+    *CAMERA_POSE_CSV_COLUMNS,
+    "pipeline_state",
+)
 SUPPORTED_DWA_CSV_COLUMNS = {
     LEGACY_DWA_CSV_COLUMNS,
     DWA_CSV_COLUMNS_WITHOUT_WRIST,
+    DWA_CSV_COLUMNS_WITH_WRIST_NO_CAMERA_POSE,
     DWA_CSV_COLUMNS,
 }
 
@@ -190,6 +208,7 @@ class LeRobotRecordingConfig:
     debug_per_episode_lerobot: bool = True
     unified_dataset: bool = True
     validate_export: bool = True
+    write_staged_videos: bool = False
     # Low-level tests and library callers remain synchronous unless requested;
     # the real pipeline enables this through RecordingSettings.
     async_encoding_and_write: bool = False
@@ -281,6 +300,38 @@ def _measured_base_velocity(record: StepRecord) -> tuple[float, float, float]:
     )
 
 
+def _camera_pose_by_key(metadata: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    capture_report = metadata.get("camera_capture_report")
+    if not isinstance(capture_report, dict):
+        return {}
+    poses = capture_report.get("camera_poses_world")
+    if not isinstance(poses, dict):
+        return {}
+    result: dict[str, dict[str, Any]] = {}
+    for camera_key, pose in poses.items():
+        if isinstance(pose, dict):
+            result[str(camera_key)] = pose
+    return result
+
+
+def _camera_pose_values(pose: dict[str, Any] | None) -> tuple[float, ...] | None:
+    if not isinstance(pose, dict):
+        return None
+    position = pose.get("position_xyz")
+    quaternion = pose.get("quaternion_wxyz")
+    if not isinstance(position, (list, tuple)) or not isinstance(quaternion, (list, tuple)):
+        return None
+    if len(position) < 3 or len(quaternion) < 4:
+        return None
+    try:
+        values = tuple(float(value) for value in (*position[:3], *quaternion[:4]))
+    except (TypeError, ValueError):
+        return None
+    if not all(math.isfinite(value) for value in values):
+        return None
+    return values
+
+
 class DwaEpisodeWriter:
     """按固定数据时间栅格记录一个连续 full-physics episode。"""
 
@@ -314,6 +365,9 @@ class DwaEpisodeWriter:
         self._queue_block_seconds = 0.0
         self._synchronization_errors: list[dict[str, Any]] = []
         self._finalized = False
+        self._write_staged_videos = bool(
+            self.config.write_staged_videos or not self.config.save_raw_images
+        )
         self.frequency_report: dict[str, Any] = {
             "physics_dt": None,
             "physics_hz": None,
@@ -334,7 +388,8 @@ class DwaEpisodeWriter:
                     stale_image.unlink()
         if self.video_staging_root.exists():
             shutil.rmtree(self.video_staging_root)
-        self.video_staging_root.mkdir(parents=True, exist_ok=True)
+        if self._write_staged_videos:
+            self.video_staging_root.mkdir(parents=True, exist_ok=True)
         self.samples_path.write_text("", encoding="utf-8")
         with self.csv_path.open("w", encoding="utf-8", newline="") as stream:
             csv.DictWriter(stream, fieldnames=DWA_CSV_COLUMNS).writeheader()
@@ -451,6 +506,7 @@ class DwaEpisodeWriter:
 
         frame_index = self.frame_count
         camera_frames: dict[str, dict[str, Any]] = {}
+        camera_poses = _camera_pose_by_key(state.metadata)
         prepared_images: list[tuple[str, np.ndarray]] = []
         for camera_key in self.config.camera_keys:
             camera_image = state.camera_images.get(camera_key)
@@ -480,6 +536,9 @@ class DwaEpisodeWriter:
                 "synchronization_source": synchronization_source,
                 "raw_image_path": raw_path,
             }
+            pose = camera_poses.get(camera_key)
+            if pose is not None:
+                camera_frames[camera_key]["camera_pose_world"] = pose
 
         primary_raw_path = camera_frames[self.config.primary_camera_key]["raw_image_path"]
         wrist_raw_path = camera_frames.get("wrist", {}).get("raw_image_path")
@@ -606,7 +665,7 @@ class DwaEpisodeWriter:
             with self._measure("recorder.raw_jpeg_write"):
                 self._write_raw_image(camera_key, image, packet.frame_index)
             with self._measure("recorder.staged_video_write"):
-                self._write_video_frame(camera_key, image)
+                self._write_or_count_video_frame(camera_key, image)
         with self._measure("recorder.csv_write"):
             with self.csv_path.open("a", encoding="utf-8", newline="") as stream:
                 csv.DictWriter(stream, fieldnames=DWA_CSV_COLUMNS).writerow(
@@ -702,7 +761,10 @@ class DwaEpisodeWriter:
                 key: list(shape) for key, shape in self._camera_shapes.items()
             },
             "raw_images_saved": self.raw_images_saved,
-            "video_staging_root": str(self.video_staging_root),
+            "video_staging_enabled": bool(self._write_staged_videos),
+            "video_staging_root": (
+                str(self.video_staging_root) if self._write_staged_videos else None
+            ),
             "async_encoding_and_write": self.config.async_encoding_and_write,
             "async_queue_size": self.config.async_queue_size,
             "async_max_queue_depth": self._max_queue_depth,
@@ -776,7 +838,16 @@ class DwaEpisodeWriter:
         temporary_path.replace(image_path)
         return relative_path
 
-    def _write_video_frame(self, camera_key: str, image: np.ndarray) -> None:
+    def _write_or_count_video_frame(self, camera_key: str, image: np.ndarray) -> None:
+        self._camera_shapes.setdefault(
+            camera_key,
+            tuple(int(value) for value in image.shape),
+        )
+        self._camera_frame_counts[camera_key] = (
+            self._camera_frame_counts.get(camera_key, 0) + 1
+        )
+        if not self._write_staged_videos:
+            return
         import cv2
 
         writer = self._video_writers.get(camera_key)
@@ -796,9 +867,7 @@ class DwaEpisodeWriter:
             if not writer.isOpened():
                 raise RuntimeError(f"failed to create staged camera video: {video_path}")
             self._video_writers[camera_key] = writer
-            self._camera_shapes[camera_key] = tuple(int(value) for value in image.shape)
         writer.write(cv2.cvtColor(image, cv2.COLOR_RGB2BGR))
-        self._camera_frame_counts[camera_key] = self._camera_frame_counts.get(camera_key, 0) + 1
 
     def _update_frequency_report(self, metadata: dict[str, Any]) -> None:
         physics_dt = metadata.get("physics_dt")
@@ -889,6 +958,14 @@ class DwaEpisodeWriter:
             "腕部摄像头图像": wrist_image_name,
             "pipeline_state": record.pipeline_state,
         }
+        camera_poses = _camera_pose_by_key(state.metadata)
+        for camera_key in CAMERA_POSE_KEYS:
+            values = _camera_pose_values(camera_poses.get(camera_key))
+            for component_index, component in enumerate(CAMERA_POSE_COMPONENTS):
+                column = f"{camera_key}_camera_world_{component}"
+                row[column] = (
+                    f"{values[component_index]:.9f}" if values is not None else ""
+                )
         for index, value in enumerate(arm, start=1):
             row[f"关节{index}"] = f"{value:.6f}"
         return row
@@ -918,6 +995,8 @@ def _read_episode_rows(episode_dir: Path) -> list[dict[str, str]]:
         # 兼容旧 raw CSV：历史版本只有 front 图像列，wrist 在 samples.jsonl 中。
         row.setdefault("腕部摄像头图像", "")
         row.setdefault("pipeline_state", "")
+        for column in CAMERA_POSE_CSV_COLUMNS:
+            row.setdefault(column, "")
     return rows
 
 

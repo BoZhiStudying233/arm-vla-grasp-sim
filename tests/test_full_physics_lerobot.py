@@ -48,6 +48,15 @@ def _state(step_index: int, image: np.ndarray | None) -> SimulationState:
             "joint_names": joint_names,
             "body_velocity": (0.3, -0.1, 0.2),
             "body_linear_velocity": (0.3, -0.1, 0.02),
+            "camera_capture_report": {
+                "camera_poses_world": {
+                    "front": {
+                        "frame": "world",
+                        "position_xyz": [3.0, 4.0, 5.0],
+                        "quaternion_wxyz": [1.0, 0.0, 0.0, 0.0],
+                    }
+                }
+            },
         },
     )
 
@@ -326,9 +335,15 @@ class FullPhysicsLeRobotTest(unittest.TestCase):
             self.assertAlmostEqual(float(rows[0]["线速度Z"]), 0.02)
             self.assertAlmostEqual(float(rows[0]["关节6"]), 6.0)
             self.assertAlmostEqual(float(rows[0]["夹爪"]), 0.03)
+            self.assertAlmostEqual(float(rows[0]["front_camera_world_x"]), 3.0)
+            self.assertAlmostEqual(float(rows[0]["front_camera_world_y"]), 4.0)
+            self.assertAlmostEqual(float(rows[0]["front_camera_world_z"]), 5.0)
+            self.assertAlmostEqual(float(rows[0]["front_camera_world_qw"]), 1.0)
+            self.assertEqual(rows[0]["wrist_camera_world_x"], "")
 
             image_path = episode_dir / "images/front/camera0_00000.jpg"
             self.assertTrue(image_path.is_file())
+            self.assertFalse((episode_dir / "recording_videos").exists())
             with Image.open(image_path) as saved_image:
                 self.assertEqual(saved_image.size, (640, 480))
             samples = [
@@ -346,6 +361,12 @@ class FullPhysicsLeRobotTest(unittest.TestCase):
             self.assertEqual(
                 samples[0]["camera_frames"]["front"]["feature_key"],
                 "observation.images.front",
+            )
+            self.assertEqual(
+                samples[0]["camera_frames"]["front"]["camera_pose_world"][
+                    "position_xyz"
+                ],
+                [3.0, 4.0, 5.0],
             )
 
             frames = [

@@ -794,6 +794,64 @@ def _as_tuple(values: Any) -> tuple[float, ...]:
     return tuple(float(value) for value in values)
 
 
+def _sensor_vector_tuple(values: Any, *, length: int) -> tuple[float, ...]:
+    """Read a single-env IsaacLab sensor vector as a flat float tuple."""
+
+    if values is None:
+        return ()
+    if hasattr(values, "detach"):
+        values = values.detach().cpu()
+    if hasattr(values, "tolist"):
+        values = values.tolist()
+    while (
+        isinstance(values, (list, tuple))
+        and len(values) == 1
+        and isinstance(values[0], (list, tuple))
+    ):
+        values = values[0]
+    if not isinstance(values, (list, tuple)) or len(values) < length:
+        return ()
+    try:
+        vector = tuple(float(value) for value in values[:length])
+    except (TypeError, ValueError):
+        return ()
+    if not all(math.isfinite(value) for value in vector):
+        return ()
+    return vector
+
+
+def _read_camera_sensor_pose(sensor: Any, *, camera_key: str, sensor_name: str) -> dict[str, Any] | None:
+    """Return the camera optical-frame world pose when IsaacLab exposes it."""
+
+    data = getattr(sensor, "data", None)
+    if data is None:
+        return None
+    position = _sensor_vector_tuple(getattr(data, "pos_w", None), length=3)
+    if len(position) != 3:
+        return None
+    quaternion_source = ""
+    quaternion: tuple[float, ...] = ()
+    for attr_name in ("quat_w_ros", "quat_w_world", "quat_w_opengl", "quat_w"):
+        quaternion = _sensor_vector_tuple(getattr(data, attr_name, None), length=4)
+        if len(quaternion) == 4:
+            quaternion_source = attr_name
+            break
+    if len(quaternion) != 4:
+        return None
+    norm = math.sqrt(sum(value * value for value in quaternion))
+    if norm <= 1.0e-12:
+        return None
+    quaternion = tuple(value / norm for value in quaternion)
+    return {
+        "camera_key": camera_key,
+        "sensor_name": sensor_name,
+        "frame": "world",
+        "position_xyz": list(position),
+        "quaternion_wxyz": list(quaternion),
+        "quaternion_source": quaternion_source,
+    }
+
+
 def _get_or_add_xform_op(xformable: Any, op_type: Any) -> Any:
     """复用引用层已有 xformOp，避免 AddXformOp 因同名属性已存在而失败。"""
 
@@ -5946,6 +6004,7 @@ class IsaacLabNavigationRuntime:
                 ],
                 "available_camera_keys": [],
                 "missing_camera_keys": [],
+                "camera_poses_world": {},
                 "capture_step_index": step_calls,
                 "render_step_index": render_step,
                 "render_generation": int(self._camera_render_generation),
@@ -5965,12 +6024,20 @@ class IsaacLabNavigationRuntime:
             sensor_names.append(("wrist", "arm_camera"))
         if self._config.enable_overview_camera:
             sensor_names.append(("overview", "overview_camera"))
+        camera_poses: dict[str, Any] = {}
         for camera_key, sensor_name in sensor_names:
             try:
                 sensor = self._runtime.scene[sensor_name]
                 rgb = sensor.data.output["rgb"]
             except (KeyError, TypeError, AttributeError):
                 continue
+            pose = _read_camera_sensor_pose(
+                sensor,
+                camera_key=camera_key,
+                sensor_name=sensor_name,
+            )
+            if pose is not None and camera_key in {"front", "wrist"}:
+                camera_poses[camera_key] = pose
             if rgb is None or getattr(rgb, "shape", (0,))[0] < 1:
                 continue
             images[camera_key] = rgb[0, :, :, :3]
@@ -5985,6 +6052,7 @@ class IsaacLabNavigationRuntime:
                     key: [int(value) for value in getattr(image, "shape", ())]
                     for key, image in images.items()
                 },
+                "camera_poses_world": camera_poses,
                 "capture_step_index": step_calls,
                 "render_step_index": render_step,
                 "render_generation": int(self._camera_render_generation),

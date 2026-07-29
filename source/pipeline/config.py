@@ -287,6 +287,7 @@ class RecordingSettings:
     debug_per_episode_lerobot: bool = True
     unified_dataset: bool = True
     validate_export: bool = True
+    write_staged_videos: bool = False
     async_encoding_and_write: bool = True
     async_queue_size: int = 16
 
