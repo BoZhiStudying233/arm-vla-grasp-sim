@@ -20,11 +20,47 @@ def _yaw_from_wxyz(quaternion: tuple[float, ...]) -> float:
     return math.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
 
 
+def _quat_conjugate(quaternion: tuple[float, ...]) -> tuple[float, float, float, float]:
+    w, x, y, z = quaternion
+    return w, -x, -y, -z
+
+
+def _quat_multiply(
+    left: tuple[float, ...], right: tuple[float, ...]
+) -> tuple[float, float, float, float]:
+    lw, lx, ly, lz = left
+    rw, rx, ry, rz = right
+    return (
+        lw * rw - lx * rx - ly * ry - lz * rz,
+        lw * rx + lx * rw + ly * rz - lz * ry,
+        lw * ry - lx * rz + ly * rw + lz * rx,
+        lw * rz + lx * ry - ly * rx + lz * rw,
+    )
+
+
+def _quat_to_rpy(quaternion: tuple[float, ...]) -> tuple[float, float, float]:
+    w, x, y, z = quaternion
+    roll = math.atan2(2.0 * (w * x + y * z), 1.0 - 2.0 * (x * x + y * y))
+    pitch = math.asin(max(-1.0, min(1.0, 2.0 * (w * y - z * x))))
+    yaw = _yaw_from_wxyz(quaternion)
+    return roll, pitch, yaw
+
+
+def _rotate_vector(
+    quaternion: tuple[float, ...], vector: tuple[float, float, float]
+) -> tuple[float, float, float]:
+    pure = (0.0, *vector)
+    rotated = _quat_multiply(_quat_multiply(quaternion, pure), _quat_conjugate(quaternion))
+    return rotated[1], rotated[2], rotated[3]
+
+
 @dataclass(frozen=True)
 class ObservationEncoder:
     jpeg_quality: int = 90
     front_camera_key: str = "front"
     wrist_camera_key: str = "wrist"
+    gripper_closed_m: float = 0.0
+    gripper_open_m: float = 0.04
 
     def build_payload(
         self,
@@ -52,6 +88,7 @@ class ObservationEncoder:
             "state": {
                 "base_velocity_body": list(self._body_velocity(state)),
                 "base_world_xyyaw": list(self._pose_xyyaw(state)),
+                "arm_tcp_base": list(self._arm_tcp_base(state)),
             },
         }
 
@@ -101,3 +138,30 @@ class ObservationEncoder:
             yaw,
         )
         return vx, vy, float(state.robot_root_velocity[5])
+
+    def _arm_tcp_base(
+        self, state: SimulationState
+    ) -> tuple[float, float, float, float, float, float, float]:
+        if state.tcp_pose is None:
+            return (0.0,) * 7
+        root_position = tuple(float(value) for value in state.robot_root_pose[:3])
+        root_quaternion = tuple(float(value) for value in state.robot_root_pose[3:7])
+        tcp_position = tuple(float(value) for value in state.tcp_pose[:3])
+        tcp_quaternion = tuple(float(value) for value in state.tcp_pose[3:7])
+        delta_world = tuple(tcp_position[i] - root_position[i] for i in range(3))
+        base_inverse = _quat_conjugate(root_quaternion)
+        tcp_position_base = _rotate_vector(base_inverse, delta_world)
+        tcp_quaternion_base = _quat_multiply(base_inverse, tcp_quaternion)
+        tcp_rpy_base = _quat_to_rpy(tcp_quaternion_base)
+
+        names = tuple(str(name) for name in state.metadata.get("joint_names", ()))
+        gripper_values = [
+            float(state.joint_positions[index])
+            for index, name in enumerate(names)
+            if index < len(state.joint_positions) and "gripper" in name.lower()
+        ]
+        gripper_m = sum(gripper_values) / len(gripper_values) if gripper_values else 0.0
+        span = self.gripper_open_m - self.gripper_closed_m
+        gripper = 0.0 if span <= 0.0 else (gripper_m - self.gripper_closed_m) / span
+        gripper = max(0.0, min(1.0, gripper))
+        return (*tcp_position_base, *tcp_rpy_base, gripper)

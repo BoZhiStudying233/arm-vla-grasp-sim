@@ -17,6 +17,16 @@ def test_policy_decision_requires_waypoints_for_nav() -> None:
         PolicyDecision.from_response({"route": "nav", "nav_waypoints": None})
 
 
+def test_policy_decision_accepts_base_frame_arm_targets() -> None:
+    decision = PolicyDecision.from_response(
+        {
+            "route": "grasp",
+            "arm_targets_base": [[0.35, 0.0, 0.2, 0.0, 0.1, 0.0, 1.0]],
+        }
+    )
+    assert decision.arm_targets_base == ((0.35, 0.0, 0.2, 0.0, 0.1, 0.0, 1.0),)
+
+
 def test_client_rejects_stale_request_id() -> None:
     raw = json.dumps(
         {

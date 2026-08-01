@@ -6,7 +6,7 @@ import math
 from dataclasses import dataclass, field
 from typing import Any
 
-PROTOCOL_VERSION = "starvla-go2-eval/v1"
+PROTOCOL_VERSION = "starvla-go2-eval/v2"
 ROUTES = frozenset({"nav", "grasp", "place", "done", "recover"})
 
 
@@ -19,6 +19,9 @@ class PolicyDecision:
     route: str
     subtask: str | None = None
     nav_waypoints: tuple[tuple[float, float, float], ...] = ()
+    arm_targets_base: tuple[
+        tuple[float, float, float, float, float, float, float], ...
+    ] = ()
     route_confidence: float | None = None
     route_probs: dict[str, float | None] | None = None
     raw_text: str = ""
@@ -52,6 +55,26 @@ class PolicyDecision:
                 if not all(math.isfinite(value) for value in values):
                     raise RemotePolicyError(f"nav_waypoints[{index}] is non-finite")
                 waypoints.append(values)
+        raw_arm_targets = data.get("arm_targets_base")
+        arm_targets: list[tuple[float, float, float, float, float, float, float]] = []
+        if raw_arm_targets is not None:
+            if not isinstance(raw_arm_targets, list) or not raw_arm_targets:
+                raise RemotePolicyError("arm_targets_base must be a non-empty list")
+            if len(raw_arm_targets) > 32:
+                raise RemotePolicyError("arm_targets_base exceeds 32 targets")
+            for index, target in enumerate(raw_arm_targets):
+                if not isinstance(target, list) or len(target) != 7:
+                    raise RemotePolicyError(
+                        f"arm_targets_base[{index}] must contain [x,y,z,roll,pitch,yaw,gripper]"
+                    )
+                values = tuple(float(value) for value in target)
+                if not all(math.isfinite(value) for value in values):
+                    raise RemotePolicyError(f"arm_targets_base[{index}] is non-finite")
+                if not 0.0 <= values[-1] <= 1.0:
+                    raise RemotePolicyError(
+                        f"arm_targets_base[{index}] gripper must be in [0,1]"
+                    )
+                arm_targets.append(values)
         confidence = data.get("route_confidence")
         if confidence is not None and not math.isfinite(float(confidence)):
             raise RemotePolicyError("route_confidence is non-finite")
@@ -59,6 +82,7 @@ class PolicyDecision:
             route=route,
             subtask=None if data.get("subtask") is None else str(data["subtask"]),
             nav_waypoints=tuple(waypoints),
+            arm_targets_base=tuple(arm_targets),
             route_confidence=None if confidence is None else float(confidence),
             route_probs=data.get("route_probs"),
             raw_text=str(data.get("raw_text", "")),
@@ -70,6 +94,7 @@ class PolicyDecision:
             "route": self.route,
             "subtask": self.subtask,
             "nav_waypoints": [list(point) for point in self.nav_waypoints],
+            "arm_targets_base": [list(target) for target in self.arm_targets_base],
             "route_confidence": self.route_confidence,
             "route_probs": self.route_probs,
             "raw_text": self.raw_text,
