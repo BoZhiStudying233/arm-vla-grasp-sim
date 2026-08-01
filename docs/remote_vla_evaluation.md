@@ -2,12 +2,14 @@
 
 ## 模块边界
 
-- `starVLA_sc/deployment/go2_remote`：加载完整 QwenPI checkpoint，输出 `route/subtask/nav_waypoints`，服务只监听服务器回环地址。
+- `starVLA_sc/deployment/go2_remote`：加载完整 QwenPI checkpoint，输出 `route/subtask/nav_waypoints/arm_targets_base`，服务只监听服务器回环地址。
 - `pct_scene/source/evaluation`：编码 front/wrist 图像与机体系速度，校验协议和 waypoint，将机体系短轨迹转到世界系。
 - 现有 `DwaNavExecutor`：把世界系 waypoint 转为底盘速度，再由 Isaac Lab locomotion policy 执行。
 - 现有 full-physics state machine：`GRASP/PLACE` 仅作为语义门控，机械臂仍使用 cuRobo 在线规划与分段执行。
 
-协议版本为 `starvla-go2-eval/v1`。每次请求携带 `request_id/episode_id/frame_index/phase`；每次响应记录 route、subtask、延迟、checkpoint 和 waypoint。网络失败、协议不匹配、越界 waypoint 或重规划超限都会发送零速度并终止该 episode。
+协议版本为 `starvla-go2-eval/v2`。每次请求携带 `request_id/episode_id/frame_index/phase`；每次响应记录 route、subtask、延迟、checkpoint 和动作目标。网络失败、协议不匹配、越界 waypoint 或重规划超限都会发送零速度并终止该 episode。
+
+当前状态机只消费模型 NAV waypoint；GRASP/PLACE 仍门控确定性 cuRobo 抓放。旧 3 维 checkpoint 不能作为 v2 的 10 维完整动作模型使用。完整流程见 `docs/simulation_vla_evaluation_tutorial.md`。
 
 ## 启动顺序
 
@@ -17,7 +19,7 @@
 
 ```bash
 cd /hdd4/MaTianran/pct_workspace/starVLA_sc
-CHECKPOINT=/hdd4/MaTianran/pct_workspace/starVLA_sc/results/Checkpoints/go2_n200_curriculum_a40_b12_0801_pick_place/final_model/pytorch_model.pt \
+CHECKPOINT=/absolute/path/to/10d/final_model/pytorch_model.pt \
 GPU=0 PORT=10093 \
 scripts/evaluation/start_go2_vla_server_tmux.sh
 ```
