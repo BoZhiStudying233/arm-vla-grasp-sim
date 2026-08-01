@@ -50,6 +50,27 @@ PLACE_PLAN = (
 
 
 class FullPhysicsBatchTest(unittest.TestCase):
+    def test_remote_vla_eval_forwards_loopback_protocol_options(self) -> None:
+        args = _build_parser().parse_args(
+            [
+                "--output-dir",
+                "/tmp/remote_vla_eval",
+                "--remote-vla-eval",
+                "--vla-endpoint",
+                "ws://127.0.0.1:10193",
+                "--vla-max-replans",
+                "12",
+            ]
+        )
+
+        command = _build_child_command(args, episode_index=0).command
+        child_args = _parse_pipeline_args(command[3:])
+
+        self.assertIn("--remote-vla-eval", command)
+        self.assertEqual(child_args.mode, "remote_vla_eval")
+        self.assertEqual(child_args.vla_endpoint, "ws://127.0.0.1:10193")
+        self.assertEqual(child_args.vla_max_replans, 12)
+
     def test_reused_process_command_runs_all_episodes_in_one_output_root(self) -> None:
         args = _build_parser().parse_args(
             [

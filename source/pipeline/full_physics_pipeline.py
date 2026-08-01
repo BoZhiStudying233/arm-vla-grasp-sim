@@ -19,6 +19,7 @@ from source.interfaces import (
     NavExecutor,
     NavPlanner,
     SimulationRuntime,
+    SemanticRoutePolicy,
     StepRecord,
 )
 from source.recording.overview_video_recorder import OverviewVideoRecorder
@@ -50,6 +51,7 @@ class FullPhysicsPipeline:
         gripper: GripperController,
         verifier: EpisodeVerifier,
         recorder: EpisodeRecorder,
+        semantic_route_policy: SemanticRoutePolicy | None = None,
         close_simulation_on_exit: bool = True,
     ):
         self.config = config
@@ -58,6 +60,7 @@ class FullPhysicsPipeline:
         self.simulation = simulation
         self.nav_planner = nav_planner
         self.recorder = recorder
+        self.semantic_route_policy = semantic_route_policy
         self._close_simulation_on_exit = bool(close_simulation_on_exit)
         self._profiler: WallTimeProfiler | None = None
         self.machine = FullPhysicsStateMachine(
@@ -72,6 +75,7 @@ class FullPhysicsPipeline:
             gripper=gripper,
             verifier=verifier,
             recorder=recorder,
+            semantic_route_policy=semantic_route_policy,
         )
 
     def run_episode(self) -> dict[str, Any]:
@@ -281,6 +285,8 @@ class FullPhysicsPipeline:
                 else:
                     with self._profiler.measure("pipeline.simulation_close"):
                         self.simulation.close()
+            if self.semantic_route_policy is not None:
+                self.semantic_route_policy.close()
 
     def _performance_report(
         self,

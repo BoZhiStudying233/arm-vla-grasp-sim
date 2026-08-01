@@ -9,6 +9,7 @@ import json
 import os
 import sys
 import traceback
+import urllib.parse
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, Sequence
@@ -880,6 +881,15 @@ def _build_parser() -> argparse.ArgumentParser:
         default=True,
         help="要求 locomotion checkpoint 存在；默认开启。",
     )
+    parser.add_argument(
+        "--vla-endpoint",
+        default="ws://127.0.0.1:10093",
+        help="评测机本地 SSH forward 的 WebSocket 地址；只允许回环地址。",
+    )
+    parser.add_argument("--vla-connect-timeout-s", type=float, default=10.0)
+    parser.add_argument("--vla-response-timeout-s", type=float, default=120.0)
+    parser.add_argument("--vla-jpeg-quality", type=int, default=90)
+    parser.add_argument("--vla-max-replans", type=int, default=64)
     mode_group = parser.add_mutually_exclusive_group()
     mode_group.add_argument(
         "--dry-run",
@@ -947,6 +957,13 @@ def _build_parser() -> argparse.ArgumentParser:
         const="manipulation_apply_smoke",
         dest="mode",
         help="启动真实 Isaac Sim，跳过导航并验证机械臂/夹爪 action 能下发到 articulation。",
+    )
+    mode_group.add_argument(
+        "--remote-vla-eval",
+        action="store_const",
+        const="remote_vla_eval",
+        dest="mode",
+        help="通过本地 SSH tunnel 调用远程 StarVLA，执行完整物理闭环评测。",
     )
     parser.set_defaults(mode="full_physics")
     return parser
@@ -1134,12 +1151,30 @@ def main(argv: Sequence[str] | None = None) -> int:
     pick_smoke = mode == "pick_smoke"
     manipulation_smoke = mode == "manipulation_smoke"
     manipulation_apply_smoke = mode == "manipulation_apply_smoke"
-    full_physics = mode == "full_physics"
+    remote_vla_eval = mode == "remote_vla_eval"
+    full_physics = mode in {"full_physics", "remote_vla_eval"}
     flat_episode_output = os.environ.get("FULL_PHYSICS_FLAT_EPISODE_OUTPUT") == "1"
     if (full_physics or pick_smoke) and (args.pick_plan_json or args.place_plan_json):
         raise SystemExit("full-physics / pick-smoke 模式禁止使用离线 plan JSON；pick/place 必须按当前仿真状态在线规划。")
     if args.keep_window_open and args.headless:
         raise SystemExit("--keep-window-open 只能与 --no-headless 一起使用。")
+    if remote_vla_eval:
+        parsed_endpoint = urllib.parse.urlparse(str(args.vla_endpoint))
+        if parsed_endpoint.scheme != "ws" or parsed_endpoint.hostname not in {
+            "127.0.0.1",
+            "localhost",
+            "::1",
+        }:
+            raise SystemExit(
+                "--remote-vla-eval 的 --vla-endpoint 必须是 ws:// 回环地址；"
+                "请用 SSH -L 转发远程推理端口。"
+            )
+        if args.vla_connect_timeout_s <= 0 or args.vla_response_timeout_s <= 0:
+            raise SystemExit("VLA connect/response timeout 必须大于 0。")
+        if not 1 <= args.vla_jpeg_quality <= 100:
+            raise SystemExit("--vla-jpeg-quality 必须在 1..100。")
+        if args.vla_max_replans <= 0:
+            raise SystemExit("--vla-max-replans 必须大于 0。")
     if stair_locomotion_smoke and args.pct_stair_float:
         raise SystemExit("--stair-locomotion-smoke 固定禁用 Float，请不要传 --pct-stair-float。")
     if args.record_video and dry_run:
@@ -1727,14 +1762,33 @@ def main(argv: Sequence[str] | None = None) -> int:
                         simulation_app=app_launcher.app,
                         scene_isaac_runtime_overrides=scene_isaac_runtime_overrides,
                     )
-                pipeline = create_full_physics_pipeline(
-                    config=config,
-                    episode_spec=episode_spec,
-                    episode_seed=episode_seed,
-                    episode_dir=episode_dir,
-                    simulation=simulation,
-                    close_simulation_on_exit=not share_runtime,
-                )
+                if remote_vla_eval:
+                    from source.evaluation.factory import (
+                        create_remote_vla_evaluation_pipeline,
+                    )
+
+                    pipeline = create_remote_vla_evaluation_pipeline(
+                        config=config,
+                        episode_spec=episode_spec,
+                        episode_seed=episode_seed,
+                        episode_dir=episode_dir,
+                        simulation=simulation,
+                        endpoint=str(args.vla_endpoint),
+                        connect_timeout_s=float(args.vla_connect_timeout_s),
+                        response_timeout_s=float(args.vla_response_timeout_s),
+                        jpeg_quality=int(args.vla_jpeg_quality),
+                        max_replans_per_navigation=int(args.vla_max_replans),
+                        close_simulation_on_exit=not share_runtime,
+                    )
+                else:
+                    pipeline = create_full_physics_pipeline(
+                        config=config,
+                        episode_spec=episode_spec,
+                        episode_seed=episode_seed,
+                        episode_dir=episode_dir,
+                        simulation=simulation,
+                        close_simulation_on_exit=not share_runtime,
+                    )
             elif pct_plan_preview:
                 from source.pipeline.pct_plan_preview import (
                     create_pct_plan_preview_pipeline,

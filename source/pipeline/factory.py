@@ -4,9 +4,10 @@ from __future__ import annotations
 
 from dataclasses import replace
 from pathlib import Path
+from typing import Callable
 
 from source.diagnostics import FullPhysicsVerifier
-from source.interfaces import EpisodeSpec
+from source.interfaces import EpisodeSpec, NavExecutor, NavPlanner, SemanticRoutePolicy
 from source.manipulation import (
     BinaryGripperController,
     CurrentStateCuroboPlanner,
@@ -126,6 +127,10 @@ def create_full_physics_pipeline(
     episode_dir: str | Path,
     simulation: IsaacLabNavigationRuntime,
     close_simulation_on_exit: bool = True,
+    navigation_stack_transform: (
+        Callable[[NavPlanner, NavExecutor], tuple[NavPlanner, NavExecutor]] | None
+    ) = None,
+    semantic_route_policy: SemanticRoutePolicy | None = None,
 ) -> FullPhysicsPipeline:
     """在同一 IsaacLab runtime 中连续调度 nav、在线 cuRobo、arm 和 gripper。"""
 
@@ -192,6 +197,11 @@ def create_full_physics_pipeline(
         config=full_physics_config,
         episode_spec=episode_spec,
     )
+    if navigation_stack_transform is not None:
+        nav_planner, nav_executor = navigation_stack_transform(
+            nav_planner,
+            nav_executor,
+        )
     gripper = BinaryGripperController()
     post_motion_hold_duration = (
         full_physics_config.manipulation.arm_post_motion_hold_duration_s
@@ -286,5 +296,6 @@ def create_full_physics_pipeline(
                 async_queue_size=full_physics_config.recording.async_queue_size,
             ),
         ),
+        semantic_route_policy=semantic_route_policy,
         close_simulation_on_exit=close_simulation_on_exit,
     )

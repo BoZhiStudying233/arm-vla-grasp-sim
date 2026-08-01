@@ -20,6 +20,7 @@ from source.interfaces import (
     RobotAction,
     SimulationRuntime,
     SimulationState,
+    SemanticRoutePolicy,
     VerificationResult,
 )
 from source.simulation.object_initialization import (
@@ -980,6 +981,7 @@ class FullPhysicsStateMachine:
         gripper: GripperController,
         verifier: EpisodeVerifier,
         recorder: EpisodeRecorder,
+        semantic_route_policy: SemanticRoutePolicy | None = None,
     ):
         self.config = config
         self.episode_spec = episode_spec
@@ -992,6 +994,7 @@ class FullPhysicsStateMachine:
         self.gripper = gripper
         self.verifier = verifier
         self.recorder = recorder
+        self.semantic_route_policy = semantic_route_policy
 
         self.state = PipelineState.BUILD_STAGE
         self.state_ticks = 0
@@ -1133,6 +1136,60 @@ class FullPhysicsStateMachine:
                 self._place_max_horizontal_displacement_m
             ),
         }
+
+    def _require_semantic_route(
+        self,
+        observation: SimulationState,
+        *,
+        expected_route: str,
+        phase: str,
+    ) -> tuple[bool, list[PipelineEvent]]:
+        """Evaluate a model route while keeping deterministic primitives authoritative."""
+
+        if self.semantic_route_policy is None:
+            return True, []
+        try:
+            decision = dict(
+                self.semantic_route_policy.predict_route(
+                    observation,
+                    phase=phase,
+                )
+            )
+        except Exception as exc:
+            return False, self._fail(
+                "remote_vla_inference_failed",
+                observation,
+                {
+                    "phase": phase,
+                    "expected_route": expected_route,
+                    "error": str(exc),
+                    "traceback": traceback.format_exc(),
+                },
+            )
+        actual_route = str(decision.get("route", "")).lower()
+        report = {
+            "phase": phase,
+            "expected_route": expected_route,
+            "actual_route": actual_route,
+            "decision": decision,
+        }
+        events = [
+            self._event(
+                "remote_vla_route_decision",
+                observation.step_index,
+                report,
+            )
+        ]
+        if actual_route != expected_route:
+            events.extend(
+                self._fail(
+                    "remote_vla_route_mismatch",
+                    observation,
+                    report,
+                )
+            )
+            return False, events
+        return True, events
 
     def _handle_state(
         self,
@@ -1657,7 +1714,14 @@ class FullPhysicsStateMachine:
         if settle_result is not None:
             return settle_result
 
-        events = [self._event("pick_plan_start", observation.step_index)]
+        route_allowed, events = self._require_semantic_route(
+            observation,
+            expected_route="grasp",
+            phase="before_pick",
+        )
+        if not route_allowed:
+            return RobotAction.idle(source="remote_vla_route_gate"), events
+        events.append(self._event("pick_plan_start", observation.step_index))
         if self._physical_pick_enabled():
             prepare_report = self.simulation.prepare_object_for_pick(self.episode_spec)
             events.append(
@@ -2018,7 +2082,14 @@ class FullPhysicsStateMachine:
         if settle_result is not None:
             return settle_result
 
-        events = [self._event("place_plan_start", observation.step_index)]
+        route_allowed, events = self._require_semantic_route(
+            observation,
+            expected_route="place",
+            phase="before_place",
+        )
+        if not route_allowed:
+            return RobotAction.idle(source="remote_vla_route_gate"), events
+        events.append(self._event("place_plan_start", observation.step_index))
         try:
             plan = self.manipulation_planner.plan_place(observation, self.episode_spec)
         except Exception as exc:
@@ -2506,6 +2577,13 @@ class FullPhysicsStateMachine:
                 verification_observation,
                 result.metadata,
             )
+        route_allowed, route_events = self._require_semantic_route(
+            observation,
+            expected_route="done",
+            phase="after_place",
+        )
+        if not route_allowed:
+            return RobotAction.idle(source="remote_vla_route_gate"), route_events
         place_success_event = (
             "place_success"
             if self.config.full_physics
@@ -2515,7 +2593,10 @@ class FullPhysicsStateMachine:
                 else "place_success"
             )
         )
-        events = [self._event(place_success_event, observation.step_index, result.metadata)]
+        events = [
+            *route_events,
+            self._event(place_success_event, observation.step_index, result.metadata),
+        ]
         if self._manipulation_only_smoke_enabled():
             events.append(
                 self._event(self._manipulation_smoke_event("success"), observation.step_index)

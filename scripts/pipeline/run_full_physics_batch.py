@@ -34,7 +34,10 @@ _REAL_MODES = {
     "navigation_carry_smoke": "--navigation-carry-smoke",
     "stair_locomotion_smoke": "--stair-locomotion-smoke",
     "manipulation_apply_smoke": "--manipulation-apply-smoke",
+    "remote_vla_eval": "--remote-vla-eval",
 }
+
+_FULL_PHYSICS_MODES = frozenset({"full_physics", "remote_vla_eval"})
 
 
 _COLORS = {
@@ -398,6 +401,11 @@ def _build_parser() -> argparse.ArgumentParser:
         default=2.2,
         help="转发给单 episode pipeline：overview 线性 RGB 转 sRGB gamma，默认 2.2。",
     )
+    parser.add_argument("--vla-endpoint", default="ws://127.0.0.1:10093")
+    parser.add_argument("--vla-connect-timeout-s", type=float, default=10.0)
+    parser.add_argument("--vla-response-timeout-s", type=float, default=120.0)
+    parser.add_argument("--vla-jpeg-quality", type=int, default=90)
+    parser.add_argument("--vla-max-replans", type=int, default=64)
 
     mode_group = parser.add_mutually_exclusive_group()
     mode_group.add_argument("--dry-run", action="store_const", const="dry_run", dest="mode")
@@ -1065,6 +1073,7 @@ def _build_child_command(
         "overview_camera_mode",
         "overview_camera_prim_path",
         "video_mode",
+        "vla_endpoint",
     ):
         value = getattr(args, argument_name)
         if value is not None:
@@ -1083,6 +1092,16 @@ def _build_child_command(
             command.extend(
                 [f"--{argument_name.replace('_', '-')}", str(_project_path(value))]
             )
+
+    for argument_name in (
+        "vla_connect_timeout_s",
+        "vla_response_timeout_s",
+        "vla_jpeg_quality",
+        "vla_max_replans",
+    ):
+        command.extend(
+            [f"--{argument_name.replace('_', '-')}", str(getattr(args, argument_name))]
+        )
 
     if args.pct_no_fallback is not None:
         command.append(
@@ -1105,9 +1124,9 @@ def _build_child_command(
         command.append(_REAL_MODES[args.mode])
     if args.show_randomization_debug:
         command.append("--show-randomization-debug")
-    if args.pick_plan_json and args.mode != "full_physics":
+    if args.pick_plan_json and args.mode not in _FULL_PHYSICS_MODES:
         command.extend(["--pick-plan-json", str(_project_path(args.pick_plan_json))])
-    if args.place_plan_json and args.mode != "full_physics":
+    if args.place_plan_json and args.mode not in _FULL_PHYSICS_MODES:
         command.extend(["--place-plan-json", str(_project_path(args.place_plan_json))])
 
     command.extend(["--video-width", str(int(args.video_width))])
@@ -1432,7 +1451,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     env["FULL_PHYSICS_DEFER_LEROBOT_EXPORT"] = "1"
     reuse_isaac_process = bool(
         args.reuse_isaac_process
-        and args.mode == "full_physics"
+        and args.mode in _FULL_PHYSICS_MODES
         and args.num_episodes > 1
         and args.headless
         and args.continue_on_failure
@@ -1484,10 +1503,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         episode_results.append(result)
         training_quality_passed = _training_quality_gate_passed(summary)
-        if args.mode == "full_physics" and success and training_quality_passed:
+        if args.mode in _FULL_PHYSICS_MODES and success and training_quality_passed:
             training_accepted_episode_dirs.append(episode.output_dir)
         episode_accepted = bool(
-            success and (args.mode != "full_physics" or training_quality_passed)
+            success and (args.mode not in _FULL_PHYSICS_MODES or training_quality_passed)
         )
         all_success = all_success and episode_accepted
         completed += 1
@@ -1576,7 +1595,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 if not episode_accepted and not args.continue_on_failure:
                     break
     lerobot_report: dict[str, object] | None = None
-    if args.mode == "full_physics":
+    if args.mode in _FULL_PHYSICS_MODES:
         lerobot_report = _materialize_batch_lerobot(
             output_root,
             training_accepted_episode_dirs,
