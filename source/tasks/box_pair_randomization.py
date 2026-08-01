@@ -8,6 +8,11 @@ import random
 from pathlib import Path
 from typing import Any
 
+from source.instruction_context import (
+    build_box_pair_global_instruction,
+    target_direction_from_pose,
+)
+
 from .forward_sector_randomization import (
     _finite_float,
     _goal_facing_target,
@@ -23,6 +28,59 @@ from .forward_sector_randomization import (
 
 
 BOX_PAIR_MODE = "liangzhu_box_pair_xy_v1"
+
+
+def _sync_global_instruction_context(
+    task: dict[str, Any],
+    *,
+    layout: dict[str, Any],
+) -> None:
+    """按初始位姿和抓取完成 base goal 写入在线策略的全局方位描述。"""
+
+    base_instruction = str(
+        task.get("base_instruction") or task.get("instruction") or ""
+    ).strip()
+    robot = layout["robot"]
+    pick_goal = layout["pick_base_goal"]
+    box1_center = layout["box1"]["support_center_xy_sampled"]
+    box2_center = layout["box2"]["support_center_xy_sampled"]
+    box1_direction, box1_bearing = target_direction_from_pose(
+        anchor_x=robot["xyz"][0],
+        anchor_y=robot["xyz"][1],
+        anchor_yaw=robot["yaw_rad"],
+        target_x=box1_center[0],
+        target_y=box1_center[1],
+    )
+    box2_direction, box2_bearing = target_direction_from_pose(
+        anchor_x=pick_goal["x"],
+        anchor_y=pick_goal["y"],
+        anchor_yaw=pick_goal["yaw"],
+        target_x=box2_center[0],
+        target_y=box2_center[1],
+    )
+    task["base_instruction"] = base_instruction
+    task["instruction"] = build_box_pair_global_instruction(
+        base_instruction,
+        box1_direction=box1_direction,
+        box2_direction=box2_direction,
+    )
+    task["global_instruction_context"] = {
+        "schema": "box_pair_relative_direction_v1",
+        "direction_frame": "robot_body",
+        "direction_bins": 8,
+        "box1": {
+            "direction": box1_direction,
+            "relative_bearing_rad": box1_bearing,
+            "anchor": "robot_initial_pose",
+            "target": "box1_support_center",
+        },
+        "box2": {
+            "direction": box2_direction,
+            "relative_bearing_rad": box2_bearing,
+            "anchor": "pick_base_goal_after_grasp",
+            "target": "box2_support_center",
+        },
+    }
 
 
 def uses_box_pair_randomization(raw_task: dict[str, Any]) -> bool:
@@ -737,6 +795,8 @@ def _sync_task_from_layout(
     )
     place["curobo_world_collision"] = place_collision
     task["place"] = place
+
+    _sync_global_instruction_context(task, layout=layout)
 
     keepout_margin = _finite_float(
         config.get("navigation_keepout_margin_m", 0.04),

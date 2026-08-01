@@ -326,6 +326,15 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--record-dataset",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "转发 LeRobot dataset 录制开关；默认保留单 episode pipeline "
+            "的原行为，仿真测评建议显式使用 --no-record-dataset。"
+        ),
+    )
+    parser.add_argument(
         "--dataset-camera-keys",
         nargs="+",
         choices=("front", "wrist", "overview"),
@@ -1060,6 +1069,7 @@ def _build_child_command(
             "--no-require-locomotion-checkpoint",
         ),
         (args.record_video, "--record-video", "--no-record-video"),
+        (args.record_dataset, "--record-dataset", "--no-record-dataset"),
     ):
         if value is not None:
             command.append(_bool_flag(bool(value), enabled_flag, disabled_flag))

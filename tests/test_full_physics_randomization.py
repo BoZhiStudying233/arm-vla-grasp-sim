@@ -133,6 +133,17 @@ class FullPhysicsRandomizationTest(unittest.TestCase):
             task["place"]["base_goal"]["z"],
             sample["place_base_goal"]["z"],
         )
+        context = task["global_instruction_context"]
+        self.assertEqual(context["box1"]["anchor"], "robot_initial_pose")
+        self.assertEqual(context["box2"]["anchor"], "pick_base_goal_after_grasp")
+        self.assertIn(
+            f"Box1 is to the robot's {context['box1']['direction']} ",
+            first.instruction,
+        )
+        self.assertIn(
+            f"Box2 is to the robot's {context['box2']['direction']} ",
+            first.instruction,
+        )
         self.assertTrue(all(task["randomization"]["synchronization"].values()))
 
     def test_liangzhu_task_requires_precise_stable_navigation_handoff(self) -> None:

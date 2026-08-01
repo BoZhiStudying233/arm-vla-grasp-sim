@@ -9,6 +9,11 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Sequence
 
+from source.instruction_context import (
+    RELATIVE_DIRECTION_LABELS,
+    relative_direction_label,
+)
+
 from .training_action import task_requests_vla_training_action
 
 
@@ -25,16 +30,6 @@ NAV_SUBTASKS = ("nav_straight", "nav_turn", "nav_stop")
 ARM_SUBTASKS = ("arm_approach", "arm_contact", "arm_retreat")
 SUBTASK_LABELS = (*NAV_SUBTASKS, *ARM_SUBTASKS)
 INSTRUCTION_ANNOTATION_SCHEMA = "relative_direction_segment_instruction_v1"
-RELATIVE_DIRECTION_LABELS = (
-    "front",
-    "front-left",
-    "left",
-    "back-left",
-    "back",
-    "back-right",
-    "right",
-    "front-right",
-)
 
 
 @dataclass(frozen=True)
@@ -435,16 +430,6 @@ def segment_episode_samples(
         "config": config.metadata(),
         "instruction_annotation": _instruction_annotation_metadata(raw_task),
     }
-
-
-def relative_direction_label(relative_bearing_rad: float) -> str:
-    """把机器人局部目标方位量化为稳定的八方向英文标签。"""
-
-    angle = _wrap_angle(float(relative_bearing_rad))
-    if not math.isfinite(angle):
-        raise ValueError("relative_bearing_rad 必须是有限数值")
-    index = int(math.floor((angle + math.pi / 8.0) / (math.pi / 4.0))) % 8
-    return RELATIVE_DIRECTION_LABELS[index]
 
 
 def _instruction_annotation_config(task: dict[str, Any]) -> dict[str, Any] | None:

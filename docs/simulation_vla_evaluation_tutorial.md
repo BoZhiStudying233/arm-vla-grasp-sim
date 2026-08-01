@@ -4,6 +4,16 @@
 
 当前闭环由两台机器协作：推理服务器运行 `starVLA_sc`，评测机运行 `pct_scene` 和 Isaac Sim。远程协议为 `starvla-go2-eval/v2`，只允许通过 SSH 隧道访问服务器回环端口。
 
+### 为什么入口仍是 full-physics pipeline
+
+`run_full_physics_pipeline.py` 和 `run_full_physics_batch.py` 最初用于数据采集，但它们同时拥有 Isaac Sim 启停、场景随机化、任务状态机、locomotion 和 cuRobo 执行器。测评没有复制这套重型运行时，而是通过专用 mode 复用它：
+
+- 不传 `--remote-vla-eval`：普通 full-physics/数采流程，使用确定性规划器。
+- 传 `--remote-vla-eval`：仍由同一入口创建 Isaac runtime，但 pipeline factory 切换为 `source.evaluation.create_remote_vla_evaluation_pipeline`，将远程 VLA session 注入导航规划栈和 route gate。
+- `run_full_physics_batch.py` 只负责按 seed 重复启动上述单 episode 测评并汇总失败，不是另一套模型测评逻辑。
+
+测评命令应显式使用 `--no-record-dataset --no-record-video`，只保留 summary、远程决策、延迟、执行状态和失败证据；需要人工复核时再单独开启视频。
+
 当前能力边界如下：
 
 - VLM 输出 `route/subtask`。
@@ -12,6 +22,8 @@
 - 默认 full-physics 状态机尚未执行模型机械臂目标；GRASP/PLACE 仍门控已有 cuRobo 确定性抓放。
 
 因此，当前仿真闭环可以评价 route/subtask、导航轨迹和完整任务成功率，但完整任务成功率不能单独证明机械臂 action head 有效。机械臂动作质量应先做离线误差评测，待显式执行 adapter 通过 smoke test 后再做模型控制的物理评测。
+
+随机化任务会在送入远程策略前生成逐 episode 全局 instruction：box1 方位以机器狗初始位姿为参考，box2 方位以抓取完成后的 `pick_base_goal` 为参考，均量化为八方向。该文本格式与 StarVLA 训练 loader 完全一致。
 
 旧 3 维 NAV checkpoint 与新 10 维动作头不兼容。启动 v2 完整模型服务必须使用重新训练后的 10 维 checkpoint；旧 checkpoint 只能用于独立 VLM route/subtask 评测。
 
@@ -85,6 +97,8 @@ PYTHONDONTWRITEBYTECODE=1 "$ISAAC_PYTHON" -B \
   --vla-connect-timeout-s 10 \
   --vla-response-timeout-s 120 \
   --vla-max-replans 64 \
+  --no-record-dataset \
+  --no-record-video \
   --headless
 ```
 
@@ -105,11 +119,15 @@ PYTHONDONTWRITEBYTECODE=1 "$ISAAC_PYTHON" -B \
   --vla-endpoint ws://127.0.0.1:10093 \
   --vla-response-timeout-s 120 \
   --vla-max-replans 64 \
+  --no-record-dataset \
+  --no-record-video \
   --headless \
   --continue-on-failure
 ```
 
-至少汇总以下指标：route/subtask 准确率、任务成功率、NAV 到达率、抓取成功率、放置成功率、平均重规划次数、推理延迟、超时率和失败原因分布。模型、协议、seed、checkpoint、scene profile 和代码 commit 必须随结果保存。
+在线 batch 汇总任务成功率、NAV 到达率、抓取成功率、放置成功率、平均重规划次数、推理延迟、超时率和失败原因分布。状态机在关键阶段会记录 expected/actual route，并在 route 错误时终止 episode。
+
+局部 instruction exact accuracy 不能由无逐帧 GT 的在线仿真 summary 凭空得到，应使用 `starVLA_sc/scripts/evaluate_go2_vlm_subtasks.py` 在 held-out LeRobot episode 上单独评测。模型、协议、seed、checkpoint、scene profile 和代码 commit 必须随结果保存。
 
 ## 7. 安全退出与故障判断
 
