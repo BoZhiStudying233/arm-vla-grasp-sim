@@ -11,6 +11,8 @@
 - 真机 Fork：`https://github.com/Natural-Horse/gx-real.git`（`origin`）
 - 真机上游：`https://github.com/lemonoscar/gx-real.git`（`upstream`）
 
+涉及 `gx-real` 时，提交、分支推送和 PR 只面向用户 Fork `Natural-Horse/gx-real`（`origin`）；`upstream` 仅供只读参考，不得向其推送或创建 PR。推送前必须核对 `git remote get-url --push origin`。
+
 工作时保留用户已有改动。先在本地修改、测试并提交到 `mtr_dev`；远端评测机的仓库路径和同步方式必须在首次写入前确认，不可从训练服务器路径推断。
 
 仿真模型评测采用明确分层：`starVLA_sc` 负责模型加载、版本化协议和机体系稀疏 waypoint 输出；`pct_scene` 负责观测编码、waypoint 世界系变换、DWA/RL 速度适配、Isaac 状态机及 cuRobo 抓放。两仓库不复制模型业务代码，机械臂不直接执行模型文本或远端关节指令。
