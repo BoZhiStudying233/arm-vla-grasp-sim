@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import time
+import urllib.parse
 import uuid
 from dataclasses import dataclass
 from typing import Any
@@ -17,6 +19,23 @@ class RemotePolicyClientConfig:
     response_timeout_s: float = 120.0
     max_message_bytes: int = 20 * 1024 * 1024
     reconnect_attempts: int = 1
+
+    def __post_init__(self) -> None:
+        parsed = urllib.parse.urlparse(str(self.endpoint))
+        if parsed.scheme != "ws" or parsed.hostname not in {
+            "127.0.0.1",
+            "localhost",
+            "::1",
+        }:
+            raise RemotePolicyError(
+                "remote VLA endpoint must be a loopback ws:// URL reached through SSH"
+            )
+        if parsed.port is None:
+            raise RemotePolicyError("remote VLA endpoint must include an explicit port")
+        if self.connect_timeout_s <= 0.0 or self.response_timeout_s <= 0.0:
+            raise RemotePolicyError("remote VLA timeouts must be positive")
+        if self.reconnect_attempts < 0:
+            raise RemotePolicyError("remote VLA reconnect_attempts must be non-negative")
 
 
 class RemotePolicyClient:
@@ -42,11 +61,16 @@ class RemotePolicyClient:
 
     def infer(self, payload: dict[str, Any]) -> PolicyDecision:
         response = self._request("infer", payload)
+        timing = response.get("remote_timing")
+        timing = dict(timing) if isinstance(timing, dict) else {}
+        roundtrip_ms = response.get("client_roundtrip_ms")
+        if isinstance(roundtrip_ms, (int, float)):
+            timing["client_roundtrip_ms"] = float(roundtrip_ms)
         return PolicyDecision.from_response(
             response,
             metadata={
                 "remote_endpoint": self.config.endpoint,
-                "remote_timing": response.get("remote_timing"),
+                "remote_timing": timing,
             },
         )
 
@@ -77,11 +101,17 @@ class RemotePolicyClient:
         attempts = self.config.reconnect_attempts + 1
         last_error: Exception | None = None
         for _ in range(attempts):
+            started_at = time.perf_counter()
             try:
                 connection = self._connection or self._connect()
                 connection.send(json.dumps(message, ensure_ascii=True))
                 raw_response = connection.recv(timeout=self.config.response_timeout_s)
-                return self._validate_response(raw_response, request_id)
+                data = self._validate_response(raw_response, request_id)
+                data["client_roundtrip_ms"] = round(
+                    (time.perf_counter() - started_at) * 1000.0,
+                    3,
+                )
+                return data
             except Exception as exc:
                 last_error = exc
                 self.close()

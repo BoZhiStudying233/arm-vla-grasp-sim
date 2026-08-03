@@ -415,6 +415,12 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--vla-response-timeout-s", type=float, default=120.0)
     parser.add_argument("--vla-jpeg-quality", type=int, default=90)
     parser.add_argument("--vla-max-replans", type=int, default=64)
+    parser.add_argument("--vla-max-chunk-steps", type=int, default=250)
+    parser.add_argument(
+        "--vla-arm-mode",
+        choices=("route_only", "shadow"),
+        default="route_only",
+    )
 
     mode_group = parser.add_mutually_exclusive_group()
     mode_group.add_argument("--dry-run", action="store_const", const="dry_run", dest="mode")
@@ -1084,6 +1090,7 @@ def _build_child_command(
         "overview_camera_prim_path",
         "video_mode",
         "vla_endpoint",
+        "vla_arm_mode",
     ):
         value = getattr(args, argument_name)
         if value is not None:
@@ -1108,6 +1115,7 @@ def _build_child_command(
         "vla_response_timeout_s",
         "vla_jpeg_quality",
         "vla_max_replans",
+        "vla_max_chunk_steps",
     ):
         command.extend(
             [f"--{argument_name.replace('_', '-')}", str(getattr(args, argument_name))]
@@ -1380,6 +1388,7 @@ def _write_batch_record(
         "failed_state": result.failed_state,
         "lerobot_path": result.lerobot_path,
         "elapsed_seconds": result.elapsed_seconds,
+        "remote_vla": summary.get("remote_vla") if summary else None,
     }
     stream.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")))
     stream.write("\n")

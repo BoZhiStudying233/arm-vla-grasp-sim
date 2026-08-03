@@ -726,7 +726,7 @@ class FullPhysicsPipelineTest(unittest.TestCase):
         self.assertEqual(args.overview_camera_mode, "fixed")
         self.assertEqual(args.overview_camera_prim_path, "/World/overview")
         self.assertFalse(args.pct_stair_float)
-        self.assertTrue(args.record_video)
+        self.assertFalse(args.record_video)
 
     def test_pct_multifloor_stable_preset_resolves_runtime_defaults(self) -> None:
         args = _parse_args(["--pct-multifloor"])
@@ -768,7 +768,7 @@ class FullPhysicsPipelineTest(unittest.TestCase):
         self.assertEqual(args.output_dir, "outputs/multi_floor")
         self.assertEqual(args.navigation_visual_mode, "collision")
         self.assertEqual(args.scene_light_mode, "auto")
-        self.assertTrue(args.record_video)
+        self.assertFalse(args.record_video)
         self.assertEqual(args.video_mode, "composite")
         self.assertEqual(
             args.overview_camera_schedule,
@@ -859,11 +859,11 @@ class FullPhysicsPipelineTest(unittest.TestCase):
         self.assertTrue(args.show_planned_trajectories)
         self.assertFalse(args.headless)
         self.assertTrue(args.keep_window_open)
-        self.assertTrue(args.record_video)
+        self.assertFalse(args.record_video)
         self.assertTrue(args.record_dataset)
         self.assertEqual(
             args.dataset_camera_keys,
-            ["front", "wrist", "overview"],
+            ["front", "wrist"],
         )
         self.assertEqual(args.video_mode, "composite")
         self.assertEqual(

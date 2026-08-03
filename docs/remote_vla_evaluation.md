@@ -9,7 +9,7 @@
 
 协议版本为 `starvla-go2-eval/v2`。每次请求携带 `request_id/episode_id/frame_index/phase`；每次响应记录 route、subtask、延迟、checkpoint 和动作目标。网络失败、协议不匹配、越界 waypoint 或重规划超限都会发送零速度并终止该 episode。
 
-当前状态机只消费模型 NAV waypoint；GRASP/PLACE 仍门控确定性 cuRobo 抓放。旧 3 维 checkpoint 不能作为 v2 的 10 维完整动作模型使用。完整流程见 `docs/simulation_vla_evaluation_tutorial.md`。
+当前状态机执行模型 NAV waypoint；GRASP/PLACE 可选择 route-only 或模型 TCP shadow 校验，物理抓放仍由确定性 cuRobo 执行。旧 3 维 checkpoint 不能作为 v2 的 10 维完整动作模型使用。完整流程见 `docs/仿真测试指南.md`。
 
 ## 启动顺序
 

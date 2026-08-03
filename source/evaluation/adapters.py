@@ -26,6 +26,81 @@ class WaypointSafetyConfig:
     max_segment_translation_m: float = 0.80
     max_segment_yaw_rad: float = math.radians(45.0)
     max_replans_per_navigation: int = 64
+    max_chunk_execution_steps: int = 250
+
+
+@dataclass(frozen=True)
+class ArmTargetShadowConfig:
+    min_xyz: tuple[float, float, float] = (0.05, -0.50, -0.10)
+    max_xyz: tuple[float, float, float] = (0.75, 0.50, 0.60)
+    max_translation_step_m: float = 0.15
+    max_rotation_step_rad: float = math.radians(35.0)
+
+
+class RemoteVLAArmTargetShadowValidator:
+    """Validate model TCP chunks without creating an arm command or cuRobo plan."""
+
+    def __init__(self, config: ArmTargetShadowConfig | None = None) -> None:
+        self.config = config or ArmTargetShadowConfig()
+
+    def validate(
+        self,
+        state: SimulationState,
+        decision: PolicyDecision,
+    ) -> dict[str, Any]:
+        if decision.route not in {"grasp", "place"}:
+            return {"validated": False, "reason": "route_has_no_arm_target"}
+        if not decision.arm_targets_base:
+            raise ValueError(f"{decision.route} decision has no arm_targets_base")
+        if state.tcp_pose is None:
+            raise ValueError("arm target shadow validation requires current tcp_pose")
+
+        current = ObservationEncoder()._arm_tcp_base(state)
+        previous = tuple(float(value) for value in current[:6])
+        reports: list[dict[str, Any]] = []
+        for index, target in enumerate(decision.arm_targets_base):
+            xyz = target[:3]
+            for axis_index, axis_name in enumerate("xyz"):
+                if not (
+                    self.config.min_xyz[axis_index]
+                    <= xyz[axis_index]
+                    <= self.config.max_xyz[axis_index]
+                ):
+                    raise ValueError(
+                        f"arm_targets_base[{index}] {axis_name} outside workspace"
+                    )
+            translation = math.sqrt(
+                sum((target[axis] - previous[axis]) ** 2 for axis in range(3))
+            )
+            rotation = max(
+                abs(wrap_yaw(target[axis] - previous[axis]))
+                for axis in range(3, 6)
+            )
+            if translation > self.config.max_translation_step_m:
+                raise ValueError(
+                    f"arm_targets_base[{index}] translation step {translation:.3f} m "
+                    f"exceeds {self.config.max_translation_step_m:.3f} m"
+                )
+            if rotation > self.config.max_rotation_step_rad:
+                raise ValueError(
+                    f"arm_targets_base[{index}] rotation step {rotation:.3f} rad "
+                    f"exceeds {self.config.max_rotation_step_rad:.3f} rad"
+                )
+            reports.append(
+                {
+                    "index": index,
+                    "translation_step_m": translation,
+                    "rotation_step_rad": rotation,
+                    "gripper": target[-1],
+                }
+            )
+            previous = tuple(float(value) for value in target[:6])
+        return {
+            "validated": True,
+            "mode": "shadow_no_execution",
+            "target_count": len(reports),
+            "targets": reports,
+        }
 
 
 class RemotePolicySession:
@@ -37,13 +112,25 @@ class RemotePolicySession:
         client: RemotePolicyClient,
         encoder: ObservationEncoder,
         episode_spec: EpisodeSpec,
+        arm_mode: str = "route_only",
+        arm_shadow_validator: RemoteVLAArmTargetShadowValidator | None = None,
     ) -> None:
         self.client = client
         self.encoder = encoder
         self.episode_spec = episode_spec
+        if arm_mode not in {"route_only", "shadow"}:
+            raise ValueError(f"unsupported remote VLA arm_mode={arm_mode!r}")
+        self.arm_mode = arm_mode
+        self.arm_shadow_validator = (
+            arm_shadow_validator or RemoteVLAArmTargetShadowValidator()
+        )
         self.inference_count = 0
         self.last_decision: PolicyDecision | None = None
         self.server_health: dict[str, Any] = {}
+        self.route_counts: dict[str, int] = {}
+        self.phase_counts: dict[str, int] = {}
+        self.roundtrip_ms: list[float] = []
+        self.last_arm_shadow_report: dict[str, Any] = {}
 
     def start(self) -> dict[str, Any]:
         health = self.client.health()
@@ -59,15 +146,29 @@ class RemotePolicySession:
             phase=phase,
         )
         decision = self.client.infer(payload)
+        arm_shadow_report: dict[str, Any] = {}
+        if self.arm_mode == "shadow" and decision.route in {"grasp", "place"}:
+            arm_shadow_report = self.arm_shadow_validator.validate(state, decision)
+            self.last_arm_shadow_report = dict(arm_shadow_report)
         decision = replace(
             decision,
             metadata={
                 **decision.metadata,
                 "server_health": self.server_health,
                 "inference_index": self.inference_count + 1,
+                "phase": phase,
+                "arm_mode": self.arm_mode,
+                "arm_shadow_report": arm_shadow_report,
             },
         )
         self.inference_count += 1
+        self.route_counts[decision.route] = self.route_counts.get(decision.route, 0) + 1
+        self.phase_counts[phase] = self.phase_counts.get(phase, 0) + 1
+        timing = decision.metadata.get("remote_timing")
+        if isinstance(timing, dict):
+            roundtrip = timing.get("client_roundtrip_ms")
+            if isinstance(roundtrip, (int, float)):
+                self.roundtrip_ms.append(float(roundtrip))
         self.last_decision = decision
         return decision
 
@@ -76,6 +177,25 @@ class RemotePolicySession:
 
     def close(self) -> None:
         self.client.close()
+
+    def status(self) -> dict[str, Any]:
+        return {
+            "protocol_health": dict(self.server_health),
+            "arm_mode": self.arm_mode,
+            "inference_count": self.inference_count,
+            "route_counts": dict(self.route_counts),
+            "phase_counts": dict(self.phase_counts),
+            "client_roundtrip_ms_mean": (
+                sum(self.roundtrip_ms) / len(self.roundtrip_ms)
+                if self.roundtrip_ms
+                else None
+            ),
+            "client_roundtrip_ms_max": max(self.roundtrip_ms) if self.roundtrip_ms else None,
+            "last_decision": (
+                None if self.last_decision is None else self.last_decision.to_dict()
+            ),
+            "last_arm_shadow_report": dict(self.last_arm_shadow_report),
+        }
 
 
 class RemoteVLANavPlanner:
@@ -199,6 +319,7 @@ class RecedingHorizonNavExecutor:
         self.failure_reason = ""
         self.replan_count = 0
         self.last_replan_report: dict[str, Any] = {}
+        self.chunk_started_step: int | None = None
 
     def reset(self, plan: NavPlan) -> None:
         raw_goal = plan.metadata.get("evaluation_task_goal") or {}
@@ -216,6 +337,7 @@ class RecedingHorizonNavExecutor:
         self.failure_reason = ""
         self.replan_count = 0
         self.last_replan_report = {}
+        self.chunk_started_step = None
         self._accept_plan(plan)
 
     def compute_action(self, state: SimulationState) -> RobotAction:
@@ -224,6 +346,15 @@ class RecedingHorizonNavExecutor:
                 source="remote_vla_navigation_stop",
                 metadata={"remote_vla_terminal_route": self.terminal_route},
             )
+        if self.chunk_started_step is None:
+            self.chunk_started_step = int(state.step_index)
+        elif (
+            int(state.step_index) - self.chunk_started_step
+            > self.planner.safety.max_chunk_execution_steps
+        ):
+            self.failed = True
+            self.failure_reason = "remote_vla_waypoint_chunk_expired"
+            return RobotAction.idle(source=self.failure_reason)
         if not self.executor.is_done(state):
             return self.executor.compute_action(state)
         if self.replan_count >= self.planner.safety.max_replans_per_navigation:
@@ -239,6 +370,7 @@ class RecedingHorizonNavExecutor:
             )
             self.replan_count += 1
             self._accept_plan(refreshed)
+            self.chunk_started_step = int(state.step_index)
             self.last_replan_report = {
                 "replan_count": self.replan_count,
                 "route": refreshed.metadata.get("remote_vla_route"),

@@ -5,6 +5,7 @@ import math
 import pytest
 
 from source.evaluation.adapters import (
+    RemoteVLAArmTargetShadowValidator,
     RecedingHorizonNavExecutor,
     RemoteVLANavPlanner,
 )
@@ -129,3 +130,49 @@ def test_wrong_terminal_route_fails_before_manipulation() -> None:
     status = executor.status()
     assert status["failed"] is True
     assert "expected=grasp actual=place" in status["failure_reason"]
+
+
+def test_arm_shadow_validator_accepts_small_base_frame_chunk() -> None:
+    state = SimulationState(
+        step_index=0,
+        timestamp=0.0,
+        robot_root_pose=(0.0, 0.0, 0.5, 1.0, 0.0, 0.0, 0.0),
+        robot_root_velocity=(0.0,) * 6,
+        tcp_pose=(0.30, 0.0, 0.70, 1.0, 0.0, 0.0, 0.0),
+    )
+    decision = PolicyDecision(
+        route="grasp",
+        arm_targets_base=((0.34, 0.0, 0.22, 0.0, 0.1, 0.0, 0.4),),
+    )
+    report = RemoteVLAArmTargetShadowValidator().validate(state, decision)
+    assert report["validated"] is True
+    assert report["target_count"] == 1
+
+
+def test_arm_shadow_validator_rejects_missing_targets() -> None:
+    with pytest.raises(ValueError, match="no arm_targets_base"):
+        RemoteVLAArmTargetShadowValidator().validate(
+            _state(), PolicyDecision(route="place")
+        )
+
+
+def test_nav_executor_expires_a_stale_chunk() -> None:
+    session = _Session(
+        [PolicyDecision(route="nav", nav_waypoints=((0.25, 0.0, 0.0),))]
+    )
+    planner = RemoteVLANavPlanner(session, _episode())
+    planner.safety = type(planner.safety)(max_chunk_execution_steps=1)
+    base = _Executor()
+    base.done = False
+    executor = RecedingHorizonNavExecutor(planner, base)
+    executor.reset(planner.plan(_state(), _episode().pick_goal))
+    executor.compute_action(_state())
+    late = SimulationState(
+        step_index=2,
+        timestamp=0.04,
+        robot_root_pose=_state().robot_root_pose,
+        robot_root_velocity=(0.0,) * 6,
+    )
+    executor.compute_action(late)
+    assert executor.status()["failed"] is True
+    assert executor.status()["failure_reason"] == "remote_vla_waypoint_chunk_expired"

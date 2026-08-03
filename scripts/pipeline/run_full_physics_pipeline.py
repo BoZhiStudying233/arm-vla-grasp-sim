@@ -890,6 +890,16 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--vla-response-timeout-s", type=float, default=120.0)
     parser.add_argument("--vla-jpeg-quality", type=int, default=90)
     parser.add_argument("--vla-max-replans", type=int, default=64)
+    parser.add_argument("--vla-max-chunk-steps", type=int, default=250)
+    parser.add_argument(
+        "--vla-arm-mode",
+        choices=("route_only", "shadow"),
+        default="route_only",
+        help=(
+            "route_only 仅用 GRASP/PLACE route 门控确定性 cuRobo；"
+            "shadow 额外强制校验并记录模型 arm_targets_base，但不执行模型 TCP。"
+        ),
+    )
     mode_group = parser.add_mutually_exclusive_group()
     mode_group.add_argument(
         "--dry-run",
@@ -1175,6 +1185,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise SystemExit("--vla-jpeg-quality 必须在 1..100。")
         if args.vla_max_replans <= 0:
             raise SystemExit("--vla-max-replans 必须大于 0。")
+        if args.vla_max_chunk_steps <= 0:
+            raise SystemExit("--vla-max-chunk-steps 必须大于 0。")
     if stair_locomotion_smoke and args.pct_stair_float:
         raise SystemExit("--stair-locomotion-smoke 固定禁用 Float，请不要传 --pct-stair-float。")
     if args.record_video and dry_run:
@@ -1778,6 +1790,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                         response_timeout_s=float(args.vla_response_timeout_s),
                         jpeg_quality=int(args.vla_jpeg_quality),
                         max_replans_per_navigation=int(args.vla_max_replans),
+                        max_chunk_execution_steps=int(args.vla_max_chunk_steps),
+                        arm_mode=str(args.vla_arm_mode),
                         close_simulation_on_exit=not share_runtime,
                     )
                 else:

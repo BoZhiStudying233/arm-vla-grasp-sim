@@ -60,6 +60,10 @@ class FullPhysicsBatchTest(unittest.TestCase):
                 "ws://127.0.0.1:10193",
                 "--vla-max-replans",
                 "12",
+                "--vla-max-chunk-steps",
+                "180",
+                "--vla-arm-mode",
+                "shadow",
                 "--no-record-dataset",
             ]
         )
@@ -71,6 +75,8 @@ class FullPhysicsBatchTest(unittest.TestCase):
         self.assertEqual(child_args.mode, "remote_vla_eval")
         self.assertEqual(child_args.vla_endpoint, "ws://127.0.0.1:10193")
         self.assertEqual(child_args.vla_max_replans, 12)
+        self.assertEqual(child_args.vla_max_chunk_steps, 180)
+        self.assertEqual(child_args.vla_arm_mode, "shadow")
         self.assertFalse(child_args.record_dataset)
 
     def test_reused_process_command_runs_all_episodes_in_one_output_root(self) -> None:

@@ -1095,6 +1095,13 @@ class FullPhysicsStateMachine:
         )
 
     def summary_fields(self) -> dict[str, Any]:
+        semantic_policy_status = {}
+        status = getattr(self.semantic_route_policy, "status", None)
+        if callable(status):
+            try:
+                semantic_policy_status = dict(status())
+            except Exception as exc:
+                semantic_policy_status = {"status_error": str(exc)}
         return {
             "success": self.state == PipelineState.DONE,
             "failure_reason": self.failure_reason,
@@ -1135,6 +1142,7 @@ class FullPhysicsStateMachine:
             "place_max_horizontal_displacement_m": (
                 self._place_max_horizontal_displacement_m
             ),
+            "remote_vla": semantic_policy_status,
         }
 
     def _require_semantic_route(
