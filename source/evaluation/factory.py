@@ -34,6 +34,8 @@ def create_remote_vla_evaluation_pipeline(
     max_chunk_execution_steps: int,
     arm_mode: str,
     close_simulation_on_exit: bool = True,
+    first_waypoint_only: bool = False,
+    arm_gate=None,
 ):
     client = RemotePolicyClient(
         RemotePolicyClientConfig(
@@ -47,6 +49,7 @@ def create_remote_vla_evaluation_pipeline(
         encoder=ObservationEncoder(jpeg_quality=jpeg_quality),
         episode_spec=episode_spec,
         arm_mode=arm_mode,
+        arm_gate=arm_gate,
     )
     try:
         session.start()
@@ -62,6 +65,7 @@ def create_remote_vla_evaluation_pipeline(
                 max_replans_per_navigation=max_replans_per_navigation,
                 max_chunk_execution_steps=max_chunk_execution_steps,
             ),
+            first_waypoint_only=first_waypoint_only,
         )
         return planner, RecedingHorizonNavExecutor(planner, base_executor)
 

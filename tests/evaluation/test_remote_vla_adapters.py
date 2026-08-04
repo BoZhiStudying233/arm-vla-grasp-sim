@@ -8,6 +8,7 @@ from source.evaluation.adapters import (
     RemoteVLAArmTargetShadowValidator,
     RecedingHorizonNavExecutor,
     RemoteVLANavPlanner,
+    RemotePolicySession,
 )
 from source.evaluation.protocol import PolicyDecision
 from source.interfaces import EpisodeSpec, NavGoal, RobotAction, SimulationState
@@ -92,6 +93,63 @@ def test_body_waypoints_are_transformed_to_world_plan() -> None:
     assert plan.waypoints[1][1] == pytest.approx(0.25)
     assert plan.goal.y == pytest.approx(0.50)
     assert plan.goal.yaw == pytest.approx(math.pi / 2 + 0.1)
+
+
+def test_first_waypoint_only_keeps_single_body_waypoint() -> None:
+    session = _Session(
+        [
+            PolicyDecision(
+                route="nav",
+                nav_waypoints=((0.25, 0.0, 0.0), (0.50, 0.0, 0.1)),
+            )
+        ]
+    )
+    planner = RemoteVLANavPlanner(session, _episode(), first_waypoint_only=True)
+    plan = planner.plan(_state(), _episode().pick_goal)
+    assert len(plan.waypoints) == 2  # start + first waypoint
+    assert plan.metadata["remote_vla_waypoints_body"] == [[0.25, 0.0, 0.0]]
+    assert plan.goal.y == pytest.approx(0.25)
+
+
+def test_remote_policy_session_arm_gate_skips_grasp() -> None:
+    class _Client:
+        def health(self):
+            return {"ok": True}
+
+        def reset(self, episode_id):
+            return {"ok": True}
+
+        def infer(self, payload):
+            return PolicyDecision(
+                route="grasp",
+                subtask="Pick up the can.",
+                arm_targets_base=((0.3, 0.0, 0.2, 0.0, 0.0, 0.0, 1.0),),
+            )
+
+    class _Encoder:
+        def build_payload(self, state, *, instruction, episode_id, phase):
+            return {"phase": phase}
+
+    gate_calls = []
+
+    def gate(decision):
+        gate_calls.append(decision.route)
+        return False
+
+    session = RemotePolicySession(
+        client=_Client(),
+        encoder=_Encoder(),
+        episode_spec=_episode(),
+        arm_mode="shadow",
+        arm_gate=gate,
+    )
+    decision = session.predict(_state(), phase="nav_to_pick")
+
+    assert gate_calls == ["grasp"]
+    assert decision.route == "recover"
+    assert decision.subtask is not None
+    assert decision.subtask.startswith("operator_skipped_grasp")
+    assert decision.arm_targets_base == ()
 
 
 def test_executor_replans_then_stops_on_grasp_route() -> None:

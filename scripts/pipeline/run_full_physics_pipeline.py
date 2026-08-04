@@ -99,6 +99,55 @@ def _optional_project_path(raw_path: str | Path | None) -> Path | None:
     return None if raw_path is None else _project_path(raw_path)
 
 
+def _build_vla_arm_gate():
+    """按环境变量构造人工门控回调；未设置则返回 None（保持全自动）。
+
+    交互评测入口会设置 ``VLA_ARM_GATE_YAML``，从 yaml 读取确认提示。
+    收到 GRASP/PLACE 决策时终端阻塞等待数字输入：1=执行，0=跳过。
+    """
+
+    gate_yaml = os.environ.get("VLA_ARM_GATE_YAML", "").strip()
+    if not gate_yaml:
+        return None
+
+    import yaml as _yaml
+
+    gate_path = Path(gate_yaml).expanduser().resolve()
+    if not gate_path.is_file():
+        raise ValueError(f"VLA_ARM_GATE_YAML 指向的文件不存在: {gate_path}")
+    with gate_path.open(encoding="utf-8") as stream:
+        cfg = _yaml.safe_load(stream) or {}
+    interactive_cfg = cfg.get("interactive") or {}
+    prompt_template = str(
+        interactive_cfg.get(
+            "arm_confirm_prompt",
+            "是否执行 {route}？输入 1=执行 0=跳过: ",
+        )
+    )
+
+    def gate(decision) -> bool:
+        route = str(decision.route)
+        prompt = prompt_template.format(route=route, subtask=decision.subtask)
+        while True:
+            try:
+                raw = input(prompt).strip()
+                choice = int(raw)
+            except (EOFError, KeyboardInterrupt):
+                print("[vla] 输入中断，按跳过处理")
+                return False
+            except ValueError:
+                print("[vla] 输入无效，请输入 0 或 1")
+                continue
+            if choice == 1:
+                return True
+            if choice == 0:
+                print(f"[vla] {route} 被操作者跳过")
+                return False
+            print("[vla] 请输入 0 或 1")
+
+    return gate
+
+
 def _parse_xyz_points(
     raw_values: Sequence[str] | None,
     *,
@@ -899,6 +948,12 @@ def _build_parser() -> argparse.ArgumentParser:
             "route_only 仅用 GRASP/PLACE route 门控确定性 cuRobo；"
             "shadow 额外强制校验并记录模型 arm_targets_base，但不执行模型 TCP。"
         ),
+    )
+    parser.add_argument(
+        "--vla-first-waypoint-only",
+        action="store_true",
+        default=False,
+        help="NAV 只执行模型 chunk 的第一个 waypoint，到位后再请求下一次推理。",
     )
     mode_group = parser.add_mutually_exclusive_group()
     mode_group.add_argument(
@@ -1793,6 +1848,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                         max_chunk_execution_steps=int(args.vla_max_chunk_steps),
                         arm_mode=str(args.vla_arm_mode),
                         close_simulation_on_exit=not share_runtime,
+                        first_waypoint_only=bool(args.vla_first_waypoint_only),
+                        arm_gate=_build_vla_arm_gate(),
                     )
                 else:
                     pipeline = create_full_physics_pipeline(

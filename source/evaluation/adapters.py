@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, replace
-from typing import Any
+from typing import Any, Callable
 
 from source.interfaces import (
     EpisodeSpec,
@@ -114,6 +114,7 @@ class RemotePolicySession:
         episode_spec: EpisodeSpec,
         arm_mode: str = "route_only",
         arm_shadow_validator: RemoteVLAArmTargetShadowValidator | None = None,
+        arm_gate: Callable[[PolicyDecision], bool] | None = None,
     ) -> None:
         self.client = client
         self.encoder = encoder
@@ -124,6 +125,7 @@ class RemotePolicySession:
         self.arm_shadow_validator = (
             arm_shadow_validator or RemoteVLAArmTargetShadowValidator()
         )
+        self.arm_gate = arm_gate
         self.inference_count = 0
         self.last_decision: PolicyDecision | None = None
         self.server_health: dict[str, Any] = {}
@@ -146,6 +148,20 @@ class RemotePolicySession:
             phase=phase,
         )
         decision = self.client.infer(payload)
+        if self.arm_gate is not None and decision.route in {"grasp", "place"}:
+            approved = self.arm_gate(decision)
+            if not approved:
+                decision = replace(
+                    decision,
+                    route="recover",
+                    subtask=(
+                        "operator_skipped_"
+                        + str(decision.route)
+                        + ((": " + str(decision.subtask)) if decision.subtask else "")
+                    ),
+                    nav_waypoints=(),
+                    arm_targets_base=(),
+                )
         arm_shadow_report: dict[str, Any] = {}
         if self.arm_mode == "shadow" and decision.route in {"grasp", "place"}:
             arm_shadow_report = self.arm_shadow_validator.validate(state, decision)
@@ -204,10 +220,12 @@ class RemoteVLANavPlanner:
         session: RemotePolicySession,
         episode_spec: EpisodeSpec,
         safety: WaypointSafetyConfig | None = None,
+        first_waypoint_only: bool = False,
     ) -> None:
         self.session = session
         self.episode_spec = episode_spec
         self.safety = safety or WaypointSafetyConfig()
+        self.first_waypoint_only = bool(first_waypoint_only)
 
     def plan(self, state: SimulationState, goal: NavGoal) -> NavPlan:
         phase = self._phase_for_goal(goal)
@@ -250,7 +268,10 @@ class RemoteVLANavPlanner:
         world_points: list[tuple[float, float, float]] = []
         cosine = math.cos(current_yaw)
         sine = math.sin(current_yaw)
-        for dx, dy, dyaw in decision.nav_waypoints:
+        raw_waypoints = decision.nav_waypoints
+        if self.first_waypoint_only and len(raw_waypoints) > 1:
+            raw_waypoints = raw_waypoints[:1]
+        for dx, dy, dyaw in raw_waypoints:
             point = (
                 current_x + cosine * dx - sine * dy,
                 current_y + sine * dx + cosine * dy,
@@ -273,7 +294,7 @@ class RemoteVLANavPlanner:
             metadata={
                 **metadata,
                 "remote_vla_waypoints_body": [
-                    list(point) for point in decision.nav_waypoints
+                    list(point) for point in raw_waypoints
                 ],
             },
         )

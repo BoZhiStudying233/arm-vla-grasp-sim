@@ -1,0 +1,43 @@
+# 仿真 VLA 交互评测配置（pct_scene）
+# 用一条命令启动：python scripts/evaluation/run_vla_sim_interactive.py --config configs/vla_eval/sim_liangzhu.yaml
+
+server:
+  endpoint: ws://127.0.0.1:10093
+  connect_timeout_s: 10.0
+  response_timeout_s: 120.0
+
+task:
+  # 任务 instruction 直接传给远程模型
+  instruction: "Pick up the coke can on box1 and place it on box2."
+  episode_id: "sim_vla_liangzhu_0001"
+  # 场景 profile 或直接指定场景文件
+  scene_profile: liangzhu
+  scene_usd: null            # 为空则用 profile 默认；可填绝对/相对路径覆盖
+  task_json: tasks/nav_pick_place_cola_liangzhu_pct.json
+
+sim:
+  seed: 42
+  # 机器狗起始位姿（覆盖 task json 的 start）
+  robot_start_override:
+    x: -1.4849319648011197
+    y: 1.5885989660024645
+    yaw: 0.0
+  # 物体初始位姿（覆盖 task json 的 object_initial_pose）
+  object_pose_override: null
+  headless: false
+  num_episodes: 1
+  jpeg_quality: 90
+
+interactive:
+  # nav 阶段：走到预测的第一个 waypoint 后请求下一次推理
+  nav_waypoint_tolerance_m: 0.12
+  nav_yaw_tolerance_rad: 0.14
+  nav_max_steps_per_waypoint: 500
+  nav_max_replans: 64
+  # 抓取/放置人工门控：收到 grasp/place 决策后阻塞等待数字输入
+  arm_confirm_prompt: "是否执行 {route}？输入 1=执行 0=跳过: "
+  arm_confirm_timeout_s: null    # null=无限等待；可填秒数
+  # 终端实时显示
+  show_raw_text: true
+  show_timing: true
+  jsonl_out: results/vla_eval/sim_vla_interactive.jsonl
