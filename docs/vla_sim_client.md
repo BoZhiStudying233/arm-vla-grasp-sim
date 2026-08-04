@@ -3,6 +3,9 @@
 本文描述如何在仿真侧（pct_scene）启动 Isaac 场景并运行远程 StarVLA 交互 client。
 所有参数集中在 YAML，一条命令启动。
 
+仿真侧跑在远程仿真主机上（pct_scene 仓库所在机器）。启动前先登录仿真主机，
+确认仓库已同步（`git pull` 或 rsync）以及本机 `127.0.0.1:10093` 隧道已建立。
+
 ## 1. 配置（YAML）
 
 `configs/vla_eval/sim_liangzhu.yaml`：
@@ -58,7 +61,7 @@ interactive:
 ## 3. 启动
 
 ```bash
-cd /home/natural/Desktop/mtr/pct_scene
+cd /path/to/pct_scene          # 仿真主机上的仓库（例如 /home/natural/Desktop/mtr/pct_scene）
 bash scripts/evaluation/run_vla_sim_all.sh --config configs/vla_eval/sim_liangzhu.yaml
 ```
 
