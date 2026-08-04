@@ -134,6 +134,8 @@ class InteractiveVLAController:
         self.frame_index = 0
         self.inference_count = 0
         self.replan_count = 0
+        self.locked_route: str | None = None
+        self.locked_subtask: str | None = None
         self.records: list[InferenceRecord] = []
         self.log_path = Path(config.jsonl_out) if config.jsonl_out else None
 
@@ -190,6 +192,9 @@ class InteractiveVLAController:
             phase=self.phase,
             frame_index=self.frame_index,
         )
+        if self.locked_route is not None:
+            payload["locked_route"] = self.locked_route
+            payload["locked_subtask"] = self.locked_subtask or ""
         started = time.perf_counter()
         try:
             decision = self.client.infer(payload)
@@ -200,17 +205,35 @@ class InteractiveVLAController:
         elapsed_ms = round((time.perf_counter() - started) * 1000.0, 3)
         self.inference_count += 1
 
+        decision_route = str(getattr(decision, "route", "")).strip().lower()
+        decision_subtask = getattr(decision, "subtask", None)
+        if (
+            self.locked_route is not None
+            and decision_route == self.locked_route
+            and (decision_subtask or "") == (self.locked_subtask or "")
+        ):
+            # 锁定期间模型只回 action；route/subtask 沿用锁定值。
+            decision_route = self.locked_route
+            decision_subtask = self.locked_subtask
+        elif decision_route in {"nav", "grasp", "place"}:
+            # 完整推理得到新 route/subtask：锁定，后续只跑 action。
+            self.locked_route = decision_route
+            self.locked_subtask = (
+                str(decision_subtask).strip() if decision_subtask else ""
+            )
+
         waypoints = getattr(decision, "nav_waypoints", ()) or ()
         arm_targets = getattr(decision, "arm_targets_base", ()) or ()
         record = InferenceRecord(
             frame_index=self.frame_index,
             phase=self.phase,
-            route=str(getattr(decision, "route", "")),
-            subtask=getattr(decision, "subtask", None),
+            route=decision_route,
+            subtask=decision_subtask,
             nav_waypoints=tuple(tuple(float(v) for v in p) for p in waypoints),
             arm_targets_base=tuple(tuple(float(v) for v in t) for t in arm_targets),
             raw_text=str(getattr(decision, "raw_text", "")),
             timing_ms=elapsed_ms,
+            extra={"locked_action": self.locked_route is not None},
         )
         self.records.append(record)
         self._print_decision(record)
@@ -260,6 +283,8 @@ class InteractiveVLAController:
         choice = self._ask_number(prompt)
         if choice != 1:
             self.display(f"[vla] {record.route} skipped by operator")
+            # 跳过也解锁：允许下一次完整路由切换到下一个 subtask。
+            self.unlock()
             self._append_jsonl(
                 {
                     "event": "arm_gate",
@@ -271,6 +296,8 @@ class InteractiveVLAController:
             return
         report = self.arm_executor.execute_arm_target(record.arm_targets_base[0])
         self.display(f"[vla] {record.route} executed: {report}")
+        # 机械臂执行完成后解锁，允许下一次完整路由切换到下一个 subtask。
+        self.unlock()
         self._append_jsonl(
             {
                 "event": "arm_exec",
@@ -280,6 +307,12 @@ class InteractiveVLAController:
                 "report": report,
             }
         )
+
+    def unlock(self) -> None:
+        """结束当前锁定，下一次推理重新做完整路由。"""
+        self.locked_route = None
+        self.locked_subtask = None
+        self._append_jsonl({"event": "unlock"})
 
     def _ask_number(self, prompt: str) -> int:
         while True:
