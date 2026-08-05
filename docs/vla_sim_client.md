@@ -54,6 +54,10 @@ interactive:
 ## 2. 启动前提
 
 1. 推理服务已启动（见 `starVLA_sc/docs/vla_remote_inference_server.md`）；
+   - 注意服务端代码需与 checkpoint 架构匹配：2025-08 后新训练产物使用
+     **按 step 索引归一化**（`dataset_statistics.json` 为 `[horizon,10]`），
+     双 expert（NAV/ARM 两个 head）用 `robodog_two_heads` 分支；
+     client 协议不变，仍按 route 取 `nav_waypoints` / `arm_targets_base`。
 2. 本机 `127.0.0.1:10093` 可访问（SSH 本地转发已建立）；
 3. 机器上有可运行的 Isaac Sim 环境（需设置 `ISAAC_PYTHON` 指向含 Isaac 的
    Python，缺省用当前 `python3`）。
