@@ -496,7 +496,13 @@ class FullPhysicsPipelineTest(unittest.TestCase):
                 "gripper_joint_positions"
             ]
             self.assertAlmostEqual(hold_positions[0], 0.023)
-            self.assertAlmostEqual(hold_positions[1], 0.008)
+            self.assertAlmostEqual(hold_positions[1], 0.023)
+            self.assertAlmostEqual(
+                pipeline.machine._carry_gripper_target[
+                    "verified_follower_error_m"
+                ],
+                0.015,
+            )
             self.assertEqual(
                 pipeline.machine._carry_gripper_target["commanded_close_positions"],
                 (0.0, 0.0),

@@ -290,8 +290,32 @@ def training_wrist_camera_object_clearance_verified(
     )
 
 
+def training_gripper_symmetry_verified(summary: dict[str, Any]) -> bool:
+    """拒绝 runtime 已报告且超过门限的双指不同步 episode。"""
+
+    simulation_report = summary.get("simulation_report")
+    simulation_report = (
+        simulation_report if isinstance(simulation_report, dict) else {}
+    )
+    report = simulation_report.get("gripper_symmetry_report")
+    # 旧 summary 没有该字段时保持可读取；新版 Isaac runtime 总会生成报告。
+    if report is None:
+        return True
+    return bool(
+        isinstance(report, dict)
+        and report.get("required_for_training") is True
+        and report.get("available") is True
+        and isinstance(report.get("sample_count"), int)
+        and report["sample_count"] > 0
+        and report.get("verified") is True
+        and isinstance(report.get("max_abs_error_m"), int | float)
+        and isinstance(report.get("tolerance_m"), int | float)
+        and float(report["max_abs_error_m"]) <= float(report["tolerance_m"])
+    )
+
+
 def training_quality_success_verified(summary: dict[str, Any]) -> bool:
-    """物理来源、RGB、支撑体、Mesh-truth 与 wrist clearance 必须同时通过。"""
+    """物理来源、RGB、任务几何、相机和夹爪对称性必须同时通过。"""
 
     return bool(
         physical_execution_success_verified(summary)
@@ -299,6 +323,7 @@ def training_quality_success_verified(summary: dict[str, Any]) -> bool:
         and training_receptacle_support_verified(summary)
         and training_mesh_truth_manipulation_targets_verified(summary)
         and training_wrist_camera_object_clearance_verified(summary)
+        and training_gripper_symmetry_verified(summary)
     )
 
 

@@ -13,6 +13,7 @@ from .frame_utils import yaw_to_quat_wxyz
 
 ARM_JOINT_NAMES = [f"arm_joint{index}" for index in range(1, 7)]
 GRIPPER_JOINT_NAMES = ["arm_joint7", "arm_joint8"]
+GRIPPER_MASTER_JOINT_NAME = GRIPPER_JOINT_NAMES[0]
 DOG_JOINT_NAMES = [
     f"{leg}_{joint}_joint"
     for leg in ("FR", "FL", "RR", "RL")
@@ -69,6 +70,7 @@ class Go2LocomotionAdapter:
         self.dog_joint_ids, _ = self.robot.find_joints(DOG_JOINT_NAMES, preserve_order=True)
         self.arm_joint_ids, _ = self.robot.find_joints(ARM_JOINT_NAMES, preserve_order=True)
         self.gripper_joint_ids, _ = self.robot.find_joints(GRIPPER_JOINT_NAMES, preserve_order=True)
+        self.gripper_control_joint_ids = self.gripper_joint_ids[:1]
         self.ee_body_ids, _ = self.robot.find_bodies(["arm_link6"])
         self.dog_action_indices = self._resolve_action_indices(DOG_JOINT_NAMES)
         self.arm_action_indices = self._resolve_action_indices(ARM_JOINT_NAMES)
@@ -345,11 +347,16 @@ class Go2LocomotionAdapter:
                     }
             target_parts.append(arm_target)
 
-        if len(self.gripper_joint_ids) == len(GRIPPER_JOINT_NAMES):
-            joint_ids.extend(int(index) for index in self.gripper_joint_ids)
-            joint_names.extend(GRIPPER_JOINT_NAMES)
+        gripper_control_joint_ids = getattr(
+            self,
+            "gripper_control_joint_ids",
+            self.gripper_joint_ids[:1],
+        )
+        if len(gripper_control_joint_ids) == 1:
+            joint_ids.extend(int(index) for index in gripper_control_joint_ids)
+            joint_names.append(GRIPPER_MASTER_JOINT_NAME)
             target_parts.append(
-                self.robot.data.joint_pos[0, self.gripper_joint_ids]
+                self.robot.data.joint_pos[0, gripper_control_joint_ids]
                 .detach()
                 .clone()
                 .reshape(1, -1)
@@ -404,56 +411,69 @@ class Go2LocomotionAdapter:
         }
 
     def _apply_gripper_joint_target(self) -> None:
-        if len(self.gripper_joint_ids) != 2:
+        control_joint_ids = getattr(
+            self,
+            "gripper_control_joint_ids",
+            self.gripper_joint_ids[:1],
+        )
+        if len(control_joint_ids) != 1:
             return
         import torch
 
         gripper_target = (
-            torch.zeros((1, 2), dtype=torch.float32, device=self.runtime.device)
+            torch.zeros((1, 1), dtype=torch.float32, device=self.runtime.device)
             if self._gripper_joint_target is None
             else torch.as_tensor(
                 self._gripper_joint_target,
                 dtype=torch.float32,
                 device=self.runtime.device,
-            ).reshape(1, -1)
+            ).reshape(1, -1)[:, :1]
         )
-        self.robot.set_joint_position_target(gripper_target, joint_ids=self.gripper_joint_ids)
+        self.robot.set_joint_position_target(gripper_target, joint_ids=control_joint_ids)
 
     def apply_gripper_joint_target(self) -> dict[str, Any]:
         """把当前夹爪目标写成 articulation position target，不改写关节状态。"""
 
         if self._gripper_joint_target is None:
             return {"applied": False, "reason": "gripper_joint_target_disabled"}
-        if len(self.gripper_joint_ids) != len(GRIPPER_JOINT_NAMES):
+        control_joint_ids = getattr(
+            self,
+            "gripper_control_joint_ids",
+            self.gripper_joint_ids[:1],
+        )
+        if len(control_joint_ids) != 1:
             return {
                 "applied": False,
-                "reason": "gripper_joint_id_count_mismatch",
-                "joint_ids": [int(index) for index in self.gripper_joint_ids],
+                "reason": "gripper_control_joint_id_count_mismatch",
+                "joint_ids": [int(index) for index in control_joint_ids],
             }
         import torch
 
-        target = torch.as_tensor(
+        requested_target = torch.as_tensor(
             self._gripper_joint_target,
             dtype=torch.float32,
             device=self.runtime.device,
         ).reshape(1, -1)
-        if target.shape[1] != len(self.gripper_joint_ids):
+        if requested_target.shape[1] < 1:
             return {
                 "applied": False,
                 "reason": "gripper_joint_target_count_mismatch",
-                "target_count": int(target.shape[1]),
-                "joint_count": len(self.gripper_joint_ids),
+                "target_count": int(requested_target.shape[1]),
+                "joint_count": len(control_joint_ids),
             }
+        target = requested_target[:, :1]
         velocity_target = torch.zeros_like(target)
-        self.robot.set_joint_position_target(target, joint_ids=self.gripper_joint_ids)
-        self.robot.set_joint_velocity_target(velocity_target, joint_ids=self.gripper_joint_ids)
+        self.robot.set_joint_position_target(target, joint_ids=control_joint_ids)
+        self.robot.set_joint_velocity_target(velocity_target, joint_ids=control_joint_ids)
         return {
             "applied": True,
-            "joint_names": list(GRIPPER_JOINT_NAMES),
-            "joint_ids": [int(index) for index in self.gripper_joint_ids],
+            "joint_names": [GRIPPER_MASTER_JOINT_NAME],
+            "joint_ids": [int(index) for index in control_joint_ids],
             "target_positions": [
                 float(value) for value in target.reshape(-1).detach().cpu().tolist()
             ],
+            "follower_joint_names": [GRIPPER_JOINT_NAMES[1]],
+            "follower_control_mode": "physx_mimic_only",
             "uses_direct_joint_state": False,
         }
 

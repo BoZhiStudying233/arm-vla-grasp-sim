@@ -2830,20 +2830,30 @@ class FullPhysicsStateMachine:
         if any(name not in position_by_name for name in gripper_names):
             return
 
-        contact_positions = tuple(position_by_name[name] for name in gripper_names)
-        preload = float(self.config.manipulation.carry_gripper_preload_m)
-        hold_positions = tuple(
-            max(close_position, contact_position - preload)
-            for close_position, contact_position in zip(
-                close_positions,
-                contact_positions,
-            )
+        observed_contact_positions = tuple(
+            position_by_name[name] for name in gripper_names
         )
+        master_contact_position = observed_contact_positions[0]
+        preload = float(self.config.manipulation.carry_gripper_preload_m)
+        master_hold_position = max(
+            close_positions[0],
+            master_contact_position - preload,
+        )
+        hold_positions = tuple(master_hold_position for _ in gripper_names)
         target.update(
             {
                 "gripper_joint_positions": hold_positions,
                 "hold_position_source": "verified_contact_preload",
-                "verified_contact_positions": contact_positions,
+                "verified_contact_positions": observed_contact_positions,
+                "verified_master_contact_position": master_contact_position,
+                "verified_follower_error_m": (
+                    abs(
+                        observed_contact_positions[0]
+                        - observed_contact_positions[1]
+                    )
+                    if len(observed_contact_positions) > 1
+                    else None
+                ),
                 "carry_gripper_preload_m": preload,
             }
         )
@@ -3705,18 +3715,16 @@ def _gripper_motion_progress(
     if any(index >= len(observation.joint_positions) for index in joint_indices):
         return None
 
-    progress_values: list[float] = []
-    for index, start, target in zip(joint_indices, q_start, q_target):
-        span = target - start
-        if start >= target - 0.002:
-            progress_values.append(1.0)
-            continue
-        if abs(span) <= 1.0e-9:
-            continue
-        actual = float(observation.joint_positions[index])
-        if not math.isfinite(actual):
-            return None
-        progress_values.append(max(0.0, min(1.0, (actual - start) / span)))
-    if not progress_values:
+    # 夹爪只有 joint7 一个主动自由度；joint8 仅用于 mimic 对称性审计。
+    index = joint_indices[0]
+    start = q_start[0]
+    target = q_target[0]
+    span = target - start
+    if start >= target - 0.002:
+        return 1.0
+    if abs(span) <= 1.0e-9:
         return None
-    return min(progress_values)
+    actual = float(observation.joint_positions[index])
+    if not math.isfinite(actual):
+        return None
+    return max(0.0, min(1.0, (actual - start) / span))

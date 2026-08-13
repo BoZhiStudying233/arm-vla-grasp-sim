@@ -526,6 +526,7 @@ class IsaacLabNavigationRuntimeConfig:
     gripper_joint_names: tuple[str, str] = ("arm_joint7", "arm_joint8")
     gripper_open_position: float = 0.04
     gripper_close_position: float = 0.0
+    gripper_symmetry_tolerance_m: float = 0.005
     place_release_clearance_min_m: float = 0.013
     place_pre_clearance_min_m: float = 0.06
     # 这是 cuRobo 规划用的虚拟障碍膨胀，不改变 Isaac 真实物理碰撞体。
@@ -1735,6 +1736,14 @@ class IsaacLabNavigationRuntime:
             "gripper_joint_action_apply_count": 0,
             "gripper_close_apply_count": 0,
             "gripper_open_apply_count": 0,
+            "gripper_symmetry_report": {
+                "available": False,
+                "required_for_training": True,
+                "sample_count": 0,
+                "max_abs_error_m": 0.0,
+                "tolerance_m": float(self._config.gripper_symmetry_tolerance_m),
+                "verified": False,
+            },
             "world_count": 1,
             "opened_stage_count": 1,
             "stage_build_count": 0,
@@ -2111,6 +2120,16 @@ class IsaacLabNavigationRuntime:
                 "gripper_joint_action_apply_count": 0,
                 "gripper_close_apply_count": 0,
                 "gripper_open_apply_count": 0,
+                "gripper_symmetry_report": {
+                    "available": False,
+                    "required_for_training": True,
+                    "sample_count": 0,
+                    "max_abs_error_m": 0.0,
+                    "tolerance_m": float(
+                        self._config.gripper_symmetry_tolerance_m
+                    ),
+                    "verified": False,
+                },
                 "used_direct_joint_state": False,
                 "used_manipulation_base_lock": False,
                 "used_manipulation_support_joint_lock": False,
@@ -2225,6 +2244,7 @@ class IsaacLabNavigationRuntime:
             )
 
         robot = self._adapter.robot
+        self._update_gripper_symmetry_report(robot)
         self._consume_pending_arm_tracking_target(robot)
         root_position = robot.data.root_pos_w[0]
         root_quaternion = robot.data.root_quat_w[0]
@@ -2270,6 +2290,52 @@ class IsaacLabNavigationRuntime:
             camera_images=camera_images,
             metadata=metadata,
         )
+
+    def _update_gripper_symmetry_report(self, robot: Any) -> None:
+        """汇总 mimic 两指实际开度；仅报告，不改变数据列或物理状态。"""
+
+        joint_ids = tuple(int(index) for index in self._adapter.gripper_joint_ids)
+        tolerance = float(self._config.gripper_symmetry_tolerance_m)
+        previous = self._metadata.get("gripper_symmetry_report")
+        previous = previous if isinstance(previous, dict) else {}
+        if len(joint_ids) != 2:
+            self._metadata["gripper_symmetry_report"] = {
+                "available": False,
+                "required_for_training": True,
+                "reason": "gripper_state_joint_id_count_mismatch",
+                "joint_ids": joint_ids,
+                "sample_count": int(previous.get("sample_count") or 0),
+                "max_abs_error_m": float(previous.get("max_abs_error_m") or 0.0),
+                "tolerance_m": tolerance,
+                "verified": False,
+            }
+            return
+
+        positions = tuple(
+            _item(value) for value in robot.data.joint_pos[0, list(joint_ids)]
+        )
+        error = abs(positions[0] - positions[1])
+        sample_count = int(previous.get("sample_count") or 0) + 1
+        violation_count = int(previous.get("violation_count") or 0)
+        if error > tolerance:
+            violation_count += 1
+        max_error = max(float(previous.get("max_abs_error_m") or 0.0), error)
+        self._metadata["gripper_symmetry_report"] = {
+            "available": True,
+            "required_for_training": True,
+            "joint_names": tuple(self._config.gripper_joint_names),
+            "joint_ids": joint_ids,
+            "master_joint_name": self._config.gripper_joint_names[0],
+            "follower_joint_name": self._config.gripper_joint_names[1],
+            "follower_control_mode": "physx_mimic_only",
+            "sample_count": sample_count,
+            "violation_count": violation_count,
+            "latest_positions_m": positions,
+            "latest_abs_error_m": error,
+            "max_abs_error_m": max_error,
+            "tolerance_m": tolerance,
+            "verified": max_error <= tolerance,
+        }
 
     def apply(self, action: RobotAction) -> None:
         self._require_ready()
@@ -5655,7 +5721,12 @@ class IsaacLabNavigationRuntime:
                     "IsaacLabNavigationRuntime only supports fixed gripper joint order: "
                     f"{self._config.gripper_joint_names}, got {joint_names}"
                 )
-            target = tuple(float(value) for value in metadata["gripper_joint_positions"])
+            requested_target = tuple(
+                float(value) for value in metadata["gripper_joint_positions"]
+            )
+            if not requested_target:
+                raise RuntimeError("gripper_joint_positions must not be empty")
+            target = tuple(requested_target[0] for _ in requested_target)
             source = "metadata"
         elif action.gripper_command == "open":
             joint_names = tuple(self._config.gripper_joint_names)

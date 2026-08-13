@@ -256,7 +256,9 @@ class SegmentedArmExecutor:
 
         metadata = dict(step.action.metadata)
         joint_names = tuple(str(name) for name in metadata.get("gripper_joint_names", ()))
-        q_target = tuple(float(value) for value in metadata["gripper_final_target_positions"])
+        q_target = _symmetric_gripper_positions(
+            metadata["gripper_final_target_positions"]
+        )
         key = (
             metadata.get("operation"),
             metadata.get("segment_index"),
@@ -265,7 +267,11 @@ class SegmentedArmExecutor:
         q_initial = self._gripper_context.get(key)
         actual_positions, mapping_report = _actual_named_joint_positions(state, joint_names)
         if q_initial is None:
-            q_initial = actual_positions if actual_positions is not None else q_target
+            q_initial = (
+                _symmetric_gripper_positions(actual_positions)
+                if actual_positions is not None
+                else q_target
+            )
             self._gripper_context[key] = q_initial
         arm_joint_positions = step.action.arm_joint_positions
         if (
@@ -481,11 +487,11 @@ class SegmentedArmExecutor:
         if pending is None or self._failed:
             return
         self._pending_close_validation = None
-        q_final, mapping_report = _actual_named_joint_positions(
+        q_final_observed, mapping_report = _actual_named_joint_positions(
             state,
             pending["gripper_joint_names"],
         )
-        if q_final is None:
+        if q_final_observed is None:
             self._close_progress_report = {
                 **pending,
                 "available": False,
@@ -500,6 +506,17 @@ class SegmentedArmExecutor:
                 self._failure_metadata = dict(self._close_progress_report)
             return
 
+        q_final = _symmetric_gripper_positions(q_final_observed)
+        mapping_report = {
+            **mapping_report,
+            "observed_positions": q_final_observed,
+            "master_joint_position": q_final_observed[0],
+            "follower_error_m": (
+                abs(q_final_observed[0] - q_final_observed[1])
+                if len(q_final_observed) > 1
+                else None
+            ),
+        }
         close_progress = _compute_close_progress(
             pending["q_start"],
             q_final,
@@ -839,7 +856,9 @@ class SegmentedArmExecutor:
                 )
                 steps.extend(segment_steps)
                 if _is_close_segment(segment):
-                    closed_gripper_target = tuple(segment["target_position"])
+                    closed_gripper_target = _symmetric_gripper_positions(
+                        segment["target_position"]
+                    )
                     closed_gripper_joint_names = tuple(segment["joint_names"])
                 elif _is_open_segment(segment):
                     closed_gripper_target = None
@@ -882,7 +901,7 @@ class SegmentedArmExecutor:
                 and len(positions) == len(joint_names)
                 and all(math.isfinite(value) for value in positions)
             ):
-                return positions, joint_names
+                return _symmetric_gripper_positions(positions), joint_names
         for segment in segments:
             if not isinstance(segment, dict) or str(segment.get("type")) != "gripper":
                 continue
@@ -890,7 +909,7 @@ class SegmentedArmExecutor:
             if _is_open_segment(segment) and joint_names:
                 return tuple(0.0 for _ in joint_names), joint_names
             if _is_close_segment(segment) and joint_names:
-                return tuple(float(value) for value in segment["target_position"]), joint_names
+                return _symmetric_gripper_positions(segment["target_position"]), joint_names
         return None, ()
 
     def _build_motion_segment_steps(
@@ -1377,6 +1396,15 @@ def _compute_close_progress(
         sum((start - final) ** 2 for start, final in zip(q_start, q_final))
     )
     return max(0.0, min(1.0, actual_close_distance / total_close_distance))
+
+
+def _symmetric_gripper_positions(values: Any) -> tuple[float, ...]:
+    """保留双指命令字段，但始终由主关节标量生成对称目标。"""
+
+    positions = tuple(float(value) for value in values)
+    if not positions:
+        raise ValueError("gripper positions must not be empty")
+    return tuple(positions[0] for _ in positions)
 
 
 def _actual_named_joint_positions(

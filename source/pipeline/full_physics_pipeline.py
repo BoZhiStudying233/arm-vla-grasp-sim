@@ -562,6 +562,7 @@ class FullPhysicsPipeline:
                 "arm_tracking_sample_count",
                 "arm_tracking_max_abs_error",
                 "last_gripper_action_report",
+                "gripper_symmetry_report",
                 "joint_action_apply_count",
                 "arm_joint_action_apply_count",
                 "gripper_joint_action_apply_count",

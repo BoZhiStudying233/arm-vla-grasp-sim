@@ -140,6 +140,15 @@ class FullPhysicsManipulationTest(unittest.TestCase):
         )
 
         world_collision = payload["world_collision"]
+        self.assertEqual(
+            payload["planner_convention"]["active_joint_names"],
+            [f"arm_joint{index}" for index in range(1, 7)],
+        )
+        self.assertEqual(
+            payload["isaac_state"]["gripper_joint_names"],
+            ["arm_joint7", "arm_joint8"],
+        )
+        self.assertEqual(payload["isaac_state"]["q_gripper"], [0.043, 0.043])
         self.assertTrue(world_collision["enabled"])
         self.assertEqual(world_collision["padding_m"], 0.05)
         self.assertEqual(world_collision["clearance_margin_m"], 0.05)
@@ -365,7 +374,7 @@ class FullPhysicsManipulationTest(unittest.TestCase):
             executor.compute_action(_state())
 
         contact_state = _state_with_all_joints(
-            (0.2, 0.21, 0.22, 0.23, 0.24, 0.25, 0.04, 0.04)
+            (0.2, 0.21, 0.22, 0.23, 0.24, 0.25, 0.04, 0.02)
         )
         close_actions = [executor.compute_action(contact_state) for _ in range(3)]
         close_targets = [
@@ -684,7 +693,7 @@ class FullPhysicsManipulationTest(unittest.TestCase):
         self.assertTrue(
             all(
                 tuple(action.metadata.get("gripper_joint_positions", ()))
-                == (0.021, 0.023)
+                == (0.021, 0.021)
                 for action in pre_open_actions
             )
         )

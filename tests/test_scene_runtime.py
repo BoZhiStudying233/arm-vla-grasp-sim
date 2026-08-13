@@ -31,6 +31,7 @@ from source.recording.training_action import (
     task_requires_mesh_truth_manipulation_targets,
     task_requires_wrist_camera_object_clearance,
     training_mesh_truth_manipulation_targets_verified,
+    training_gripper_symmetry_verified,
     training_quality_success_verified,
     training_receptacle_support_verified,
     training_wrist_camera_object_clearance_verified,
@@ -301,6 +302,35 @@ def test_vla_training_gate_requires_synchronized_rgb_after_physical_success() ->
     assert training_quality_success_verified(summary) is False
 
     summary["training_visual_source_verified"] = True
+    assert training_quality_success_verified(summary) is True
+
+
+def test_vla_training_gate_rejects_gripper_mimic_desynchronization() -> None:
+    summary = {
+        "success": True,
+        "failure_reason": None,
+        "success_semantics": "strict_physical_execution",
+        "execution_provenance_verified": True,
+        "task_config": {},
+        "simulation_report": {
+            "gripper_symmetry_report": {
+                "available": True,
+                "required_for_training": True,
+                "sample_count": 20,
+                "max_abs_error_m": 0.022,
+                "tolerance_m": 0.005,
+                "verified": False,
+            }
+        },
+    }
+
+    assert training_gripper_symmetry_verified(summary) is False
+    assert training_quality_success_verified(summary) is False
+
+    report = summary["simulation_report"]["gripper_symmetry_report"]
+    report["max_abs_error_m"] = 0.002
+    report["verified"] = True
+    assert training_gripper_symmetry_verified(summary) is True
     assert training_quality_success_verified(summary) is True
 
 

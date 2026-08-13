@@ -40,6 +40,7 @@ from .training_action import (
     physical_execution_success_verified,
     task_requests_vla_training_action,
     training_mesh_truth_manipulation_targets_verified,
+    training_gripper_symmetry_verified,
     training_quality_success_verified,
     training_receptacle_support_verified,
     training_visual_source_verified,
@@ -471,6 +472,8 @@ class JsonlEpisodeRecorder:
                 ineligibility_reason = (
                     "wrist_camera_object_clearance_not_verified"
                 )
+            elif not training_gripper_symmetry_verified(summary):
+                ineligibility_reason = "gripper_symmetry_not_verified"
             else:  # pragma: no cover - 未来新增质量门禁的兜底。
                 ineligibility_reason = "training_quality_gate_not_verified"
             self.mark_training_eligible(

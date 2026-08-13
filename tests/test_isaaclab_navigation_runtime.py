@@ -1392,10 +1392,79 @@ class IsaacLabNavigationRuntimeActionTest(unittest.TestCase):
 
         self.assertIn('"arm": ImplicitActuatorCfg(', text)
         self.assertIn('joint_names_expr=["arm_joint[1-6]"]', text)
+        self.assertIn("convert_mimic_joints_to_normal_joints=True", text)
+        self.assertIn("GRIPPER_MIMIC_NATURAL_FREQUENCY_HZ = 100.0", text)
+        self.assertIn("GRIPPER_MIMIC_DAMPING_RATIO = 1.0", text)
         self.assertIn("effort_limit_sim=100.0", text)
         self.assertIn("velocity_limit_sim=10.0", text)
         self.assertIn("stiffness=1000.0", text)
         self.assertIn("damping=50.0", text)
+        self.assertEqual(text.count('joint_names_expr=["arm_joint7"]'), 2)
+        self.assertNotIn('joint_names_expr=["arm_joint[7-8]"]', text)
+
+    def test_gripper_target_only_drives_mimic_master_joint(self) -> None:
+        try:
+            import torch
+        except ModuleNotFoundError:
+            self.skipTest("torch is not available")
+
+        class FakeRobot:
+            def __init__(self) -> None:
+                self.position_target_calls = []
+                self.velocity_target_calls = []
+
+            def set_joint_position_target(self, target, *, joint_ids) -> None:
+                self.position_target_calls.append(
+                    (tuple(float(value) for value in target.reshape(-1)), tuple(joint_ids))
+                )
+
+            def set_joint_velocity_target(self, target, *, joint_ids) -> None:
+                self.velocity_target_calls.append(
+                    (tuple(float(value) for value in target.reshape(-1)), tuple(joint_ids))
+                )
+
+        adapter = object.__new__(Go2LocomotionAdapter)
+        adapter.runtime = type("FakeRuntime", (), {"device": "cpu"})()
+        adapter.robot = FakeRobot()
+        adapter.gripper_joint_ids = [6, 7]
+        adapter.gripper_control_joint_ids = [6]
+        adapter._gripper_joint_target = (0.012, 0.012)
+
+        report = adapter.apply_gripper_joint_target()
+
+        self.assertEqual(adapter.robot.position_target_calls[0][1], (6,))
+        self.assertAlmostEqual(adapter.robot.position_target_calls[0][0][0], 0.012)
+        self.assertEqual(adapter.robot.velocity_target_calls, [((0.0,), (6,))])
+        self.assertEqual(report["joint_names"], ["arm_joint7"])
+        self.assertEqual(report["follower_joint_names"], ["arm_joint8"])
+        self.assertEqual(report["follower_control_mode"], "physx_mimic_only")
+
+    def test_gripper_symmetry_report_accumulates_actual_joint_error(self) -> None:
+        runtime = object.__new__(IsaacLabNavigationRuntime)
+        runtime._config = IsaacLabNavigationRuntimeConfig()
+        runtime._metadata = {}
+        runtime._adapter = type(
+            "FakeAdapter",
+            (),
+            {"gripper_joint_ids": [18, 19]},
+        )()
+        joint_pos = np.zeros((1, 20), dtype=np.float32)
+        robot = type(
+            "FakeRobot",
+            (),
+            {"data": type("FakeRobotData", (), {"joint_pos": joint_pos})()},
+        )()
+
+        joint_pos[0, 18:20] = (0.03, 0.028)
+        runtime._update_gripper_symmetry_report(robot)
+        joint_pos[0, 18:20] = (0.02, 0.011)
+        runtime._update_gripper_symmetry_report(robot)
+
+        report = runtime._metadata["gripper_symmetry_report"]
+        self.assertEqual(report["sample_count"], 2)
+        self.assertEqual(report["violation_count"], 1)
+        self.assertAlmostEqual(report["max_abs_error_m"], 0.009, places=6)
+        self.assertFalse(report["verified"])
 
     def test_direct_arm_override_bypasses_policy_clip(self) -> None:
         try:
@@ -1670,7 +1739,13 @@ class IsaacLabNavigationRuntimeActionTest(unittest.TestCase):
 
         runtime.apply(action)
 
-        self.assertEqual(adapter.gripper_targets, [(0.012, 0.013)])
+        self.assertEqual(adapter.gripper_targets, [(0.012, 0.012)])
+        self.assertEqual(
+            runtime._metadata["last_gripper_action_report"][  # type: ignore[attr-defined]
+                "gripper_joint_positions"
+            ],
+            (0.012, 0.012),
+        )
         self.assertEqual(
             runtime._metadata["last_gripper_action_report"]["target_source"],  # type: ignore[attr-defined]
             "metadata",
