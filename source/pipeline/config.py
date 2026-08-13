@@ -340,6 +340,7 @@ class FullPhysicsConfig:
     output_dir: Path
     num_episodes: int = 1
     seed: int = 0
+    box_pair_layout_profile: str = "task"
     # Multi-episode real runs keep one Isaac application/environment alive and
     # re-apply episode-level poses before reset. A single episode is unchanged.
     reuse_isaac_stage: bool = True
@@ -370,6 +371,10 @@ class FullPhysicsConfig:
     def __post_init__(self) -> None:
         if self.num_episodes < 1:
             raise ValueError("num_episodes must be at least 1")
+        if self.box_pair_layout_profile not in {"task", "legacy_xy"}:
+            raise ValueError(
+                "box_pair_layout_profile must be one of: task, legacy_xy"
+            )
         if self.limits.episode < 1:
             raise ValueError("episode tick limit must be positive")
         if self.navigation.max_linear_velocity <= 0.0:

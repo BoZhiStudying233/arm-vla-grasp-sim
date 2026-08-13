@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import datetime as _datetime
 import json
 import os
@@ -44,7 +45,12 @@ from source.scene.runtime_assets import (  # noqa: E402
     materialize_scene_asset_bindings,
     write_scene_binding_report,
 )
-from source.tasks import JsonTaskProvider, prepare_episode_spec  # noqa: E402
+from source.tasks import (  # noqa: E402
+    JsonTaskProvider,
+    episode_spec_from_dict,
+    prepare_episode_spec,
+    select_box_pair_layout_profile,
+)
 
 
 DEFAULT_SCENE_PROFILE = "liangzhu"
@@ -427,6 +433,15 @@ def _build_parser() -> argparse.ArgumentParser:
         "--task-json",
         default=None,
         help="任务 JSON 路径；默认由所选 scene profile 提供。",
+    )
+    parser.add_argument(
+        "--box-pair-layout",
+        choices=("task", "legacy_xy"),
+        default="task",
+        help=(
+            "双箱布局选择：task 使用任务 JSON 当前配置；legacy_xy 恢复旧版双箱"
+            "各自 x/y ±0.5 m 独立偏移和 2.4 m 最小箱距。"
+        ),
     )
     parser.add_argument(
         "--output-dir",
@@ -1301,6 +1316,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         output_dir=_project_path(args.output_dir),
         num_episodes=args.num_episodes,
         seed=args.seed,
+        box_pair_layout_profile=str(args.box_pair_layout),
         reuse_isaac_stage=bool(args.reuse_isaac_stage),
         headless=args.headless,
         keep_window_open=args.keep_window_open,
@@ -1496,6 +1512,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     _validate_external_plan_paths(config)
     base_spec = JsonTaskProvider().load(config.task_json)
+    if config.box_pair_layout_profile != "task":
+        legacy_task = copy.deepcopy(base_spec.raw_task)
+        select_box_pair_layout_profile(
+            legacy_task,
+            profile=config.box_pair_layout_profile,
+        )
+        base_spec = episode_spec_from_dict(legacy_task)
     _validate_task_scene_profile(args, base_spec.raw_task)
     config.output_dir.mkdir(parents=True, exist_ok=True)
     scene_profile = load_scene_profile(args.scene_profile, PROJECT_ROOT)

@@ -64,6 +64,8 @@ class FullPhysicsBatchTest(unittest.TestCase):
                 "180",
                 "--vla-arm-mode",
                 "shadow",
+                "--box-pair-layout",
+                "legacy_xy",
                 "--no-record-dataset",
             ]
         )
@@ -77,6 +79,8 @@ class FullPhysicsBatchTest(unittest.TestCase):
         self.assertEqual(child_args.vla_max_replans, 12)
         self.assertEqual(child_args.vla_max_chunk_steps, 180)
         self.assertEqual(child_args.vla_arm_mode, "shadow")
+        self.assertEqual(child_args.box_pair_layout, "legacy_xy")
+        self.assertIn("--box-pair-layout", command)
         self.assertFalse(child_args.record_dataset)
 
     def test_reused_process_command_runs_all_episodes_in_one_output_root(self) -> None:

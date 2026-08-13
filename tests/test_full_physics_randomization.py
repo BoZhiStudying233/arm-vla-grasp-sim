@@ -20,7 +20,12 @@ from source.pipeline.factory import (
     _manipulation_settings_for_episode,
     _navigation_settings_for_episode,
 )
-from source.tasks import JsonTaskProvider, episode_spec_from_dict, prepare_episode_spec
+from source.tasks import (
+    JsonTaskProvider,
+    episode_spec_from_dict,
+    prepare_episode_spec,
+    select_box_pair_layout_profile,
+)
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -224,6 +229,50 @@ class FullPhysicsRandomizationTest(unittest.TestCase):
                     settings=settings,
                 )
 
+    def test_legacy_box_pair_layout_restores_old_independent_xy_ranges(self) -> None:
+        base = JsonTaskProvider().load(LIANGZHU_BOX_TASK_PATH)
+        task = copy.deepcopy(base.raw_task)
+        select_box_pair_layout_profile(task, profile="legacy_xy")
+        config = task["randomization"]["box_pair"]
+        self.assertNotIn("layout_sampling", config)
+        self.assertEqual(config["min_table_center_distance_m"], 2.4)
+        for name in ("box1", "box2"):
+            self.assertEqual(config[name]["center_x_offset_range_m"], [-0.5, 0.5])
+            self.assertEqual(config[name]["center_y_offset_range_m"], [-0.5, 0.5])
+
+        settings = RandomizationSettings(
+            enabled=True,
+            collision_ply_path=(
+                PROJECT_ROOT
+                / "source/scene/liangzhu/ply/liangzhu_collision.ply"
+            ),
+            base_goal=BaseGoalRandomizationSettings(enabled=True),
+        )
+        probe = {"xy": [0.0, 0.0], "z": -0.13, "face_index": 1}
+        with mock.patch(
+            "source.tasks.box_pair_randomization._surface_probe",
+            return_value=probe,
+        ):
+            episode = prepare_episode_spec(
+                episode_spec_from_dict(task),
+                episode_id=1,
+                seed=17,
+                settings=settings,
+            )
+        randomization = episode.raw_task["randomization"]
+        sample = randomization["sample"]
+        self.assertEqual(
+            randomization["selected_layout_profile"],
+            "legacy_independent_xy_offsets_v1",
+        )
+        self.assertIsNone(sample["layout_geometry"])
+        self.assertIsNone(sample["planar_region_reports"])
+        self.assertGreaterEqual(sample["table_center_distance_m"], 2.4)
+        for name in ("box1", "box2"):
+            self.assertTrue(
+                all(abs(value) <= 0.5 for value in sample[name]["offset_xy_m"])
+            )
+
     def test_liangzhu_task_requires_precise_stable_navigation_handoff(self) -> None:
         episode = JsonTaskProvider().load(LIANGZHU_TASK_PATH)
         settings = _navigation_settings_for_episode(
@@ -280,6 +329,17 @@ class FullPhysicsRandomizationTest(unittest.TestCase):
         self.assertEqual(args.scene_light_mode, "auto")
         self.assertEqual(args.overview_camera_mode, "fixed")
         self.assertEqual(args.overview_camera_prim_path, "/World/overview")
+        self.assertEqual(args.box_pair_layout, "task")
+        legacy_args = _parse_args(
+            [
+                "--task-json",
+                str(LIANGZHU_BOX_TASK_PATH),
+                "--box-pair-layout",
+                "legacy_xy",
+                "--dry-run",
+            ]
+        )
+        self.assertEqual(legacy_args.box_pair_layout, "legacy_xy")
 
     def test_keep_gui_open_updates_until_window_closes(self) -> None:
         class FakeApp:

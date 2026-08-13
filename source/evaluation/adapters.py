@@ -133,10 +133,14 @@ class RemotePolicySession:
         self.phase_counts: dict[str, int] = {}
         self.roundtrip_ms: list[float] = []
         self.last_arm_shadow_report: dict[str, Any] = {}
+        self.locked_route: str | None = None
+        self.locked_subtask: str | None = None
 
     def start(self) -> dict[str, Any]:
         health = self.client.health()
         self.server_health = dict(health)
+        self.locked_route = None
+        self.locked_subtask = None
         self.client.reset(str(self.episode_spec.episode_id))
         return health
 
@@ -147,6 +151,10 @@ class RemotePolicySession:
             episode_id=str(self.episode_spec.episode_id),
             phase=phase,
         )
+        requested_locked_route = self.locked_route
+        if requested_locked_route is not None:
+            payload["locked_route"] = requested_locked_route
+            payload["locked_subtask"] = self.locked_subtask or ""
         decision = self.client.infer(payload)
         if self.arm_gate is not None and decision.route in {"grasp", "place"}:
             approved = self.arm_gate(decision)
@@ -162,6 +170,14 @@ class RemotePolicySession:
                     nav_waypoints=(),
                     arm_targets_base=(),
                 )
+        if decision.route in {"nav", "grasp", "place"}:
+            self.locked_route = decision.route
+            self.locked_subtask = (
+                str(decision.subtask).strip() if decision.subtask else ""
+            )
+        else:
+            self.locked_route = None
+            self.locked_subtask = None
         arm_shadow_report: dict[str, Any] = {}
         if self.arm_mode == "shadow" and decision.route in {"grasp", "place"}:
             arm_shadow_report = self.arm_shadow_validator.validate(state, decision)
@@ -175,6 +191,9 @@ class RemotePolicySession:
                 "phase": phase,
                 "arm_mode": self.arm_mode,
                 "arm_shadow_report": arm_shadow_report,
+                "requested_locked_route": requested_locked_route,
+                "locked_route": self.locked_route,
+                "locked_subtask": self.locked_subtask,
             },
         )
         self.inference_count += 1
@@ -211,6 +230,8 @@ class RemotePolicySession:
                 None if self.last_decision is None else self.last_decision.to_dict()
             ),
             "last_arm_shadow_report": dict(self.last_arm_shadow_report),
+            "locked_route": self.locked_route,
+            "locked_subtask": self.locked_subtask,
         }
 
 

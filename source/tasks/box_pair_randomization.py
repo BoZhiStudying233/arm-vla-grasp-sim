@@ -35,6 +35,39 @@ from .forward_sector_randomization import (
 
 
 BOX_PAIR_MODE = "liangzhu_box_pair_xy_v1"
+BOX_PAIR_LAYOUT_PROFILE_TASK = "task"
+BOX_PAIR_LAYOUT_PROFILE_LEGACY_XY = "legacy_xy"
+
+
+def select_box_pair_layout_profile(
+    task: dict[str, Any],
+    *,
+    profile: str,
+) -> None:
+    """为当前进程选择双箱布局；legacy 精确复现旧独立 XY 偏移。"""
+
+    normalized = str(profile).strip().lower()
+    if normalized == BOX_PAIR_LAYOUT_PROFILE_TASK:
+        return
+    if normalized != BOX_PAIR_LAYOUT_PROFILE_LEGACY_XY:
+        raise ValueError(f"不支持的 box pair layout profile: {profile!r}")
+    if not uses_box_pair_randomization(task):
+        raise ValueError("legacy_xy 仅支持 liangzhu box pair 随机化任务")
+    randomization = task["randomization"]
+    config = randomization.get("box_pair")
+    if not isinstance(config, dict):
+        raise ValueError("legacy_xy 要求 task.randomization.box_pair")
+    config.pop("layout_sampling", None)
+    for table_name in ("box1", "box2"):
+        table = config.get(table_name)
+        if not isinstance(table, dict):
+            raise ValueError(f"legacy_xy 缺少 box_pair.{table_name}")
+        table["center_x_offset_range_m"] = [-0.5, 0.5]
+        table["center_y_offset_range_m"] = [-0.5, 0.5]
+    config["min_table_center_distance_m"] = 2.4
+    randomization["selected_layout_profile"] = (
+        "legacy_independent_xy_offsets_v1"
+    )
 
 
 def _sync_global_instruction_context(
@@ -1081,6 +1114,9 @@ def apply_box_pair_randomization(
 
 __all__ = [
     "BOX_PAIR_MODE",
+    "BOX_PAIR_LAYOUT_PROFILE_LEGACY_XY",
+    "BOX_PAIR_LAYOUT_PROFILE_TASK",
     "apply_box_pair_randomization",
+    "select_box_pair_layout_profile",
     "uses_box_pair_randomization",
 ]

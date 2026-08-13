@@ -150,6 +150,14 @@ def _build_parser() -> argparse.ArgumentParser:
         help="任务 JSON 路径；不传时由 scene profile 提供。",
     )
     parser.add_argument(
+        "--box-pair-layout",
+        choices=("task", "legacy_xy"),
+        default="task",
+        help=(
+            "转发双箱布局选择；旧模型评测使用 legacy_xy，默认 task 使用任务当前配置。"
+        ),
+    )
+    parser.add_argument(
         "--output-dir",
         required=True,
         help="批量运行输出目录；每个 episode 会写入独立子目录。",
@@ -1057,6 +1065,7 @@ def _build_child_command(
     ]
     if args.task_json:
         command.extend(["--task-json", str(_project_path(args.task_json))])
+    command.extend(["--box-pair-layout", str(args.box_pair_layout)])
     if args.overview:
         command.append("--overview")
     if args.dataset_camera_keys is not None:

@@ -150,6 +150,61 @@ def test_remote_policy_session_arm_gate_skips_grasp() -> None:
     assert decision.subtask is not None
     assert decision.subtask.startswith("operator_skipped_grasp")
     assert decision.arm_targets_base == ()
+    assert session.locked_route is None
+
+
+def test_remote_policy_session_reuses_and_updates_route_lock() -> None:
+    class _Client:
+        def __init__(self):
+            self.payloads = []
+            self.decisions = iter(
+                (
+                    PolicyDecision(
+                        route="nav",
+                        subtask="Move toward box1.",
+                        nav_waypoints=((0.25, 0.0, 0.0),),
+                    ),
+                    PolicyDecision(
+                        route="nav",
+                        subtask="Move toward box1.",
+                        nav_waypoints=((0.20, 0.0, 0.0),),
+                    ),
+                    PolicyDecision(
+                        route="grasp",
+                        subtask="Pick up the can.",
+                        arm_targets_base=((0.3, 0.0, 0.2, 0.0, 0.0, 0.0, 1.0),),
+                    ),
+                    PolicyDecision(route="done", subtask="Task complete."),
+                )
+            )
+
+        def infer(self, payload):
+            self.payloads.append(dict(payload))
+            return next(self.decisions)
+
+    class _Encoder:
+        def build_payload(self, state, *, instruction, episode_id, phase):
+            return {"phase": phase}
+
+    client = _Client()
+    session = RemotePolicySession(
+        client=client,
+        encoder=_Encoder(),
+        episode_spec=_episode(),
+    )
+
+    session.predict(_state(), phase="nav_to_pick")
+    session.predict(_state(), phase="nav_to_pick")
+    session.predict(_state(), phase="nav_to_pick")
+    session.predict(_state(), phase="after_place")
+
+    assert "locked_route" not in client.payloads[0]
+    assert client.payloads[1]["locked_route"] == "nav"
+    assert client.payloads[1]["locked_subtask"] == "Move toward box1."
+    assert client.payloads[2]["locked_route"] == "nav"
+    assert client.payloads[3]["locked_route"] == "grasp"
+    assert session.locked_route is None
+    assert session.locked_subtask is None
 
 
 def test_executor_replans_then_stops_on_grasp_route() -> None:
