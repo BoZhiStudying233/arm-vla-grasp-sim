@@ -85,6 +85,39 @@ class FullPhysicsRandomizationTest(unittest.TestCase):
         )
         self.assertEqual(task["randomization"]["mode"], "liangzhu_box_pair_xy_v1")
         self.assertEqual(config["robot_yaw_range_deg"], [-180.0, 180.0])
+        layout_config = config["layout_sampling"]
+        layout_geometry = sample["layout_geometry"]
+        self.assertEqual(
+            layout_geometry["mode"],
+            "central_annulus_opposite_halfplane_v1",
+        )
+        self.assertGreaterEqual(
+            layout_geometry["box1_radius_m"],
+            layout_config["box1_radius_range_m"][0],
+        )
+        self.assertLessEqual(
+            layout_geometry["box1_radius_m"],
+            layout_config["box1_radius_range_m"][1],
+        )
+        self.assertGreaterEqual(
+            layout_geometry["box2_radius_m"],
+            layout_config["box2_radius_range_m"][0],
+        )
+        self.assertLessEqual(
+            layout_geometry["box2_radius_m"],
+            layout_config["box2_radius_range_m"][1],
+        )
+        self.assertLessEqual(layout_geometry["box2_halfplane_value"], 1.0e-9)
+        self.assertGreaterEqual(
+            sample["table_center_distance_m"],
+            layout_config["box2_min_distance_from_box1_m"],
+        )
+        self.assertTrue(
+            all(
+                report["geometry_verified"] and not report["overlaps"]
+                for report in sample["planar_region_reports"].values()
+            )
+        )
         self.assertGreaterEqual(task["start"]["yaw"], -math.pi)
         self.assertLessEqual(task["start"]["yaw"], math.pi)
         self.assertGreaterEqual(
@@ -145,6 +178,51 @@ class FullPhysicsRandomizationTest(unittest.TestCase):
             first.instruction,
         )
         self.assertTrue(all(task["randomization"]["synchronization"].values()))
+        debug_layout = randomization_debug_spec(task)["box_pair_layout"]
+        self.assertEqual(
+            debug_layout["field_center_xy"],
+            tuple(layout_config["field_center_xy"]),
+        )
+        self.assertEqual(len(debug_layout["forbidden_regions_xy"]), 4)
+
+    def test_liangzhu_box_pair_rejects_forbidden_region_overlap(self) -> None:
+        base = copy.deepcopy(JsonTaskProvider().load(LIANGZHU_BOX_TASK_PATH))
+        box_pair = base.raw_task["randomization"]["box_pair"]
+        box_pair["max_attempts"] = 2
+        box_pair["layout_sampling"]["forbidden_regions_xy"] = [
+            {
+                "id": "entire_annulus",
+                "polygon_xy": [
+                    [-4.0, 1.0],
+                    [3.0, 1.0],
+                    [3.0, 9.0],
+                    [-4.0, 9.0],
+                ],
+            }
+        ]
+        settings = RandomizationSettings(
+            enabled=True,
+            collision_ply_path=(
+                PROJECT_ROOT
+                / "source/scene/liangzhu/ply/liangzhu_collision.ply"
+            ),
+            base_goal=BaseGoalRandomizationSettings(enabled=True),
+        )
+        probe = {"xy": [0.0, 0.0], "z": -0.13, "face_index": 1}
+        with mock.patch(
+            "source.tasks.box_pair_randomization._surface_probe",
+            return_value=probe,
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "overlaps_forbidden_regions",
+            ):
+                prepare_episode_spec(
+                    base,
+                    episode_id=1,
+                    seed=17,
+                    settings=settings,
+                )
 
     def test_liangzhu_task_requires_precise_stable_navigation_handoff(self) -> None:
         episode = JsonTaskProvider().load(LIANGZHU_TASK_PATH)

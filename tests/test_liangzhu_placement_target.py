@@ -99,7 +99,7 @@ def test_scene_contains_both_box_assets_and_coke() -> None:
     assert "prepend payload = @../objects/box2/box2.usd@" in scene_text
 
 
-def test_box_randomization_changes_only_root_xy() -> None:
+def test_box_randomization_uses_measured_annulus_and_preserves_root_z() -> None:
     task = _annotation()["task_overrides"]
     config = task["randomization"]
     box_pair = config["box_pair"]
@@ -107,14 +107,26 @@ def test_box_randomization_changes_only_root_xy() -> None:
     assert config["mode"] == "liangzhu_box_pair_xy_v1"
     assert box_pair["robot_yaw_range_deg"] == [-180.0, 180.0]
     assert box_pair["robot_segment_fraction_range"] == [0.4, 0.6]
+    layout = box_pair["layout_sampling"]
+    assert layout["mode"] == "central_annulus_opposite_halfplane_v1"
+    assert layout["field_center_xy"] == [-0.55, 5.05]
+    assert layout["box1_radius_range_m"] == [1.25, 2.1]
+    assert layout["box2_radius_range_m"] == [1.25, 2.1]
+    assert layout["box2_min_distance_from_box1_m"] == 2.6
+    assert {region["id"] for region in layout["forbidden_regions_xy"]} == {
+        "north_height_change_band",
+        "south_height_change_band",
+        "west_height_change_band",
+        "east_height_change_band",
+    }
     for name, prim_path in (("box1", "/World/box1"), ("box2", "/World/box2")):
         box = box_pair[name]
         support_pose = task["pick" if name == "box1" else "place"][
             "support_pose_world" if name == "box1" else "receptacle_pose_world"
         ]
         assert box["root_prim_path"] == prim_path
-        assert len(box["center_x_offset_range_m"]) == 2
-        assert len(box["center_y_offset_range_m"]) == 2
+        assert "center_x_offset_range_m" not in box
+        assert "center_y_offset_range_m" not in box
         assert support_pose["translation_only"] is True
         assert support_pose["ensure_static_mesh_collision"] is True
         assert support_pose["z"] == box["root_translate_xyz"][2]

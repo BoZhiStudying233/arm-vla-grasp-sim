@@ -13,6 +13,13 @@ from source.instruction_context import (
     target_direction_from_pose,
 )
 
+from .box_pair_layout import (
+    BOX_PAIR_LAYOUT_MODE,
+    _layout_sampling_config,
+    _sample_annulus_center,
+    _table_at_center,
+    _table_forbidden_region_report,
+)
 from .forward_sector_randomization import (
     _finite_float,
     _goal_facing_target,
@@ -128,11 +135,11 @@ def _table_config(config: dict[str, Any], table_name: str) -> dict[str, Any]:
     if any(value <= 0.0 for value in dims):
         raise ValueError(f"{field}.support_dims_xyz 必须全部大于零")
     x_offset = _range(
-        raw.get("center_x_offset_range_m"),
+        raw.get("center_x_offset_range_m", [0.0, 0.0]),
         field_name=f"{field}.center_x_offset_range_m",
     )
     y_offset = _range(
-        raw.get("center_y_offset_range_m"),
+        raw.get("center_y_offset_range_m", [0.0, 0.0]),
         field_name=f"{field}.center_y_offset_range_m",
     )
     root_prim_path = str(raw.get("root_prim_path") or "").strip()
@@ -406,13 +413,19 @@ def _sample_layout(
 
     box1_config = _table_config(config, "box1")
     box2_config = _table_config(config, "box2")
+    layout_sampling = _layout_sampling_config(config)
     max_attempts = int(config.get("max_attempts", 300))
     if max_attempts < 1:
         raise ValueError("box_pair.max_attempts 必须至少为 1")
-    minimum_center_distance = _finite_float(
-        config.get("min_table_center_distance_m", 2.4),
-        field_name="box_pair.min_table_center_distance_m",
-    )
+    if layout_sampling is None:
+        minimum_center_distance = _finite_float(
+            config.get("min_table_center_distance_m", 2.4),
+            field_name="box_pair.min_table_center_distance_m",
+        )
+    else:
+        minimum_center_distance = float(
+            layout_sampling["box2_min_distance_from_box1_m"]
+        )
     cola_half_extent = _vector(
         config.get("cola_center_region_half_extent_xy_m", [0.08, 0.07]),
         field_name="box_pair.cola_center_region_half_extent_xy_m",
@@ -482,8 +495,98 @@ def _sample_layout(
     rejected: list[dict[str, Any]] = []
     for attempt in range(1, max_attempts + 1):
         try:
-            box1 = _sample_table(rng, box1_config)
-            box2 = _sample_table(rng, box2_config)
+            planar_region_reports: dict[str, Any] | None = None
+            layout_geometry: dict[str, Any] | None = None
+            if layout_sampling is None:
+                box1 = _sample_table(rng, box1_config)
+                box2 = _sample_table(rng, box2_config)
+            else:
+                field_center = tuple(layout_sampling["field_center_xy"])
+                box1_xy, box1_radius, box1_angle = _sample_annulus_center(
+                    rng,
+                    center_xy=field_center,
+                    radius_range_m=tuple(
+                        layout_sampling["box1_radius_range_m"]
+                    ),
+                    angle_range_rad=(-math.pi, math.pi),
+                )
+                # 与 box1-center 连线垂直的过中心直线为分界线。
+                # 相对 box1 方向偏转 [90, 270] 度可直接保证 box2 位于区域 2。
+                box2_xy, box2_radius, box2_angle = _sample_annulus_center(
+                    rng,
+                    center_xy=field_center,
+                    radius_range_m=tuple(
+                        layout_sampling["box2_radius_range_m"]
+                    ),
+                    angle_range_rad=(
+                        box1_angle + 0.5 * math.pi,
+                        box1_angle + 1.5 * math.pi,
+                    ),
+                )
+                box1 = _table_at_center(box1_config, box1_xy)
+                box2 = _table_at_center(box2_config, box2_xy)
+                box1_vector = (
+                    box1_xy[0] - field_center[0],
+                    box1_xy[1] - field_center[1],
+                )
+                box2_vector = (
+                    box2_xy[0] - field_center[0],
+                    box2_xy[1] - field_center[1],
+                )
+                halfplane_value = (
+                    box1_vector[0] * box2_vector[0]
+                    + box1_vector[1] * box2_vector[1]
+                )
+                if halfplane_value > 1.0e-9:
+                    raise RuntimeError(
+                        "box2_not_in_region2: "
+                        f"halfplane_value={halfplane_value:.9f}"
+                    )
+                planar_region_reports = {
+                    "box1": _table_forbidden_region_report(
+                        box1,
+                        layout_sampling=layout_sampling,
+                    ),
+                    "box2": _table_forbidden_region_report(
+                        box2,
+                        layout_sampling=layout_sampling,
+                    ),
+                }
+                layout_geometry = {
+                    "mode": str(layout_sampling["mode"]),
+                    "field_center_xy": list(field_center),
+                    "box1_radius_m": box1_radius,
+                    "box1_angle_rad": box1_angle,
+                    "box2_radius_m": box2_radius,
+                    "box2_angle_rad": box2_angle,
+                    "box1_radius_range_m": list(
+                        layout_sampling["box1_radius_range_m"]
+                    ),
+                    "box2_radius_range_m": list(
+                        layout_sampling["box2_radius_range_m"]
+                    ),
+                    "box2_region": "opposite_halfplane_region2",
+                    "divider_normal_xy": list(box1_vector),
+                    "divider_equation": (
+                        "dot(point_xy-field_center_xy, divider_normal_xy)=0"
+                    ),
+                    "region1_condition": "dot>0",
+                    "region2_condition": "dot<=0",
+                    "box2_halfplane_value": halfplane_value,
+                    "minimum_box_center_distance_m": minimum_center_distance,
+                    "forbidden_regions_xy": [
+                        {
+                            "id": str(region["id"]),
+                            "polygon_xy": [
+                                list(point) for point in region["polygon_xy"]
+                            ],
+                        }
+                        for region in layout_sampling["forbidden_regions_xy"]
+                    ],
+                    "table_forbidden_region_margin_m": float(
+                        layout_sampling["table_forbidden_region_margin_m"]
+                    ),
+                }
             center_distance = math.dist(
                 box1["support_center_xy_sampled"],
                 box2["support_center_xy_sampled"],
@@ -593,6 +696,8 @@ def _sample_layout(
                     "box2": box2,
                     "box1_ground": box1_ground,
                     "box2_ground": box2_ground,
+                    "layout_geometry": layout_geometry,
+                    "planar_region_reports": planar_region_reports,
                     "table_center_distance_m": center_distance,
                     "robot": {**robot, "xyz": robot_xyz},
                     "cola": {
@@ -809,11 +914,21 @@ def _sync_task_from_layout(
     task.pop("phase0_spatial_preconditions", None)
     task["spatial_preconditions"] = {
         "mode": BOX_PAIR_MODE,
+        "layout_sampling_mode": (
+            None
+            if layout["layout_geometry"] is None
+            else layout["layout_geometry"]["mode"]
+        ),
         "box1_xy_randomized_only": True,
         "box2_xy_randomized_only": True,
         "box_orientation_and_z_preserved": True,
+        "box1_in_center_annulus": layout["layout_geometry"] is not None,
+        "box2_in_opposite_halfplane_region2": (
+            layout["layout_geometry"] is not None
+        ),
+        "forbidden_regions_rejected": layout["layout_geometry"] is not None,
         "cola_supported_by_box1": True,
-        "cola_xy_and_yaw_randomized_near_box1_center": True,
+        "cola_xy_and_yaw_randomized_on_box1_top": True,
         "robot_between_tables": True,
         "robot_yaw_randomized": True,
         "table_center_distance_m": float(layout["table_center_distance_m"]),
@@ -829,6 +944,46 @@ def _sync_task_from_layout(
     box1_y_offset = box1["center_y_offset_range_m"]
     box2_x_offset = box2["center_x_offset_range_m"]
     box2_y_offset = box2["center_y_offset_range_m"]
+    layout_geometry = layout["layout_geometry"]
+    if layout_geometry is None:
+        object_mode = "box1_center_offset_plus_local_safe_region"
+        object_x_range = [
+            box1_nominal[0] + box1_x_offset[0] - cola_region[0],
+            box1_nominal[0] + box1_x_offset[1] + cola_region[0],
+        ]
+        object_y_range = [
+            box1_nominal[1] + box1_y_offset[0] - cola_region[1],
+            box1_nominal[1] + box1_y_offset[1] + cola_region[1],
+        ]
+        place_x_range = [
+            box2_nominal[0] + box2_x_offset[0],
+            box2_nominal[0] + box2_x_offset[1],
+        ]
+        place_y_range = [
+            box2_nominal[1] + box2_y_offset[0],
+            box2_nominal[1] + box2_y_offset[1],
+        ]
+    else:
+        field_center = layout_geometry["field_center_xy"]
+        box1_outer_radius = float(layout_geometry["box1_radius_range_m"][1])
+        box2_outer_radius = float(layout_geometry["box2_radius_range_m"][1])
+        object_mode = "box1_annulus_center_plus_local_box_top_region"
+        object_x_range = [
+            field_center[0] - box1_outer_radius - cola_region[0],
+            field_center[0] + box1_outer_radius + cola_region[0],
+        ]
+        object_y_range = [
+            field_center[1] - box1_outer_radius - cola_region[1],
+            field_center[1] + box1_outer_radius + cola_region[1],
+        ]
+        place_x_range = [
+            field_center[0] - box2_outer_radius,
+            field_center[0] + box2_outer_radius,
+        ]
+        place_y_range = [
+            field_center[1] - box2_outer_radius,
+            field_center[1] + box2_outer_radius,
+        ]
     randomization.update(
         {
             "enabled": True,
@@ -844,29 +999,17 @@ def _sync_task_from_layout(
             },
             "object_xy_randomization": {
                 "enabled": True,
-                "mode": "box1_center_offset_plus_local_safe_region",
+                "mode": object_mode,
                 "sampled_xy": [cola_xyz[0], cola_xyz[1]],
-                "x_range_m": [
-                    box1_nominal[0] + box1_x_offset[0] - cola_region[0],
-                    box1_nominal[0] + box1_x_offset[1] + cola_region[0],
-                ],
-                "y_range_m": [
-                    box1_nominal[1] + box1_y_offset[0] - cola_region[1],
-                    box1_nominal[1] + box1_y_offset[1] + cola_region[1],
-                ],
+                "x_range_m": object_x_range,
+                "y_range_m": object_y_range,
             },
             "place_xy_randomization": {
                 "enabled": True,
                 "mode": "box2_center_tracks_randomized_table",
                 "sampled_xy": list(box2_center),
-                "x_range_m": [
-                    box2_nominal[0] + box2_x_offset[0],
-                    box2_nominal[0] + box2_x_offset[1],
-                ],
-                "y_range_m": [
-                    box2_nominal[1] + box2_y_offset[0],
-                    box2_nominal[1] + box2_y_offset[1],
-                ],
+                "x_range_m": place_x_range,
+                "y_range_m": place_y_range,
             },
             "synchronization": {
                 "robot_start": True,
