@@ -964,6 +964,28 @@ class FullPhysicsPipelineTest(unittest.TestCase):
         self.assertEqual(runtime_kwargs["front_camera_height"], 480)
         self.assertEqual(runtime_kwargs["camera_render_interval_control_steps"], 1)
 
+    def test_navigation_smoke_can_ignore_default_dataset_cameras(self) -> None:
+        config = FullPhysicsConfig(
+            task_json=PROJECT_ROOT / "tasks/nav_pick_place_apple_multifloor_pct.json",
+            output_dir=PROJECT_ROOT / "outputs/test",
+            headless=True,
+            navigation_smoke=True,
+            recording=RecordingSettings(
+                enabled=True,
+                camera_keys=("front", "wrist"),
+            ),
+            video=VideoRecordingSettings(enabled=False),
+        )
+
+        runtime_kwargs = _camera_sensor_runtime_kwargs(
+            config,
+            include_dataset_recording=False,
+        )
+
+        self.assertFalse(runtime_kwargs["enable_front_camera"])
+        self.assertFalse(runtime_kwargs["enable_wrist_camera"])
+        self.assertFalse(runtime_kwargs["enable_overview_camera"])
+
     def test_multifloor_gui_defaults_to_auto_overview_composite(self) -> None:
         args = _parse_args(
             [

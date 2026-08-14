@@ -309,6 +309,8 @@ def _navigation_smoke_viewport_runtime_kwargs(
 
 def _camera_sensor_runtime_kwargs(
     config: FullPhysicsConfig,
+    *,
+    include_dataset_recording: bool = True,
 ) -> dict[str, object]:
     """让 full-physics 与各类 smoke 对 video/recording 启用同一组相机。"""
 
@@ -316,7 +318,8 @@ def _camera_sensor_runtime_kwargs(
     return {
         "enable_front_camera": bool(
             (
-                config.recording.enabled
+                include_dataset_recording
+                and config.recording.enabled
                 and "front" in config.recording.camera_keys
             )
             or {"front", "composite"} & video_modes
@@ -325,7 +328,8 @@ def _camera_sensor_runtime_kwargs(
         "front_camera_width": config.recording.image_width,
         "enable_wrist_camera": bool(
             (
-                config.recording.enabled
+                include_dataset_recording
+                and config.recording.enabled
                 and "wrist" in config.recording.camera_keys
             )
             or {"wrist", "composite"} & video_modes
@@ -334,7 +338,8 @@ def _camera_sensor_runtime_kwargs(
         "wrist_camera_width": config.recording.image_width,
         "enable_overview_camera": bool(
             (
-                config.recording.enabled
+                include_dataset_recording
+                and config.recording.enabled
                 and "overview" in config.recording.camera_keys
             )
             or "composite" in video_modes
@@ -1958,7 +1963,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                                     config.recording.overview_camera_prim_path
                                 ),
                             ),
-                            **_camera_sensor_runtime_kwargs(config),
+                            **_camera_sensor_runtime_kwargs(
+                                config,
+                                include_dataset_recording=False,
+                            ),
                             show_velocity_command_debug=bool(
                                 stair_locomotion_smoke
                                 and config.show_planned_trajectories

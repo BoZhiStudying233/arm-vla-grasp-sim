@@ -14,51 +14,6 @@ from isaaclab.assets.articulation import ArticulationCfg
 
 ARM_VLA_ROOT = Path(os.environ.get("ARM_VLA_ROOT", Path(__file__).resolve().parents[4]))
 GO2_X5_URDF = ARM_VLA_ROOT / "source/robot/go2_x5/urdf/go2_x5.urdf"
-GRIPPER_MIMIC_NATURAL_FREQUENCY_HZ = 100.0
-GRIPPER_MIMIC_DAMPING_RATIO = 1.0
-
-
-def _spawn_go2_x5_with_stiff_gripper_mimic(
-    prim_path: str,
-    cfg: sim_utils.UrdfFileCfg,
-    translation=None,
-    orientation=None,
-    **kwargs,
-):
-    """导入 URDF 后、physics 初始化前收紧夹爪 mimic 耦合。"""
-
-    prim = sim_utils.spawn_from_urdf(
-        prim_path,
-        cfg,
-        translation=translation,
-        orientation=orientation,
-        **kwargs,
-    )
-    stage = sim_utils.get_current_stage()
-    patched = 0
-    for candidate in stage.Traverse():
-        if candidate.GetName() != "arm_joint8":
-            continue
-        mimic_schemas = [
-            str(schema)
-            for schema in candidate.GetAppliedSchemas()
-            if str(schema).startswith("PhysxMimicJointAPI:")
-        ]
-        for mimic_schema in mimic_schemas:
-            instance_name = mimic_schema.split(":", 1)[1]
-            candidate.GetAttribute(
-                f"physxMimicJoint:{instance_name}:naturalFrequency"
-            ).Set(GRIPPER_MIMIC_NATURAL_FREQUENCY_HZ)
-            candidate.GetAttribute(
-                f"physxMimicJoint:{instance_name}:dampingRatio"
-            ).Set(GRIPPER_MIMIC_DAMPING_RATIO)
-            patched += 1
-    if patched != 1:
-        raise RuntimeError(
-            "X5 gripper requires exactly one arm_joint8 PhysX mimic API, "
-            f"patched={patched}"
-        )
-    return prim
 
 ##
 # Configuration
@@ -66,12 +21,12 @@ def _spawn_go2_x5_with_stiff_gripper_mimic(
 
 GO2_X5_CFG = ArticulationCfg(
     spawn=sim_utils.UrdfFileCfg(
-        func=_spawn_go2_x5_with_stiff_gripper_mimic,
         fix_base=False,
         merge_fixed_joints=True,
-        # IsaacLab 2.x 默认向 Isaac Sim 5.1 传 set_parse_mimic(False)，会把
-        # URDF 的 arm_joint8 mimic 丢成普通独立关节；必须显式开启解析。
-        convert_mimic_joints_to_normal_joints=True,
+        # Isaac Sim 5.1 的 PhysX mimic 在夹持碰撞和载荷下不能可靠维持双指同步。
+        # 当前 IsaacLab 2.x 会据此调用 set_parse_mimic(False)，保留两个普通关节；
+        # 控制层再由同一个标量目标驱动两侧 position drive。
+        convert_mimic_joints_to_normal_joints=False,
         replace_cylinders_with_capsules=False,
         asset_path=str(GO2_X5_URDF),
         activate_contact_sensors=True,
@@ -133,9 +88,7 @@ GO2_X5_CFG = ArticulationCfg(
             friction=0.0,
         ),
         "gripper": DCMotorCfg(
-            # arm_joint8 是 URDF/PhysX mimic follower；只给主关节配置 actuator，
-            # 避免显式力矩与 mimic 约束同时争用从动指节。
-            joint_names_expr=["arm_joint7"],
+            joint_names_expr=["arm_joint[7-8]"],
             effort_limit=20.0,
             saturation_effort=20.0,
             velocity_limit=1.0,
@@ -205,8 +158,7 @@ GO2_X5_PCT_DOG_ONLY_CFG = GO2_X5_CFG.replace(
         ),
         # 主 pipeline 后续仍要抓取，保留本地两指夹爪 actuator。
         "gripper": DCMotorCfg(
-            # 保持与 baseline 相同的单主关节夹爪语义。
-            joint_names_expr=["arm_joint7"],
+            joint_names_expr=["arm_joint[7-8]"],
             effort_limit=20.0,
             saturation_effort=20.0,
             velocity_limit=1.0,

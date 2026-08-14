@@ -544,6 +544,88 @@ class IsaacLabNavigationRuntimeConfig:
     show_velocity_command_debug: bool = False
 
 
+def _inspect_gripper_physics_control(stage: Any) -> dict[str, Any]:
+    """确认运行 stage 使用双侧 drive，拒绝重新落入受载不可靠的 mimic。"""
+
+    expected_names = ("arm_joint7", "arm_joint8")
+    joints: dict[str, list[dict[str, Any]]] = {name: [] for name in expected_names}
+    if stage is None:
+        return {
+            "available": False,
+            "verified": False,
+            "reason": "usd_stage_unavailable",
+            "physical_control_mode": "symmetric_dual_position_drive",
+            "joints": joints,
+        }
+    for prim in stage.Traverse():
+        name = str(prim.GetName())
+        if name not in joints:
+            continue
+        schemas = tuple(str(schema) for schema in prim.GetAppliedSchemas())
+        has_linear_drive = "PhysicsDriveAPI:linear" in schemas
+        has_mimic = any(
+            schema.startswith("PhysxMimicJointAPI:") for schema in schemas
+        )
+        joints[name].append(
+            {
+                "prim_path": str(prim.GetPath()),
+                "applied_schemas": schemas,
+                "has_linear_drive": has_linear_drive,
+                "has_mimic": has_mimic,
+            }
+        )
+    counts = {name: len(entries) for name, entries in joints.items()}
+    verified = bool(
+        counts[expected_names[0]] > 0
+        and counts[expected_names[0]] == counts[expected_names[1]]
+        and all(
+            entry["has_linear_drive"] and not entry["has_mimic"]
+            for entries in joints.values()
+            for entry in entries
+        )
+    )
+    return {
+        "available": all(counts.values()),
+        "verified": verified,
+        "physical_control_mode": "symmetric_dual_position_drive",
+        "joint_prim_counts": counts,
+        "joints": joints,
+    }
+
+
+def _disable_unrequested_camera_sensors(
+    scene_cfg: Any,
+    *,
+    front: bool,
+    wrist: bool,
+    overview: bool,
+) -> dict[str, Any]:
+    """从 env cfg 移除未请求的相机，允许真正的无渲染 headless 运行。"""
+
+    requested = {
+        "head_camera": bool(front),
+        "arm_camera": bool(wrist),
+        "overview_camera": bool(overview),
+    }
+    disabled: list[str] = []
+    retained: list[str] = []
+    for name, enabled in requested.items():
+        if not hasattr(scene_cfg, name):
+            continue
+        if enabled:
+            retained.append(name)
+            continue
+        if getattr(scene_cfg, name) is not None:
+            setattr(scene_cfg, name, None)
+            disabled.append(name)
+    return {
+        "requested": requested,
+        "disabled_sensors": disabled,
+        "retained_sensors": retained,
+        "rendering_required": any(requested.values()),
+    }
+
+
 def _item(value: Any) -> float:
     return float(value.item() if hasattr(value, "item") else value)
 
@@ -1744,6 +1826,7 @@ class IsaacLabNavigationRuntime:
                 "tolerance_m": float(self._config.gripper_symmetry_tolerance_m),
                 "verified": False,
             },
+            "gripper_physics_control_report": None,
             "world_count": 1,
             "opened_stage_count": 1,
             "stage_build_count": 0,
@@ -2130,6 +2213,9 @@ class IsaacLabNavigationRuntime:
                     ),
                     "verified": False,
                 },
+                "gripper_physics_control_report": self._metadata.get(
+                    "gripper_physics_control_report"
+                ),
                 "used_direct_joint_state": False,
                 "used_manipulation_base_lock": False,
                 "used_manipulation_support_joint_lock": False,
@@ -2327,7 +2413,8 @@ class IsaacLabNavigationRuntime:
             "joint_ids": joint_ids,
             "master_joint_name": self._config.gripper_joint_names[0],
             "follower_joint_name": self._config.gripper_joint_names[1],
-            "follower_control_mode": "physx_mimic_only",
+            "follower_control_mode": "symmetric_active_drive",
+            "physical_control_mode": "symmetric_dual_position_drive",
             "sample_count": sample_count,
             "violation_count": violation_count,
             "latest_positions_m": positions,
@@ -3162,6 +3249,17 @@ class IsaacLabNavigationRuntime:
             import omni.usd
 
             stage_after_collision_patch = omni.usd.get_context().get_stage()
+            gripper_physics_report = _inspect_gripper_physics_control(
+                stage_after_collision_patch
+            )
+            self._metadata["gripper_physics_control_report"] = (
+                gripper_physics_report
+            )
+            if not gripper_physics_report["verified"]:
+                raise RuntimeError(
+                    "X5 gripper physics control preflight failed: "
+                    f"{json.dumps(gripper_physics_report, ensure_ascii=False)}"
+                )
             self._metadata["object_visibility_after_spawn_report"] = (
                 self._show_only_task_object(stage_after_collision_patch, episode_spec)
                 if stage_after_collision_patch is not None
@@ -3476,6 +3574,14 @@ class IsaacLabNavigationRuntime:
                 keyword_contact_offset=self._config.apple_collision_contact_offset,
                 keyword_rest_offset=self._config.apple_collision_rest_offset,
             )
+        self._metadata["camera_sensor_selection_report"] = (
+            _disable_unrequested_camera_sensors(
+                env_cfg.scene,
+                front=self._config.enable_front_camera,
+                wrist=self._config.enable_wrist_camera,
+                overview=self._config.enable_overview_camera,
+            )
+        )
         if self._config.enable_front_camera:
             _validate_d436_camera_calibration_resolution(
                 "front",

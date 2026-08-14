@@ -39,11 +39,13 @@ from source.simulation.isaaclab_runtime import (
     _collision_candidate_sort_key,
     _compute_wrist_camera_object_clearance_sample,
     _derive_mesh_truth_place_pose,
+    _disable_unrequested_camera_sensors,
     _dedupe_root_paths,
     _episode_reset_pose_configuration,
     _path_is_excluded_by_roots,
     _prim_keyword_match_text,
     _front_camera_calibration_metadata,
+    _inspect_gripper_physics_control,
     _overwrite_d436_intrinsic_matrices,
     _retarget_height_scanners,
     _resolve_rigid_body_prim_path,
@@ -1392,17 +1394,15 @@ class IsaacLabNavigationRuntimeActionTest(unittest.TestCase):
 
         self.assertIn('"arm": ImplicitActuatorCfg(', text)
         self.assertIn('joint_names_expr=["arm_joint[1-6]"]', text)
-        self.assertIn("convert_mimic_joints_to_normal_joints=True", text)
-        self.assertIn("GRIPPER_MIMIC_NATURAL_FREQUENCY_HZ = 100.0", text)
-        self.assertIn("GRIPPER_MIMIC_DAMPING_RATIO = 1.0", text)
+        self.assertIn("convert_mimic_joints_to_normal_joints=False", text)
         self.assertIn("effort_limit_sim=100.0", text)
         self.assertIn("velocity_limit_sim=10.0", text)
         self.assertIn("stiffness=1000.0", text)
         self.assertIn("damping=50.0", text)
-        self.assertEqual(text.count('joint_names_expr=["arm_joint7"]'), 2)
-        self.assertNotIn('joint_names_expr=["arm_joint[7-8]"]', text)
+        self.assertEqual(text.count('joint_names_expr=["arm_joint[7-8]"]'), 2)
+        self.assertNotIn("PhysxMimicJointAPI", text)
 
-    def test_gripper_target_only_drives_mimic_master_joint(self) -> None:
+    def test_gripper_target_drives_both_joints_from_one_symmetric_scalar(self) -> None:
         try:
             import torch
         except ModuleNotFoundError:
@@ -1427,17 +1427,90 @@ class IsaacLabNavigationRuntimeActionTest(unittest.TestCase):
         adapter.runtime = type("FakeRuntime", (), {"device": "cpu"})()
         adapter.robot = FakeRobot()
         adapter.gripper_joint_ids = [6, 7]
-        adapter.gripper_control_joint_ids = [6]
-        adapter._gripper_joint_target = (0.012, 0.012)
+        adapter.gripper_control_joint_ids = [6, 7]
+        adapter._gripper_joint_target = (0.012, 0.031)
 
         report = adapter.apply_gripper_joint_target()
 
-        self.assertEqual(adapter.robot.position_target_calls[0][1], (6,))
-        self.assertAlmostEqual(adapter.robot.position_target_calls[0][0][0], 0.012)
-        self.assertEqual(adapter.robot.velocity_target_calls, [((0.0,), (6,))])
-        self.assertEqual(report["joint_names"], ["arm_joint7"])
-        self.assertEqual(report["follower_joint_names"], ["arm_joint8"])
-        self.assertEqual(report["follower_control_mode"], "physx_mimic_only")
+        self.assertEqual(adapter.robot.position_target_calls[0][1], (6, 7))
+        np.testing.assert_allclose(
+            adapter.robot.position_target_calls[0][0],
+            (0.012, 0.012),
+            atol=1.0e-8,
+        )
+        self.assertEqual(adapter.robot.velocity_target_calls, [((0.0, 0.0), (6, 7))])
+        self.assertEqual(report["joint_names"], ["arm_joint7", "arm_joint8"])
+        self.assertEqual(report["command_source_joint_name"], "arm_joint7")
+        self.assertEqual(
+            report["physical_control_mode"],
+            "symmetric_dual_position_drive",
+        )
+
+    def test_gripper_physics_preflight_requires_two_drives_without_mimic(self) -> None:
+        class FakePrim:
+            def __init__(self, name: str, schemas: tuple[str, ...]) -> None:
+                self._name = name
+                self._schemas = schemas
+
+            def GetName(self) -> str:
+                return self._name
+
+            def GetPath(self) -> str:
+                return f"/World/envs/env_0/Robot/joints/{self._name}"
+
+            def GetAppliedSchemas(self) -> tuple[str, ...]:
+                return self._schemas
+
+        class FakeStage:
+            def __init__(self, prims: list[FakePrim]) -> None:
+                self._prims = prims
+
+            def Traverse(self) -> list[FakePrim]:
+                return self._prims
+
+        drive = ("PhysicsJointStateAPI:linear", "PhysicsDriveAPI:linear")
+        report = _inspect_gripper_physics_control(
+            FakeStage([FakePrim("arm_joint7", drive), FakePrim("arm_joint8", drive)])
+        )
+
+        self.assertTrue(report["verified"])
+        self.assertEqual(report["joint_prim_counts"], {"arm_joint7": 1, "arm_joint8": 1})
+
+        mimic_report = _inspect_gripper_physics_control(
+            FakeStage(
+                [
+                    FakePrim("arm_joint7", drive),
+                    FakePrim(
+                        "arm_joint8",
+                        ("PhysxMimicJointAPI:rotY",),
+                    ),
+                ]
+            )
+        )
+        self.assertFalse(mimic_report["verified"])
+
+    def test_headless_collision_mode_removes_unrequested_camera_sensors(self) -> None:
+        scene_cfg = SimpleNamespace(
+            head_camera=object(),
+            arm_camera=object(),
+            overview_camera=object(),
+        )
+
+        report = _disable_unrequested_camera_sensors(
+            scene_cfg,
+            front=False,
+            wrist=False,
+            overview=False,
+        )
+
+        self.assertIsNone(scene_cfg.head_camera)
+        self.assertIsNone(scene_cfg.arm_camera)
+        self.assertIsNone(scene_cfg.overview_camera)
+        self.assertEqual(
+            report["disabled_sensors"],
+            ["head_camera", "arm_camera", "overview_camera"],
+        )
+        self.assertFalse(report["rendering_required"])
 
     def test_gripper_symmetry_report_accumulates_actual_joint_error(self) -> None:
         runtime = object.__new__(IsaacLabNavigationRuntime)
