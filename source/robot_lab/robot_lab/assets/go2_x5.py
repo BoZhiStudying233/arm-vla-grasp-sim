@@ -14,6 +14,70 @@ from isaaclab.assets.articulation import ArticulationCfg
 
 ARM_VLA_ROOT = Path(os.environ.get("ARM_VLA_ROOT", Path(__file__).resolve().parents[4]))
 GO2_X5_URDF = ARM_VLA_ROOT / "source/robot/go2_x5/urdf/go2_x5.urdf"
+GRIPPER_MIMIC_NATURAL_FREQUENCY_HZ = 0.0
+GRIPPER_MIMIC_DAMPING_RATIO = 0.0
+# With soft_joint_pos_limit_factor=0.9, the effective lower limit of the
+# 0..44 mm finger joints is 2.2 mm.  Seed both coordinates consistently so
+# the hard mimic constraint starts satisfied instead of correcting a one-frame
+# master-only clamp during articulation initialization.
+GRIPPER_INITIAL_POSITION_M = 0.0022
+
+
+def _spawn_go2_x5_with_hard_gripper_mimic(
+    prim_path: str,
+    cfg: sim_utils.UrdfFileCfg,
+    translation=None,
+    orientation=None,
+    **kwargs,
+):
+    """Import the URDF and make joint8 a hard, drive-free mimic follower."""
+
+    prim = sim_utils.spawn_from_urdf(
+        prim_path,
+        cfg,
+        translation=translation,
+        orientation=orientation,
+        **kwargs,
+    )
+    from pxr import Sdf, UsdPhysics
+
+    stage = sim_utils.get_current_stage()
+    followers = [
+        candidate
+        for candidate in stage.Traverse()
+        if candidate.GetName() == "arm_joint8"
+    ]
+    patched = 0
+    for follower in followers:
+        mimic_schemas = [
+            str(schema)
+            for schema in follower.GetAppliedSchemas()
+            if str(schema).startswith("PhysxMimicJointAPI:")
+        ]
+        for mimic_schema in mimic_schemas:
+            instance_name = mimic_schema.split(":", 1)[1]
+            for suffix, value in (
+                ("naturalFrequency", GRIPPER_MIMIC_NATURAL_FREQUENCY_HZ),
+                ("dampingRatio", GRIPPER_MIMIC_DAMPING_RATIO),
+            ):
+                attribute_name = f"physxMimicJoint:{instance_name}:{suffix}"
+                attribute = follower.GetAttribute(attribute_name)
+                if not attribute:
+                    attribute = follower.CreateAttribute(
+                        attribute_name,
+                        Sdf.ValueTypeNames.Float,
+                    )
+                attribute.Set(float(value))
+            # The follower must never receive a second drive in parallel with
+            # the two-way mimic constraint.
+            follower.RemoveAPI(UsdPhysics.DriveAPI, "linear")
+            patched += 1
+    if patched != 1:
+        raise RuntimeError(
+            "X5 gripper requires exactly one arm_joint8 PhysX mimic API, "
+            f"patched={patched}"
+        )
+    return prim
 
 ##
 # Configuration
@@ -21,12 +85,12 @@ GO2_X5_URDF = ARM_VLA_ROOT / "source/robot/go2_x5/urdf/go2_x5.urdf"
 
 GO2_X5_CFG = ArticulationCfg(
     spawn=sim_utils.UrdfFileCfg(
+        func=_spawn_go2_x5_with_hard_gripper_mimic,
         fix_base=False,
         merge_fixed_joints=True,
-        # Isaac Sim 5.1 的 PhysX mimic 在夹持碰撞和载荷下不能可靠维持双指同步。
-        # 当前 IsaacLab 2.x 会据此调用 set_parse_mimic(False)，保留两个普通关节；
-        # 控制层再由同一个标量目标驱动两侧 position drive。
-        convert_mimic_joints_to_normal_joints=False,
+        # IsaacLab 2.x uses this flag to pass set_parse_mimic(True) to the
+        # Isaac Sim importer.  joint8 remains a dependent PhysX joint.
+        convert_mimic_joints_to_normal_joints=True,
         replace_cylinders_with_capsules=False,
         asset_path=str(GO2_X5_URDF),
         activate_contact_sensors=True,
@@ -40,7 +104,9 @@ GO2_X5_CFG = ArticulationCfg(
             max_depenetration_velocity=1.0,
         ),
         articulation_props=sim_utils.ArticulationRootPropertiesCfg(
-            enabled_self_collisions=False, solver_position_iteration_count=4, solver_velocity_iteration_count=0
+            enabled_self_collisions=False,
+            solver_position_iteration_count=8,
+            solver_velocity_iteration_count=2,
         ),
         joint_drive=sim_utils.UrdfConverterCfg.JointDriveCfg(
             gains=sim_utils.UrdfConverterCfg.JointDriveCfg.PDGainsCfg(stiffness=0, damping=0)
@@ -62,6 +128,8 @@ GO2_X5_CFG = ArticulationCfg(
             "arm_joint4": 0.0,
             "arm_joint5": 0.0,
             "arm_joint6": 0.0,
+            "arm_joint7": GRIPPER_INITIAL_POSITION_M,
+            "arm_joint8": GRIPPER_INITIAL_POSITION_M,
         },
         joint_vel={".*": 0.0},
     ),
@@ -88,7 +156,8 @@ GO2_X5_CFG = ArticulationCfg(
             friction=0.0,
         ),
         "gripper": DCMotorCfg(
-            joint_names_expr=["arm_joint[7-8]"],
+            # joint8 is physically driven by the hard mimic constraint only.
+            joint_names_expr=["arm_joint7"],
             effort_limit=20.0,
             saturation_effort=20.0,
             velocity_limit=1.0,
@@ -123,6 +192,8 @@ GO2_X5_PCT_DOG_ONLY_CFG = GO2_X5_CFG.replace(
             "arm_joint4": 0.0,
             "arm_joint5": 0.0,
             "arm_joint6": 0.0,
+            "arm_joint7": GRIPPER_INITIAL_POSITION_M,
+            "arm_joint8": GRIPPER_INITIAL_POSITION_M,
         },
         joint_vel={".*": 0.0},
     ),
@@ -158,7 +229,7 @@ GO2_X5_PCT_DOG_ONLY_CFG = GO2_X5_CFG.replace(
         ),
         # 主 pipeline 后续仍要抓取，保留本地两指夹爪 actuator。
         "gripper": DCMotorCfg(
-            joint_names_expr=["arm_joint[7-8]"],
+            joint_names_expr=["arm_joint7"],
             effort_limit=20.0,
             saturation_effort=20.0,
             velocity_limit=1.0,

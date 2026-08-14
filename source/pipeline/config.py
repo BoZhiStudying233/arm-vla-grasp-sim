@@ -237,8 +237,9 @@ class ManipulationSettings:
     carry_home_tracking_tolerance: float = 0.25
     # pick 接触确认后仅额外闭合少量预紧，避免导航时持续以零开度挤压物体。
     carry_gripper_preload_m: float = 0.012
-    # carry 前后 object-TCP 相对位置变化超过该阈值，视为抓取滑移或掉落。
-    carry_object_tcp_slip_tolerance: float = 0.10
+    # 以 TCP frame 的完整相对位姿监控真实夹持；超限立即判定滑移，而不是等到掉落 10 cm。
+    carry_object_tcp_slip_tolerance: float = 0.010
+    carry_object_tcp_rotation_slip_tolerance_rad: float = 0.08726646259971647
     insert_place_plan_start_transition: bool = True
     place_plan_start_transition_duration_s: float = 0.5
     # full-physics 在 pick 后回 home 并 carry；place 默认保持当前 TCP 姿态，
@@ -644,6 +645,10 @@ class FullPhysicsConfig:
             raise ValueError("carry_gripper_preload_m must be non-negative")
         if self.manipulation.carry_object_tcp_slip_tolerance < 0.0:
             raise ValueError("carry_object_tcp_slip_tolerance must be non-negative")
+        if self.manipulation.carry_object_tcp_rotation_slip_tolerance_rad < 0.0:
+            raise ValueError(
+                "carry_object_tcp_rotation_slip_tolerance_rad must be non-negative"
+            )
         if self.manipulation.place_plan_start_transition_duration_s <= 0.0:
             raise ValueError("place_plan_start_transition_duration_s must be positive")
         for name, bounds in (

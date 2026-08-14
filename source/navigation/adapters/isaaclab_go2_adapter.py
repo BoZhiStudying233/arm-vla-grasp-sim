@@ -70,7 +70,7 @@ class Go2LocomotionAdapter:
         self.dog_joint_ids, _ = self.robot.find_joints(DOG_JOINT_NAMES, preserve_order=True)
         self.arm_joint_ids, _ = self.robot.find_joints(ARM_JOINT_NAMES, preserve_order=True)
         self.gripper_joint_ids, _ = self.robot.find_joints(GRIPPER_JOINT_NAMES, preserve_order=True)
-        self.gripper_control_joint_ids = self.gripper_joint_ids
+        self.gripper_control_joint_ids = self.gripper_joint_ids[:1]
         self.ee_body_ids, _ = self.robot.find_bodies(["arm_link6"])
         self.dog_action_indices = self._resolve_action_indices(DOG_JOINT_NAMES)
         self.arm_action_indices = self._resolve_action_indices(ARM_JOINT_NAMES)
@@ -350,11 +350,11 @@ class Go2LocomotionAdapter:
         gripper_control_joint_ids = getattr(
             self,
             "gripper_control_joint_ids",
-            self.gripper_joint_ids,
+            self.gripper_joint_ids[:1],
         )
-        if len(gripper_control_joint_ids) == len(GRIPPER_JOINT_NAMES):
+        if len(gripper_control_joint_ids) == 1:
             joint_ids.extend(int(index) for index in gripper_control_joint_ids)
-            joint_names.extend(GRIPPER_JOINT_NAMES)
+            joint_names.append(GRIPPER_MASTER_JOINT_NAME)
             target_parts.append(
                 self.robot.data.joint_pos[0, gripper_control_joint_ids]
                 .detach()
@@ -414,14 +414,14 @@ class Go2LocomotionAdapter:
         control_joint_ids = getattr(
             self,
             "gripper_control_joint_ids",
-            self.gripper_joint_ids,
+            self.gripper_joint_ids[:1],
         )
-        if len(control_joint_ids) != len(GRIPPER_JOINT_NAMES):
+        if len(control_joint_ids) != 1:
             return
         import torch
 
         gripper_target = (
-            torch.zeros((1, 2), dtype=torch.float32, device=self.runtime.device)
+            torch.zeros((1, 1), dtype=torch.float32, device=self.runtime.device)
             if self._gripper_joint_target is None
             else torch.as_tensor(
                 self._gripper_joint_target,
@@ -429,7 +429,7 @@ class Go2LocomotionAdapter:
                 device=self.runtime.device,
             ).reshape(1, -1)
         )
-        gripper_target = gripper_target[:, :1].repeat(1, len(control_joint_ids))
+        gripper_target = gripper_target[:, :1]
         self.robot.set_joint_position_target(gripper_target, joint_ids=control_joint_ids)
 
     def apply_gripper_joint_target(self) -> dict[str, Any]:
@@ -440,9 +440,9 @@ class Go2LocomotionAdapter:
         control_joint_ids = getattr(
             self,
             "gripper_control_joint_ids",
-            self.gripper_joint_ids,
+            self.gripper_joint_ids[:1],
         )
-        if len(control_joint_ids) != len(GRIPPER_JOINT_NAMES):
+        if len(control_joint_ids) != 1:
             return {
                 "applied": False,
                 "reason": "gripper_control_joint_id_count_mismatch",
@@ -462,19 +462,20 @@ class Go2LocomotionAdapter:
                 "target_count": int(requested_target.shape[1]),
                 "joint_count": len(control_joint_ids),
             }
-        target = requested_target[:, :1].repeat(1, len(control_joint_ids))
+        target = requested_target[:, :1]
         velocity_target = torch.zeros_like(target)
         self.robot.set_joint_position_target(target, joint_ids=control_joint_ids)
         self.robot.set_joint_velocity_target(velocity_target, joint_ids=control_joint_ids)
         return {
             "applied": True,
-            "joint_names": list(GRIPPER_JOINT_NAMES),
+            "joint_names": [GRIPPER_MASTER_JOINT_NAME],
             "joint_ids": [int(index) for index in control_joint_ids],
             "target_positions": [
                 float(value) for value in target.reshape(-1).detach().cpu().tolist()
             ],
-            "command_source_joint_name": GRIPPER_MASTER_JOINT_NAME,
-            "physical_control_mode": "symmetric_dual_position_drive",
+            "follower_joint_names": [GRIPPER_JOINT_NAMES[1]],
+            "follower_control_mode": "hard_physx_mimic_only",
+            "physical_control_mode": "single_master_hard_physx_mimic",
             "uses_direct_joint_state": False,
         }
 

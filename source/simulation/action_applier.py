@@ -155,18 +155,18 @@ class NamedJointActionApplier:
             )
         if not joint_names:
             raise RuntimeError("gripper_joint_names must not be empty")
-        # 对外仍是双指字段，但两侧物理 drive 的目标都只由第一个标量生成。
+        # 对外保留双指字段；物理 target 只下发 master，follower 由 mimic 驱动。
         symmetric_positions = tuple(float(positions[0]) for _ in joint_names)
-        for name, value in zip(joint_names, symmetric_positions):
-            target_by_name[name] = value
+        target_by_name[joint_names[0]] = symmetric_positions[0]
         return {
             "gripper_targeted": True,
             "gripper_command": action.gripper_command,
             "gripper_joint_names": joint_names,
             "gripper_joint_positions": symmetric_positions,
-            "gripper_control_joint_names": joint_names,
-            "gripper_command_source_joint_name": joint_names[0],
-            "gripper_physical_control_mode": "symmetric_dual_position_drive",
+            "gripper_control_joint_names": (joint_names[0],),
+            "gripper_follower_joint_names": joint_names[1:],
+            "gripper_follower_control_mode": "hard_physx_mimic_only",
+            "gripper_physical_control_mode": "single_master_hard_physx_mimic",
         }
 
     def _make_articulation_action(

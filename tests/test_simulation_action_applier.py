@@ -103,19 +103,20 @@ class SimulationActionApplierTest(unittest.TestCase):
 
         self.assertTrue(report["applied"])
         self.assertTrue(report["gripper_targeted"])
-        self.assertEqual(robot.actions[0].joint_indices, (2, 3, 4, 5, 6, 7, 8, 9))
+        self.assertEqual(robot.actions[0].joint_indices, (2, 3, 4, 5, 6, 7, 8))
         self.assertEqual(
             robot.actions[0].joint_positions,
-            (0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.01, 0.01),
+            (0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.01),
         )
         self.assertEqual(report["gripper_joint_positions"], (0.01, 0.01))
         self.assertEqual(
             report["gripper_control_joint_names"],
-            ("arm_joint7", "arm_joint8"),
+            ("arm_joint7",),
         )
+        self.assertEqual(report["gripper_follower_joint_names"], ("arm_joint8",))
         self.assertEqual(
             report["gripper_physical_control_mode"],
-            "symmetric_dual_position_drive",
+            "single_master_hard_physx_mimic",
         )
 
     def test_default_gripper_open_close_positions_are_available(self) -> None:
@@ -129,10 +130,10 @@ class SimulationActionApplierTest(unittest.TestCase):
         open_report = applier.apply(RobotAction(gripper_command="open", source="open"))
 
         self.assertTrue(close_report["applied"])
-        self.assertEqual(robot.actions[0].joint_indices, (8, 9))
-        self.assertEqual(robot.actions[0].joint_positions, (0.0, 0.0))
+        self.assertEqual(robot.actions[0].joint_indices, (8,))
+        self.assertEqual(robot.actions[0].joint_positions, (0.0,))
         self.assertTrue(open_report["applied"])
-        self.assertEqual(robot.actions[1].joint_positions, (0.04, 0.04))
+        self.assertEqual(robot.actions[1].joint_positions, (0.04,))
 
     def test_hold_without_explicit_target_does_not_apply_joint_action(self) -> None:
         robot = FakeRobot(_dof_names())

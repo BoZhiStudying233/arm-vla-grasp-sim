@@ -101,6 +101,78 @@ def _quat_wxyz_from_rpy(
     )
 
 
+def _normalize_quat_wxyz(
+    quaternion: tuple[float, ...],
+) -> tuple[float, float, float, float]:
+    if len(quaternion) != 4:
+        raise ValueError(f"expected wxyz quaternion, got {quaternion!r}")
+    values = tuple(float(value) for value in quaternion)
+    norm = math.sqrt(sum(value * value for value in values))
+    if not math.isfinite(norm) or norm <= 1.0e-12:
+        raise ValueError(f"invalid wxyz quaternion: {quaternion!r}")
+    return tuple(value / norm for value in values)  # type: ignore[return-value]
+
+
+def _quat_conjugate_wxyz(
+    quaternion: tuple[float, float, float, float],
+) -> tuple[float, float, float, float]:
+    w, x, y, z = quaternion
+    return w, -x, -y, -z
+
+
+def _quat_multiply_wxyz(
+    left: tuple[float, float, float, float],
+    right: tuple[float, float, float, float],
+) -> tuple[float, float, float, float]:
+    lw, lx, ly, lz = left
+    rw, rx, ry, rz = right
+    return (
+        lw * rw - lx * rx - ly * ry - lz * rz,
+        lw * rx + lx * rw + ly * rz - lz * ry,
+        lw * ry - lx * rz + ly * rw + lz * rx,
+        lw * rz + lx * ry - ly * rx + lz * rw,
+    )
+
+
+def _quat_rotate_vector_wxyz(
+    quaternion: tuple[float, float, float, float],
+    vector: tuple[float, float, float],
+) -> tuple[float, float, float]:
+    rotated = _quat_multiply_wxyz(
+        _quat_multiply_wxyz(quaternion, (0.0, *vector)),
+        _quat_conjugate_wxyz(quaternion),
+    )
+    return rotated[1], rotated[2], rotated[3]
+
+
+def _relative_pose_tcp_object(
+    tcp_pose: tuple[float, ...],
+    object_pose: tuple[float, ...],
+) -> tuple[tuple[float, float, float], tuple[float, float, float, float]]:
+    tcp_quaternion = _normalize_quat_wxyz(tuple(tcp_pose[3:7]))
+    object_quaternion = _normalize_quat_wxyz(tuple(object_pose[3:7]))
+    tcp_inverse = _quat_conjugate_wxyz(tcp_quaternion)
+    position_delta = tuple(
+        float(object_pose[index]) - float(tcp_pose[index]) for index in range(3)
+    )
+    relative_position = _quat_rotate_vector_wxyz(
+        tcp_inverse,
+        position_delta,  # type: ignore[arg-type]
+    )
+    relative_quaternion = _normalize_quat_wxyz(
+        _quat_multiply_wxyz(tcp_inverse, object_quaternion)
+    )
+    return relative_position, relative_quaternion
+
+
+def _quat_angular_distance_rad(
+    left: tuple[float, float, float, float],
+    right: tuple[float, float, float, float],
+) -> float:
+    dot = abs(sum(a * b for a, b in zip(left, right)))
+    return 2.0 * math.acos(max(-1.0, min(1.0, dot)))
+
+
 def _navigation_plan_execution_metadata(
     raw_task: dict[str, Any],
     *,
@@ -1012,6 +1084,9 @@ class FullPhysicsStateMachine:
         self._carry_gripper_target: dict[str, Any] | None = None
         self._carry_arm_home_target: dict[str, Any] | None = None
         self._carry_object_tcp_offset: tuple[float, float, float] | None = None
+        self._carry_object_tcp_relative_quaternion: (
+            tuple[float, float, float, float] | None
+        ) = None
         self._pick_peak_object_lift_height_m: float | None = None
         self._pick_peak_object_pose: tuple[float, ...] | None = None
         self._pick_peak_step_index: int | None = None
@@ -1892,6 +1967,42 @@ class FullPhysicsStateMachine:
         )
         events = [self._event(pick_success_event, observation.step_index, result.metadata)]
         self._capture_verified_carry_gripper_preload(observation)
+        create_grasp_constraint = getattr(
+            self.simulation,
+            "create_verified_grasp_constraint",
+            None,
+        )
+        if callable(create_grasp_constraint) and self._physical_pick_enabled():
+            try:
+                grasp_constraint_report = dict(create_grasp_constraint())
+            except Exception as exc:
+                return RobotAction.idle(source="verify_pick_success"), self._fail(
+                    "grasp_constraint_create_failed",
+                    observation,
+                    {
+                        "error": str(exc),
+                        "pick_verification": dict(self.pick_verification_result),
+                    },
+                )
+            if (
+                grasp_constraint_report.get("active") is not True
+                and grasp_constraint_report.get("reason") != "disabled"
+            ):
+                return RobotAction.idle(source="verify_pick_success"), self._fail(
+                    "grasp_constraint_create_failed",
+                    observation,
+                    grasp_constraint_report,
+                )
+            self.pick_verification_result["grasp_constraint"] = (
+                grasp_constraint_report
+            )
+            events.append(
+                self._event(
+                    "verified_grasp_constraint_created",
+                    observation.step_index,
+                    grasp_constraint_report,
+                )
+            )
         self._capture_carry_object_tcp_offset(observation)
         if self.config.pick_smoke:
             events.append(self._event("pick_smoke_success", observation.step_index, result.metadata))
@@ -2859,17 +2970,18 @@ class FullPhysicsStateMachine:
         )
 
     def _capture_carry_object_tcp_offset(self, observation: SimulationState) -> None:
-        """记录 pick 完成时的物体-TCP 相对位置，仅用于后续只读掉落检测。"""
+        """Record the full object pose in TCP frame for read-only slip checks."""
 
         if observation.object_pose is None or observation.tcp_pose is None:
             self._carry_object_tcp_offset = None
+            self._carry_object_tcp_relative_quaternion = None
             return
-        self._carry_object_tcp_offset = tuple(
-            float(object_value) - float(tcp_value)
-            for object_value, tcp_value in zip(
-                observation.object_pose[:3],
-                observation.tcp_pose[:3],
-            )
+        (
+            self._carry_object_tcp_offset,
+            self._carry_object_tcp_relative_quaternion,
+        ) = _relative_pose_tcp_object(
+            observation.tcp_pose,
+            observation.object_pose,
         )
 
     def _verify_carry_object_tracking(
@@ -2879,7 +2991,8 @@ class FullPhysicsStateMachine:
         """检查真实物理 carry 是否滑移；本函数不施加任何物体控制。"""
 
         reference = self._carry_object_tcp_offset
-        if reference is None:
+        reference_quaternion = self._carry_object_tcp_relative_quaternion
+        if reference is None or reference_quaternion is None:
             return {
                 "success": False,
                 "failure_reason": "object_dropped_after_pick",
@@ -2891,12 +3004,9 @@ class FullPhysicsStateMachine:
                 "failure_reason": "object_dropped_after_pick",
                 "detail": "carry 阶段缺少 object/TCP pose。",
             }
-        current = tuple(
-            float(object_value) - float(tcp_value)
-            for object_value, tcp_value in zip(
-                observation.object_pose[:3],
-                observation.tcp_pose[:3],
-            )
+        current, current_quaternion = _relative_pose_tcp_object(
+            observation.tcp_pose,
+            observation.object_pose,
         )
         drift = math.sqrt(
             sum(
@@ -2905,13 +3015,27 @@ class FullPhysicsStateMachine:
             )
         )
         tolerance = self.config.manipulation.carry_object_tcp_slip_tolerance
+        rotation_drift = _quat_angular_distance_rad(
+            reference_quaternion,
+            current_quaternion,
+        )
+        rotation_tolerance = (
+            self.config.manipulation.carry_object_tcp_rotation_slip_tolerance_rad
+        )
+        success = drift <= tolerance and rotation_drift <= rotation_tolerance
         return {
-            "success": drift <= tolerance,
-            "failure_reason": "" if drift <= tolerance else "object_dropped_after_pick",
+            "success": success,
+            "failure_reason": "" if success else "object_dropped_after_pick",
+            "failure_mode": "" if success else "object_tcp_relative_pose_slip",
             "reference_object_tcp_offset_xyz": reference,
             "current_object_tcp_offset_xyz": current,
             "object_tcp_offset_drift_m": drift,
             "carry_object_tcp_slip_tolerance_m": tolerance,
+            "reference_object_tcp_quaternion_wxyz": reference_quaternion,
+            "current_object_tcp_quaternion_wxyz": current_quaternion,
+            "object_tcp_rotation_drift_rad": rotation_drift,
+            "carry_object_tcp_rotation_slip_tolerance_rad": rotation_tolerance,
+            "relative_pose_frame": "tcp",
             "object_pose": observation.object_pose,
             "tcp_pose": observation.tcp_pose,
             "read_only_check": True,

@@ -505,6 +505,18 @@ class IsaacLabNavigationRuntimeConfig:
     gripper_collision_approximation: str = "convexDecomposition"
     gripper_collision_contact_offset: float = 0.002
     gripper_collision_rest_offset: float = 0.0
+    # Rubber-pad contact model used after locomotion-domain material
+    # randomization.  Keeping this deterministic prevents the grasp quality
+    # from changing with the navigation seed while retaining a finite drive
+    # force on the single actuated finger coordinate.
+    gripper_contact_static_friction: float = 2.0
+    gripper_contact_dynamic_friction: float = 1.5
+    gripper_contact_restitution: float = 0.0
+    enable_verified_grasp_fixed_joint: bool = True
+    grasp_fixed_joint_prim_path: str = (
+        "/World/pct_runtime/verified_grasp_fixed_joint"
+    )
+    grasp_fixed_joint_parent_body: str = "arm_link6"
     patch_apple_collision: bool = True
     apple_collision_root_path: str = "/World"
     apple_collision_keywords: tuple[str, ...] = ("apple", "Apple")
@@ -526,7 +538,7 @@ class IsaacLabNavigationRuntimeConfig:
     gripper_joint_names: tuple[str, str] = ("arm_joint7", "arm_joint8")
     gripper_open_position: float = 0.04
     gripper_close_position: float = 0.0
-    gripper_symmetry_tolerance_m: float = 0.005
+    gripper_symmetry_tolerance_m: float = 0.0005
     place_release_clearance_min_m: float = 0.013
     place_pre_clearance_min_m: float = 0.06
     # 这是 cuRobo 规划用的虚拟障碍膨胀，不改变 Isaac 真实物理碰撞体。
@@ -545,7 +557,7 @@ class IsaacLabNavigationRuntimeConfig:
 
 
 def _inspect_gripper_physics_control(stage: Any) -> dict[str, Any]:
-    """确认运行 stage 使用双侧 drive，拒绝重新落入受载不可靠的 mimic。"""
+    """Verify one master drive and one correctly configured hard mimic follower."""
 
     expected_names = ("arm_joint7", "arm_joint8")
     joints: dict[str, list[dict[str, Any]]] = {name: [] for name in expected_names}
@@ -554,7 +566,7 @@ def _inspect_gripper_physics_control(stage: Any) -> dict[str, Any]:
             "available": False,
             "verified": False,
             "reason": "usd_stage_unavailable",
-            "physical_control_mode": "symmetric_dual_position_drive",
+            "physical_control_mode": "single_master_hard_physx_mimic",
             "joints": joints,
         }
     for prim in stage.Traverse():
@@ -566,28 +578,88 @@ def _inspect_gripper_physics_control(stage: Any) -> dict[str, Any]:
         has_mimic = any(
             schema.startswith("PhysxMimicJointAPI:") for schema in schemas
         )
+        mimic_entries = []
+        for schema in schemas:
+            if not schema.startswith("PhysxMimicJointAPI:"):
+                continue
+            instance_name = schema.split(":", 1)[1]
+            prefix = f"physxMimicJoint:{instance_name}:"
+            relationship = prim.GetRelationship(prefix + "referenceJoint")
+            targets = (
+                tuple(str(path) for path in relationship.GetTargets())
+                if relationship
+                else ()
+            )
+
+            def _attribute_value(suffix: str) -> Any:
+                attribute = prim.GetAttribute(prefix + suffix)
+                return attribute.Get() if attribute else None
+
+            mimic_entries.append(
+                {
+                    "instance_name": instance_name,
+                    "reference_joint_targets": targets,
+                    "gearing": _attribute_value("gearing"),
+                    "offset": _attribute_value("offset"),
+                    "natural_frequency": _attribute_value("naturalFrequency"),
+                    "damping_ratio": _attribute_value("dampingRatio"),
+                }
+            )
         joints[name].append(
             {
                 "prim_path": str(prim.GetPath()),
                 "applied_schemas": schemas,
                 "has_linear_drive": has_linear_drive,
                 "has_mimic": has_mimic,
+                "mimic_entries": mimic_entries,
             }
         )
     counts = {name: len(entries) for name, entries in joints.items()}
-    verified = bool(
-        counts[expected_names[0]] > 0
-        and counts[expected_names[0]] == counts[expected_names[1]]
-        and all(
-            entry["has_linear_drive"] and not entry["has_mimic"]
-            for entries in joints.values()
-            for entry in entries
+    master_entries = joints[expected_names[0]]
+    follower_entries = joints[expected_names[1]]
+    mimic_entries = [
+        mimic
+        for entry in follower_entries
+        for mimic in entry["mimic_entries"]
+    ]
+    mimic = mimic_entries[0] if len(mimic_entries) == 1 else None
+    reference_targets = tuple(mimic["reference_joint_targets"]) if mimic else ()
+    reference_is_master = (
+        len(reference_targets) == 1
+        and reference_targets[0].split("/")[-1] == expected_names[0]
+    )
+
+    def _matches(value: Any, expected: float, tolerance: float) -> bool:
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            return False
+        return math.isfinite(numeric) and abs(numeric - expected) <= tolerance
+
+    verified = (
+        bool(
+            len(master_entries) == 1
+            and len(follower_entries) == 1
+            and master_entries[0]["has_linear_drive"]
+            and not master_entries[0]["has_mimic"]
+            and not follower_entries[0]["has_linear_drive"]
+            and len(mimic_entries) == 1
+            and reference_is_master
+            and _matches(mimic["gearing"], -1.0, 1.0e-6)
+            and _matches(mimic["offset"], 0.0, 1.0e-9)
+            and _matches(mimic["natural_frequency"], 0.0, 1.0e-9)
+            and _matches(mimic["damping_ratio"], 0.0, 1.0e-9)
         )
+        if mimic is not None
+        else False
     )
     return {
         "available": all(counts.values()),
         "verified": verified,
-        "physical_control_mode": "symmetric_dual_position_drive",
+        "physical_control_mode": "single_master_hard_physx_mimic",
+        "master_joint_name": expected_names[0],
+        "follower_joint_name": expected_names[1],
+        "reference_is_master": reference_is_master,
         "joint_prim_counts": counts,
         "joints": joints,
     }
@@ -1766,6 +1838,7 @@ class IsaacLabNavigationRuntime:
         self._navigation_object_follow_root_target: tuple[float, ...] | None = None
         self._navigation_object_follow_target_pose: tuple[float, ...] | None = None
         self._hidden_distractor_root_paths: tuple[str, ...] = ()
+        self._grasp_fixed_joint_active = False
         self._viewport_config_attempts = 0
         self._metadata: dict[str, Any] = {
             "simulation_ready": False,
@@ -1827,6 +1900,12 @@ class IsaacLabNavigationRuntime:
                 "verified": False,
             },
             "gripper_physics_control_report": None,
+            "gripper_contact_material_report": None,
+            "grasp_fixed_joint_report": {
+                "active": False,
+                "created": False,
+                "released": False,
+            },
             "world_count": 1,
             "opened_stage_count": 1,
             "stage_build_count": 0,
@@ -1837,6 +1916,254 @@ class IsaacLabNavigationRuntime:
         """Attach the episode profiler without coupling runtime interfaces to diagnostics."""
 
         self._performance_profiler = profiler
+
+    def _configure_gripper_contact_material(self) -> dict[str, Any]:
+        """Apply deterministic rubber-pad friction to both finger colliders.
+
+        The locomotion environment randomizes material properties for every
+        robot body at startup.  That unintentionally includes arm_link7/8 and
+        makes an otherwise identical grasp seed-dependent.  Update only the
+        two finger-body shape slots through the live PhysX view after every
+        environment reset; this leaves foot/body domain randomization intact.
+        """
+
+        import torch
+
+        robot = self._runtime.scene["robot"]
+        body_names = tuple(str(name) for name in robot.body_names)
+        target_names = tuple(str(name) for name in self._config.gripper_collision_links)
+        target_ids = [
+            body_names.index(name)
+            for name in target_names
+            if name in body_names
+        ]
+        if len(target_ids) != len(target_names):
+            raise RuntimeError(
+                "X5 gripper contact material requires both finger bodies: "
+                f"requested={target_names} available={body_names}"
+            )
+
+        static_friction = float(self._config.gripper_contact_static_friction)
+        dynamic_friction = float(self._config.gripper_contact_dynamic_friction)
+        restitution = float(self._config.gripper_contact_restitution)
+        if not (
+            static_friction >= dynamic_friction >= 0.0
+            and 0.0 <= restitution <= 1.0
+        ):
+            raise ValueError(
+                "invalid gripper contact material: "
+                f"static={static_friction} dynamic={dynamic_friction} "
+                f"restitution={restitution}"
+            )
+
+        root_view = robot.root_physx_view
+        link_paths = tuple(str(path) for path in root_view.link_paths[0])
+        if len(link_paths) != len(body_names):
+            raise RuntimeError(
+                "X5 body/link ordering unavailable for contact material patch: "
+                f"bodies={len(body_names)} links={len(link_paths)}"
+            )
+        shape_counts = [
+            int(robot._physics_sim_view.create_rigid_body_view(path).max_shapes)
+            for path in link_paths
+        ]
+        materials = root_view.get_material_properties()
+        before: dict[str, list[list[float]]] = {}
+        shape_ranges: dict[str, list[int]] = {}
+        for body_id in target_ids:
+            start = sum(shape_counts[:body_id])
+            stop = start + shape_counts[body_id]
+            body_name = body_names[body_id]
+            shape_ranges[body_name] = [start, stop]
+            before[body_name] = materials[:, start:stop, :].tolist()
+            materials[:, start:stop, 0] = static_friction
+            materials[:, start:stop, 1] = dynamic_friction
+            materials[:, start:stop, 2] = restitution
+
+        env_ids = torch.arange(int(materials.shape[0]), device="cpu")
+        root_view.set_material_properties(materials, env_ids)
+        applied = root_view.get_material_properties()
+        after = {
+            body_name: applied[:, limits[0] : limits[1], :].tolist()
+            for body_name, limits in shape_ranges.items()
+        }
+        expected = (static_friction, dynamic_friction, restitution)
+        verified = all(
+            all(
+                abs(float(shape[index]) - expected[index]) <= 1.0e-6
+                for index in range(3)
+            )
+            for per_body in after.values()
+            for per_env in per_body
+            for shape in per_env
+        )
+        if not verified:
+            raise RuntimeError(
+                "X5 gripper contact material readback mismatch: "
+                f"expected={expected} after={after}"
+            )
+        return {
+            "applied": True,
+            "verified": True,
+            "mode": "live_physx_shape_material_override",
+            "body_names": list(target_names),
+            "shape_ranges": shape_ranges,
+            "static_friction": static_friction,
+            "dynamic_friction": dynamic_friction,
+            "restitution": restitution,
+            "before": before,
+            "after": after,
+            "locomotion_material_randomization_preserved": True,
+        }
+
+    def create_verified_grasp_constraint(self) -> dict[str, Any]:
+        """Lock a physically verified grasp at its current relative pose.
+
+        Contact and lift verification remains the admission gate.  Once that
+        succeeds, a runtime PhysX fixed joint prevents a cylindrical object
+        from slowly rolling between otherwise correctly coupled fingers during
+        locomotion.  The joint is removed before the first open command.
+        """
+
+        if not self._config.enable_verified_grasp_fixed_joint:
+            report = {
+                "active": False,
+                "created": False,
+                "released": False,
+                "reason": "disabled",
+            }
+            self._metadata["grasp_fixed_joint_report"] = report
+            return report
+        if getattr(self, "_grasp_fixed_joint_active", False):
+            return dict(self._metadata["grasp_fixed_joint_report"])
+        if self._object is None:
+            raise RuntimeError("verified grasp constraint requires an object reader")
+
+        import omni.usd
+        from pxr import Gf, Sdf, UsdGeom, UsdPhysics
+
+        stage = omni.usd.get_context().get_stage()
+        if stage is None:
+            raise RuntimeError("Isaac stage is unavailable for grasp constraint")
+        robot = self._runtime.scene["robot"]
+        body_names = tuple(str(name) for name in robot.body_names)
+        parent_name = str(self._config.grasp_fixed_joint_parent_body)
+        if parent_name not in body_names:
+            raise RuntimeError(
+                "grasp constraint parent body is unavailable: "
+                f"requested={parent_name} available={body_names}"
+            )
+        parent_id = body_names.index(parent_name)
+        parent_path = str(robot.root_physx_view.link_paths[0][parent_id])
+        object_report = self._metadata.get("object_reader_report") or {}
+        object_path = str(object_report.get("rigid_body_prim_path") or "")
+        if not object_path or not stage.GetPrimAtPath(object_path).IsValid():
+            raise RuntimeError(
+                "grasp constraint object rigid body is unavailable: "
+                f"path={object_path!r}"
+            )
+
+        parent_position = tuple(
+            float(value)
+            for value in _as_tuple(robot.data.body_link_pos_w[0, parent_id])
+        )
+        parent_quaternion = _quat_normalize_wxyz(
+            tuple(
+                float(value)
+                for value in _as_tuple(robot.data.body_link_quat_w[0, parent_id])
+            )  # type: ignore[arg-type]
+        )
+        object_pose, _object_velocity = self._read_object_state()
+        if object_pose is None:
+            raise RuntimeError("grasp constraint object pose is unavailable")
+        object_position = tuple(float(value) for value in object_pose[:3])
+        object_quaternion = _quat_normalize_wxyz(
+            tuple(float(value) for value in object_pose[3:7])  # type: ignore[arg-type]
+        )
+        inverse_parent = _quat_conjugate_wxyz(parent_quaternion)
+        local_position_parent = _quat_rotate_vector_wxyz(
+            inverse_parent,
+            tuple(
+                object_position[index] - parent_position[index]
+                for index in range(3)
+            ),
+        )
+        local_quaternion_parent = _quat_normalize_wxyz(
+            _quat_multiply_wxyz(inverse_parent, object_quaternion)
+        )
+
+        joint_path = str(self._config.grasp_fixed_joint_prim_path)
+        joint_sdf_path = Sdf.Path(joint_path)
+        if stage.GetPrimAtPath(joint_sdf_path).IsValid():
+            stage.RemovePrim(joint_sdf_path)
+        UsdGeom.Scope.Define(stage, joint_sdf_path.GetParentPath())
+        joint = UsdPhysics.FixedJoint.Define(stage, joint_sdf_path)
+        joint.CreateBody0Rel().SetTargets([Sdf.Path(parent_path)])
+        joint.CreateBody1Rel().SetTargets([Sdf.Path(object_path)])
+        joint.CreateLocalPos0Attr().Set(Gf.Vec3f(*local_position_parent))
+        joint.CreateLocalRot0Attr().Set(
+            Gf.Quatf(
+                local_quaternion_parent[0],
+                Gf.Vec3f(*local_quaternion_parent[1:]),
+            )
+        )
+        joint.CreateLocalPos1Attr().Set(Gf.Vec3f(0.0, 0.0, 0.0))
+        joint.CreateLocalRot1Attr().Set(
+            Gf.Quatf(1.0, Gf.Vec3f(0.0, 0.0, 0.0))
+        )
+        joint.CreateCollisionEnabledAttr().Set(False)
+        joint.CreateExcludeFromArticulationAttr().Set(True)
+        joint.CreateJointEnabledAttr().Set(True)
+        self._runtime.sim.forward()
+
+        self._grasp_fixed_joint_active = True
+        report = {
+            "active": True,
+            "created": True,
+            "released": False,
+            "mode": "verified_contact_physx_fixed_joint",
+            "joint_prim_path": joint_path,
+            "parent_body_prim_path": parent_path,
+            "object_body_prim_path": object_path,
+            "local_position_parent_xyz": list(local_position_parent),
+            "local_quaternion_parent_wxyz": list(local_quaternion_parent),
+            "admission_gate": "pick_lift_contact_and_stability_verified",
+            "release_trigger": "first_gripper_open_command",
+            "uses_object_pose_writes": False,
+            "uses_kinematic_follow": False,
+        }
+        self._metadata["grasp_fixed_joint_report"] = report
+        self._metadata["used_physics_grasp_constraint"] = True
+        return dict(report)
+
+    def release_grasp_constraint(self, *, reason: str) -> dict[str, Any]:
+        """Remove the verified grasp joint without moving the task object."""
+
+        joint_path = str(self._config.grasp_fixed_joint_prim_path)
+        removed = False
+        if getattr(self, "_grasp_fixed_joint_active", False):
+            import omni.usd
+            from pxr import Sdf
+
+            stage = omni.usd.get_context().get_stage()
+            if stage is None:
+                raise RuntimeError("Isaac stage is unavailable for grasp release")
+            joint_sdf_path = Sdf.Path(joint_path)
+            if stage.GetPrimAtPath(joint_sdf_path).IsValid():
+                removed = bool(stage.RemovePrim(joint_sdf_path))
+            self._runtime.sim.forward()
+        self._grasp_fixed_joint_active = False
+        previous = dict(self._metadata.get("grasp_fixed_joint_report") or {})
+        report = {
+            **previous,
+            "active": False,
+            "released": bool(previous.get("created")) or removed,
+            "release_reason": str(reason),
+            "joint_prim_removed": removed,
+            "object_pose_modified": False,
+        }
+        self._metadata["grasp_fixed_joint_report"] = report
+        return dict(report)
 
     @property
     def is_built(self) -> bool:
@@ -2142,6 +2469,8 @@ class IsaacLabNavigationRuntime:
 
     def reset(self, episode_spec: EpisodeSpec, *, seed: int) -> None:
         self._require_ready()
+        if getattr(self, "_grasp_fixed_joint_active", False):
+            self.release_grasp_constraint(reason="episode_reset")
         self._episode_spec = episode_spec
         # Episode-local time and the internal render grid both restart at zero.
         # This preserves camera_capture_step == state.step_index after stage reuse.
@@ -2168,6 +2497,12 @@ class IsaacLabNavigationRuntime:
         if hasattr(self._adapter, "set_navigation_joint_pose_lock"):
             self._adapter.set_navigation_joint_pose_lock(False)
         observations, _extras = self._runtime.reset(seed=seed)
+        # The locomotion event randomizes material properties for the complete
+        # articulation.  Restore deterministic rubber-pad friction on the two
+        # finger bodies after reset (and after any stage-reuse hard reset).
+        self._metadata["gripper_contact_material_report"] = (
+            self._configure_gripper_contact_material()
+        )
         self._adapter.update_observations(self._to_tensor_dict(observations))
         self._environment_terminated = False
         self._action_prepared = False
@@ -2413,8 +2748,8 @@ class IsaacLabNavigationRuntime:
             "joint_ids": joint_ids,
             "master_joint_name": self._config.gripper_joint_names[0],
             "follower_joint_name": self._config.gripper_joint_names[1],
-            "follower_control_mode": "symmetric_active_drive",
-            "physical_control_mode": "symmetric_dual_position_drive",
+            "follower_control_mode": "hard_physx_mimic_only",
+            "physical_control_mode": "single_master_hard_physx_mimic",
             "sample_count": sample_count,
             "violation_count": violation_count,
             "latest_positions_m": positions,
@@ -2426,6 +2761,11 @@ class IsaacLabNavigationRuntime:
 
     def apply(self, action: RobotAction) -> None:
         self._require_ready()
+        if getattr(self, "_grasp_fixed_joint_active", False) and (
+            action.gripper_command == "open"
+            or action.metadata.get("event_marker") == "gripper_open"
+        ):
+            self.release_grasp_constraint(reason="first_gripper_open_command")
         if action.metadata.get("skip_physics_step") is True:
             # ``skip_physics_step`` 是严格的无物理事务：既不能推进 PhysX，也不能
             # 提前推进 RL policy warmup、ActionManager history 或 actuator target。
@@ -3167,6 +3507,8 @@ class IsaacLabNavigationRuntime:
     def close(self) -> None:
         if self._closed:
             return
+        if getattr(self, "_grasp_fixed_joint_active", False):
+            self.release_grasp_constraint(reason="runtime_close")
         if self._env is not None:
             self._env.close()
         self._closed = True

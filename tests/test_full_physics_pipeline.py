@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import tempfile
 import unittest
 from dataclasses import replace
@@ -537,6 +538,66 @@ class FullPhysicsPipelineTest(unittest.TestCase):
                 object_pose=(1.02, 2.01, 0.30, 1.0, 0.0, 0.0, 0.0),
             )
             pipeline.machine._capture_carry_object_tcp_offset(pick_state)
+
+            half_sqrt_two = math.sqrt(0.5)
+            followed_state = replace(
+                pick_state,
+                step_index=15,
+                tcp_pose=(
+                    3.0,
+                    4.0,
+                    0.8,
+                    half_sqrt_two,
+                    0.0,
+                    0.0,
+                    half_sqrt_two,
+                ),
+                object_pose=(
+                    2.99,
+                    4.02,
+                    0.78,
+                    half_sqrt_two,
+                    0.0,
+                    0.0,
+                    half_sqrt_two,
+                ),
+            )
+            followed_report = pipeline.machine._verify_carry_object_tracking(
+                followed_state
+            )
+            self.assertTrue(followed_report["success"])
+            self.assertAlmostEqual(followed_report["object_tcp_offset_drift_m"], 0.0)
+            self.assertAlmostEqual(
+                followed_report["object_tcp_rotation_drift_rad"],
+                0.0,
+            )
+            self.assertEqual(followed_report["relative_pose_frame"], "tcp")
+
+            slipped_orientation_state = replace(
+                followed_state,
+                object_pose=(
+                    2.99,
+                    4.02,
+                    0.78,
+                    math.cos(math.radians(50.0)),
+                    0.0,
+                    0.0,
+                    math.sin(math.radians(50.0)),
+                ),
+            )
+            orientation_report = pipeline.machine._verify_carry_object_tracking(
+                slipped_orientation_state
+            )
+            self.assertFalse(orientation_report["success"])
+            self.assertEqual(
+                orientation_report["failure_mode"],
+                "object_tcp_relative_pose_slip",
+            )
+            self.assertGreater(
+                orientation_report["object_tcp_rotation_drift_rad"],
+                pipeline.machine.config.manipulation
+                .carry_object_tcp_rotation_slip_tolerance_rad,
+            )
 
             report = pipeline.machine._verify_carry_object_tracking(dropped_state)
 
