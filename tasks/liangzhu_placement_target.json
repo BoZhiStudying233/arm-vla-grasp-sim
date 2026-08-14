@@ -28,6 +28,18 @@
         "rotation_settle_angular_velocity_rps": 0.12,
         "large_heading_creep_velocity_mps": 0.0
       },
+      "carry_initial_alignment": {
+        "enabled": true,
+        "mode": "direct",
+        "target": "final_place_waypoint",
+        "yaw_tolerance_rad": 0.1,
+        "settle_angular_velocity_rps": 0.12,
+        "settle_required_stable_steps": 5,
+        "yaw_kp": 1.2,
+        "minimum_yaw_rate_rps": 0.18,
+        "maximum_yaw_rate_rps": 0.3,
+        "max_steps": 600
+      },
       "carry_departure": {
         "enabled": true,
         "activation_heading_error_rad": 0.7853981633974483,

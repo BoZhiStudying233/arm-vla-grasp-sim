@@ -81,6 +81,23 @@ def _carry_departure_config(
     }
 
 
+def _carry_initial_alignment_config(
+    *,
+    mode: str = "direct",
+) -> dict[str, object]:
+    return {
+        "enabled": True,
+        "mode": mode,
+        "yaw_tolerance_rad": 0.10,
+        "settle_angular_velocity_rps": 0.12,
+        "settle_required_stable_steps": 2,
+        "yaw_kp": 1.2,
+        "minimum_yaw_rate_rps": 0.18,
+        "maximum_yaw_rate_rps": 0.30,
+        "max_steps": 100,
+    }
+
+
 def test_exact_live_start_replaces_map_dependent_pct_cell_center() -> None:
     grid = _open_grid(
         resolution=0.2,
@@ -482,6 +499,73 @@ def test_same_floor_carry_reverses_outside_support_then_turns_in_place() -> None
     assert status["dwa"]["rotation_gate_active"] is True
     assert status["dwa_limits"]["rotate_in_place_angle"] == pytest.approx(0.45)
     assert status["dwa_limits"]["rotate_in_place_exit_angle"] == pytest.approx(0.20)
+
+
+def test_carry_initial_alignment_directly_faces_final_waypoint_before_dwa() -> None:
+    grid = _open_grid(
+        resolution=0.05,
+        origin=(-3.0, -3.0, 0.0),
+        shape=(140, 140),
+    )
+    target_angle = 0.30
+    goal = (2.0 * math.cos(target_angle), 2.0 * math.sin(target_angle))
+    plan = NavPlan(
+        goal=NavGoal(x=goal[0], y=goal[1], yaw=target_angle),
+        waypoints=((0.0, 0.0), goal),
+        metadata={
+            "planner": "pct",
+            "sim_start": (0.0, 0.0, 0.3),
+            "execution_phase": "carry_nav_to_place",
+            "navigation_execution": {
+                "carry_initial_alignment": _carry_initial_alignment_config(),
+            },
+        },
+    )
+    executor = DwaNavExecutor(
+        grid_map=grid,
+        carry_grid_map=grid,
+        dwa_config=DWAConfig(control_dt=0.02),
+    )
+    executor.reset(plan)
+
+    turn = executor.compute_action(_state(0.0, 0.0, 0.0, step=0))
+    report = turn.metadata["carry_initial_alignment"]
+    assert turn.source == "navigation_carry_initial_alignment"
+    assert turn.base_velocity == pytest.approx((0.0, 0.0, 0.30))
+    assert report["raw_relative_turn_rad"] == pytest.approx(target_angle)
+    assert report["selected_relative_turn_rad"] == pytest.approx(target_angle)
+    assert report["target"] == "final_place_waypoint"
+
+    executor.compute_action(_state(0.0, 0.0, target_angle, step=1))
+    completed = executor.compute_action(
+        _state(0.0, 0.0, target_angle, step=2)
+    )
+    assert completed.source == "navigation_carry_initial_alignment_complete"
+    assert completed.metadata["carry_initial_alignment"]["completed"] is True
+    assert completed.metadata["phase"] == "dwa"
+
+
+@pytest.mark.parametrize(
+    ("degrees", "expected_degrees", "expected_label"),
+    [
+        (20.0, 0.0, "front"),
+        (30.0, 45.0, "front left"),
+        (80.0, 90.0, "left"),
+        (140.0, 135.0, "back left"),
+        (179.0, -180.0, "back"),
+        (-140.0, -135.0, "back right"),
+        (-80.0, -90.0, "right"),
+        (-30.0, -45.0, "front right"),
+    ],
+)
+def test_carry_initial_alignment_octants_preserve_left_right_semantics(
+    degrees: float,
+    expected_degrees: float,
+    expected_label: str,
+) -> None:
+    selected, label = DwaNavExecutor._octant_turn(math.radians(degrees))
+    assert math.degrees(selected) == pytest.approx(expected_degrees)
+    assert label == expected_label
 
 
 def test_carry_departure_fails_before_turn_when_reverse_segment_is_blocked() -> None:

@@ -369,6 +369,15 @@ class DwaNavExecutor:
         self._carry_departure_tick_count = 0
         self._carry_departure_settle_count = 0
         self._carry_departure_stable_count = 0
+        self._carry_initial_alignment_config: dict[str, Any] | None = None
+        self._carry_initial_alignment_report: dict[str, Any] = {
+            "enabled": False
+        }
+        self._carry_initial_alignment_pending = False
+        self._carry_initial_alignment_active = False
+        self._carry_initial_alignment_target_yaw: float | None = None
+        self._carry_initial_alignment_tick_count = 0
+        self._carry_initial_alignment_stable_count = 0
 
     def reset(self, plan: NavPlan) -> None:
         """载入新路径并清空执行、终点和停滞状态。"""
@@ -524,9 +533,12 @@ class DwaNavExecutor:
         self._consecutive_infeasible_recomputes = 0
         self._near_goal_stall_handoff = False
         self._near_goal_stall_handoff_tolerance = None
+        self._reset_carry_initial_alignment_state(plan)
         self._reset_carry_departure_state(plan)
         if self._carry_departure_pending:
             self._phase = "carry_departure_pending"
+        elif self._carry_initial_alignment_pending:
+            self._phase = "carry_initial_alignment_pending"
 
     def compute_action(self, state: SimulationState) -> RobotAction:
         """根据当前观测计算一个 tick 的 RobotAction，不推进仿真。"""
@@ -553,6 +565,12 @@ class DwaNavExecutor:
         )
         if carry_departure_action is not None:
             return carry_departure_action
+        carry_alignment_action = self._compute_carry_initial_alignment_action(
+            pose,
+            body_velocity,
+        )
+        if carry_alignment_action is not None:
+            return carry_alignment_action
         stair_float_action = self._compute_stair_float_action(state, pose)
         if stair_float_action is not None:
             return stair_float_action
@@ -738,6 +756,8 @@ class DwaNavExecutor:
             self._carry_departure_pending
             or self._carry_departure_active
             or self._carry_departure_settling
+            or self._carry_initial_alignment_pending
+            or self._carry_initial_alignment_active
         ):
             return False
 
@@ -810,6 +830,9 @@ class DwaNavExecutor:
                 self._carry_forward_translation_activation_reason
             ),
             "carry_departure": dict(self._carry_departure_report),
+            "carry_initial_alignment": dict(
+                self._carry_initial_alignment_report
+            ),
             "position_tolerance": self._active_position_tolerance,
             "configured_position_tolerance": self.position_tolerance,
             "carry_position_tolerance": self.carry_position_tolerance,
@@ -1457,6 +1480,271 @@ class DwaNavExecutor:
             settle_angular_velocity,
         )
 
+    def _reset_carry_initial_alignment_state(self, plan: NavPlan) -> None:
+        """Prepare a dedicated post-grasp yaw manoeuvre before local navigation."""
+
+        self._carry_initial_alignment_config = None
+        self._carry_initial_alignment_report = {"enabled": False}
+        self._carry_initial_alignment_pending = False
+        self._carry_initial_alignment_active = False
+        self._carry_initial_alignment_target_yaw = None
+        self._carry_initial_alignment_tick_count = 0
+        self._carry_initial_alignment_stable_count = 0
+        if plan.metadata.get("execution_phase") != "carry_nav_to_place":
+            self._carry_initial_alignment_report["reason"] = "not_carry_navigation"
+            return
+        if _pct_plan_is_multifloor(plan):
+            self._carry_initial_alignment_report["reason"] = "multifloor_route"
+            return
+        execution = plan.metadata.get("navigation_execution")
+        execution = execution if isinstance(execution, dict) else {}
+        raw_config = execution.get("carry_initial_alignment")
+        if raw_config is None:
+            self._carry_initial_alignment_report["reason"] = "not_configured"
+            return
+        if not isinstance(raw_config, dict):
+            raise ValueError(
+                "navigation_execution.carry_initial_alignment 必须是对象"
+            )
+        if not bool(raw_config.get("enabled", False)):
+            self._carry_initial_alignment_report = {
+                "enabled": False,
+                "reason": "disabled_by_task",
+            }
+            return
+        mode = str(raw_config.get("mode", "direct")).strip().lower()
+        if mode not in {"direct", "nearest_octant"}:
+            raise ValueError(
+                "carry_initial_alignment.mode 必须是 direct 或 nearest_octant"
+            )
+        config = dict(raw_config)
+        config["mode"] = mode
+        defaults = {
+            "yaw_tolerance_rad": 0.10,
+            "settle_angular_velocity_rps": 0.12,
+            "yaw_kp": 1.2,
+            "minimum_yaw_rate_rps": 0.18,
+            "maximum_yaw_rate_rps": 0.30,
+        }
+        for field_name, default in defaults.items():
+            value = float(config.get(field_name, default))
+            if not math.isfinite(value) or value < 0.0:
+                raise ValueError(
+                    f"carry_initial_alignment.{field_name} 数值无效"
+                )
+            config[field_name] = value
+        if config["yaw_tolerance_rad"] <= 0.0:
+            raise ValueError("carry_initial_alignment.yaw_tolerance_rad 必须为正")
+        if config["maximum_yaw_rate_rps"] <= 0.0:
+            raise ValueError(
+                "carry_initial_alignment.maximum_yaw_rate_rps 必须为正"
+            )
+        if (
+            config["minimum_yaw_rate_rps"]
+            > config["maximum_yaw_rate_rps"]
+        ):
+            raise ValueError("carry_initial_alignment 最小角速度不能大于最大角速度")
+        for field_name, default in (
+            ("settle_required_stable_steps", 5),
+            ("max_steps", 600),
+        ):
+            value = int(config.get(field_name, default))
+            if value < 1:
+                raise ValueError(f"carry_initial_alignment.{field_name} 必须至少为 1")
+            config[field_name] = value
+        self._carry_initial_alignment_config = config
+        self._carry_initial_alignment_pending = True
+        self._carry_initial_alignment_report = {
+            "enabled": True,
+            "configured": True,
+            "mode": mode,
+            "target": "final_place_waypoint",
+            "target_xy": [float(plan.goal.x), float(plan.goal.y)],
+            "active": False,
+            "completed": False,
+        }
+
+    @staticmethod
+    def _octant_turn(relative_yaw_rad: float) -> tuple[float, str]:
+        """Quantize a signed body-frame yaw delta and preserve left/right semantics."""
+
+        step = math.pi / 4.0
+        index = int(math.floor(float(relative_yaw_rad) / step + 0.5))
+        index = ((index + 4) % 8) - 4
+        selected = float(index) * step
+        labels = {
+            0: "front",
+            1: "front left",
+            2: "left",
+            3: "back left",
+            -4: "back",
+            -3: "back right",
+            -2: "right",
+            -1: "front right",
+        }
+        return selected, labels[index]
+
+    def _compute_carry_initial_alignment_action(
+        self,
+        pose: tuple[float, float, float],
+        body_velocity: tuple[float, float, float],
+    ) -> RobotAction | None:
+        if self._carry_initial_alignment_pending:
+            self._initialize_carry_initial_alignment(pose)
+        if not self._carry_initial_alignment_active:
+            return None
+        config = self._carry_initial_alignment_config
+        target_yaw = self._carry_initial_alignment_target_yaw
+        if config is None or target_yaw is None:
+            self._fail_carry_initial_alignment("carry_initial_alignment_state_lost")
+            return self._emit_carry_initial_alignment_action(
+                (0.0, 0.0, 0.0),
+                source="navigation_carry_initial_alignment_failed",
+            )
+        self._carry_initial_alignment_tick_count += 1
+        error = wrap_yaw(target_yaw - pose[2])
+        tolerance = float(config["yaw_tolerance_rad"])
+        within_target = abs(error) <= tolerance
+        stable = (
+            within_target
+            and abs(body_velocity[2])
+            <= float(config["settle_angular_velocity_rps"])
+        )
+        self._carry_initial_alignment_stable_count = (
+            self._carry_initial_alignment_stable_count + 1 if stable else 0
+        )
+        self._carry_initial_alignment_report.update(
+            {
+                "tick_count": self._carry_initial_alignment_tick_count,
+                "current_pose_xyyaw": list(pose),
+                "current_yaw_error_rad": error,
+                "within_target_tolerance": within_target,
+                "settle_stable_count": self._carry_initial_alignment_stable_count,
+                "measured_angular_velocity_rps": body_velocity[2],
+            }
+        )
+        if self._carry_initial_alignment_stable_count >= int(
+            config["settle_required_stable_steps"]
+        ):
+            try:
+                self._reanchor_after_carry_departure(pose)
+            except LocalPathRefinementError as exc:
+                self._carry_initial_alignment_report["reanchor_error"] = dict(
+                    exc.report
+                )
+                self._fail_carry_initial_alignment(
+                    "carry_initial_alignment_reanchor_failed"
+                )
+            else:
+                self._carry_initial_alignment_active = False
+                self._phase = "dwa"
+                self._carry_initial_alignment_report.update(
+                    {
+                        "active": False,
+                        "completed": True,
+                        "completed_pose_xyyaw": list(pose),
+                        "final_yaw_error_rad": error,
+                    }
+                )
+                return self._emit_carry_initial_alignment_action(
+                    (0.0, 0.0, 0.0),
+                    source="navigation_carry_initial_alignment_complete",
+                )
+        elif self._carry_initial_alignment_tick_count >= int(config["max_steps"]):
+            self._fail_carry_initial_alignment("carry_initial_alignment_timeout")
+
+        if not self._carry_initial_alignment_active:
+            return self._emit_carry_initial_alignment_action(
+                (0.0, 0.0, 0.0),
+                source="navigation_carry_initial_alignment_failed",
+            )
+        if within_target:
+            self._phase = "carry_initial_alignment_settling"
+            command = (0.0, 0.0, 0.0)
+            source = "navigation_carry_initial_alignment_settling"
+        else:
+            self._phase = "carry_initial_alignment"
+            magnitude = min(
+                float(config["maximum_yaw_rate_rps"]),
+                max(
+                    float(config["minimum_yaw_rate_rps"]),
+                    float(config["yaw_kp"]) * abs(error),
+                ),
+            )
+            command = (0.0, 0.0, math.copysign(magnitude, error))
+            source = "navigation_carry_initial_alignment"
+        return self._emit_carry_initial_alignment_action(command, source=source)
+
+    def _initialize_carry_initial_alignment(
+        self,
+        pose: tuple[float, float, float],
+    ) -> None:
+        config = self._carry_initial_alignment_config
+        if config is None or self.plan is None:
+            self._fail_carry_initial_alignment(
+                "carry_initial_alignment_not_initialized"
+            )
+            return
+        self._carry_initial_alignment_pending = False
+        target_bearing = math.atan2(
+            float(self.plan.goal.y) - pose[1],
+            float(self.plan.goal.x) - pose[0],
+        )
+        raw_delta = wrap_yaw(target_bearing - pose[2])
+        if config["mode"] == "nearest_octant":
+            selected_delta, turn_label = self._octant_turn(raw_delta)
+        else:
+            selected_delta = raw_delta
+            _quantized, turn_label = self._octant_turn(raw_delta)
+        target_yaw = wrap_yaw(pose[2] + selected_delta)
+        self._carry_initial_alignment_target_yaw = target_yaw
+        self._carry_initial_alignment_active = True
+        self._phase = "carry_initial_alignment"
+        self._carry_initial_alignment_report.update(
+            {
+                "active": True,
+                "initial_pose_xyyaw": list(pose),
+                "target_bearing_world_rad": target_bearing,
+                "raw_relative_turn_rad": raw_delta,
+                "selected_relative_turn_rad": selected_delta,
+                "selected_relative_turn_deg": math.degrees(selected_delta),
+                "turn_label": turn_label,
+                "target_yaw_rad": target_yaw,
+            }
+        )
+
+    def _fail_carry_initial_alignment(self, reason: str) -> None:
+        self._carry_initial_alignment_pending = False
+        self._carry_initial_alignment_active = False
+        self._carry_initial_alignment_report.update(
+            {
+                "active": False,
+                "completed": False,
+                "failed": True,
+                "failure_reason": reason,
+            }
+        )
+        self._stall_detected = True
+        self._done = True
+        self._success = False
+        self._failure_reason = reason
+        self._phase = "stalled"
+
+    def _emit_carry_initial_alignment_action(
+        self,
+        command: tuple[float, float, float],
+        *,
+        source: str,
+    ) -> RobotAction:
+        self._tick_index += 1
+        self._last_command = tuple(float(value) for value in command)
+        self._command_recomputed_this_tick = True
+        return RobotAction(
+            base_velocity=self._last_command,
+            source=source,
+            metadata=self._action_metadata(),
+        )
+
     def _reset_carry_departure_state(self, plan: NavPlan) -> None:
         """Prepare an optional straight retreat before a large carry turn."""
 
@@ -1804,6 +2092,22 @@ class DwaNavExecutor:
         if self._carry_departure_stable_count >= int(
             config["settle_required_stable_steps"]
         ):
+            if self._carry_initial_alignment_pending:
+                self._carry_departure_settling = False
+                self._carry_departure_completed = True
+                self._phase = "carry_initial_alignment_pending"
+                self._carry_departure_report.update(
+                    {
+                        "settling": False,
+                        "completed": True,
+                        "departure_settled_pose_xyyaw": list(pose),
+                        "reanchor_deferred_until_initial_alignment": True,
+                    }
+                )
+                return self._emit_carry_departure_action(
+                    (0.0, 0.0, 0.0),
+                    source="navigation_carry_departure_complete",
+                )
             try:
                 self._reanchor_after_carry_departure(pose)
             except LocalPathRefinementError as exc:
@@ -1878,7 +2182,11 @@ class DwaNavExecutor:
                 "reason": reason,
             }
         )
-        self._phase = "dwa"
+        self._phase = (
+            "carry_initial_alignment_pending"
+            if self._carry_initial_alignment_pending
+            else "dwa"
+        )
 
     def _fail_carry_departure(self, reason: str) -> None:
         self._carry_departure_pending = False
@@ -2260,6 +2568,9 @@ class DwaNavExecutor:
                 self._carry_forward_translation_activation_reason
             ),
             "carry_departure": dict(self._carry_departure_report),
+            "carry_initial_alignment": dict(
+                self._carry_initial_alignment_report
+            ),
             "measured_body_velocity": self._last_body_velocity,
             "yaw_alignment_required": self._active_require_yaw_alignment,
             "stall_detected": self._stall_detected,

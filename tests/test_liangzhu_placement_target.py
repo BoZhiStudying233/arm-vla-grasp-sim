@@ -52,6 +52,10 @@ def test_box_pair_annotation_is_the_task_specific_single_source() -> None:
     assert alignment["rotate_in_place_exit_angle_rad"] == 0.2
     assert alignment["rotation_settle_angular_velocity_rps"] == 0.12
     assert alignment["large_heading_creep_velocity_mps"] == 0.0
+    carry_alignment = task["navigation_execution"]["carry_initial_alignment"]
+    assert carry_alignment["enabled"] is True
+    assert carry_alignment["mode"] == "direct"
+    assert carry_alignment["target"] == "final_place_waypoint"
     assert task["navigation_execution"]["carry_departure"]["enabled"] is True
     assert task["place"]["place_linear_velocity_tolerance_mps"] == 0.1
     assert task["place"]["place_angular_velocity_tolerance_rps"] == 2.0
