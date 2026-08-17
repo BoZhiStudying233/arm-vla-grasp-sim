@@ -22,13 +22,22 @@ PIPELINE_ENTRY = PROJECT_ROOT / "scripts/pipeline/run_full_physics_pipeline.py"
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from source.recording.training_action import (  # noqa: E402
+    training_quality_success_verified,
+)
+from source.scene.profiles import SceneProfileError, load_scene_profile  # noqa: E402
+
 
 _REAL_MODES = {
     "simulation_smoke": "--simulation-smoke",
     "navigation_smoke": "--navigation-smoke",
     "navigation_carry_smoke": "--navigation-carry-smoke",
+    "stair_locomotion_smoke": "--stair-locomotion-smoke",
     "manipulation_apply_smoke": "--manipulation-apply-smoke",
+    "remote_vla_eval": "--remote-vla-eval",
 }
+
+_FULL_PHYSICS_MODES = frozenset({"full_physics", "remote_vla_eval"})
 
 
 _COLORS = {
@@ -48,6 +57,7 @@ _COLORS = {
 _STATE_COLORS = {
     "launching": "cyan",
     "isaac_startup": "yellow",
+    "progress_pending": "yellow",
     "build_stage": "blue",
     "reset_episode": "cyan",
     "plan_nav_to_pick": "magenta",
@@ -78,6 +88,7 @@ class BatchEpisodeCommand:
     output_dir: Path
     summary_path: Path
     command: list[str]
+    num_episodes: int = 1
 
 
 @dataclass(frozen=True)
@@ -87,6 +98,8 @@ class EpisodeProgress:
     state: str | None = None
     step_index: int | None = None
     source: str = "unavailable"
+    episode_index: int | None = None
+    seed: int | None = None
 
 
 @dataclass(frozen=True)
@@ -98,6 +111,7 @@ class BatchEpisodeResult:
     pick_place_xy: str
     base_goal_relative_xy: str
     success: bool
+    training_quality_gate_passed: bool
     failed_state: str
     lerobot_path: str
     elapsed_seconds: float
@@ -113,15 +127,51 @@ def _project_path(raw_path: str | Path) -> Path:
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="逐个子进程运行 full-physics episode，适用于真实 Isaac 自动化批量验证。",
+        description=(
+            "批量运行 full-physics episode；默认复用一个 Isaac 进程和 stage，"
+            "也可回退到逐 episode 子进程。"
+        ),
     )
-    parser.add_argument("--task-json", required=True, help="任务 JSON 路径。")
+    parser.add_argument(
+        "--scene-profile",
+        default="liangzhu",
+        help="场景 profile 名称或别名；默认 liangzhu。",
+    )
+    parser.add_argument(
+        "--pct-multifloor",
+        action="store_const",
+        const="multi_floor",
+        dest="scene_profile",
+        help="兼容旧命令：等价于 --scene-profile multi_floor。",
+    )
+    parser.add_argument(
+        "--task-json",
+        default=None,
+        help="任务 JSON 路径；不传时由 scene profile 提供。",
+    )
+    parser.add_argument(
+        "--box-pair-layout",
+        choices=("task", "legacy_xy"),
+        default="task",
+        help=(
+            "转发双箱布局选择；旧模型评测使用 legacy_xy，默认 task 使用任务当前配置。"
+        ),
+    )
     parser.add_argument(
         "--output-dir",
         required=True,
         help="批量运行输出目录；每个 episode 会写入独立子目录。",
     )
     parser.add_argument("--num-episodes", type=int, default=1, help="运行的 episode 数量。")
+    parser.add_argument(
+        "--reuse-isaac-process",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "多 episode 时复用同一 Isaac/IsaacLab 进程和 stage；默认开启。"
+            "使用 --no-reuse-isaac-process 恢复逐 episode 子进程。"
+        ),
+    )
     parser.add_argument(
         "--seed",
         type=int,
@@ -131,8 +181,8 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--randomize-task",
         action=argparse.BooleanOptionalAction,
-        default=True,
-        help="按 episode seed 随机采样 pick/place XY；默认开启。",
+        default=None,
+        help="按 episode seed 随机采样任务；不传时由 scene profile 决定。",
     )
     parser.add_argument(
         "--show-randomization-debug",
@@ -142,14 +192,104 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--randomize-base-goal",
         action=argparse.BooleanOptionalAction,
-        default=True,
-        help="转发给单 episode pipeline：开启 pick/place base_goal 极坐标随机化；默认开启。",
+        default=None,
+        help="开启 base_goal 随机化；不传时由 scene profile 决定。",
     )
     parser.add_argument(
         "--headless",
         action=argparse.BooleanOptionalAction,
         default=True,
         help="批量运行默认 headless；需要 GUI 时使用 --no-headless。",
+    )
+    parser.add_argument(
+        "--navigation-visual-mode",
+        choices=("auto", "collision", "full"),
+        default=None,
+        help="转发物理场景视觉模式；不传时由 scene profile 决定。",
+    )
+    parser.add_argument(
+        "--global-planner",
+        choices=("astar", "pct"),
+        default=None,
+        help="转发全局规划器；不传时由 scene profile 决定。",
+    )
+    parser.add_argument(
+        "--pct-server-script",
+        default=None,
+        help="转发 PCT server 脚本路径。",
+    )
+    parser.add_argument("--pct-server-python", help="转发 PCT server Python 路径。")
+    parser.add_argument(
+        "--pct-tomogram-path",
+        default=None,
+        help="转发 PCT tomogram 路径。",
+    )
+    parser.add_argument(
+        "--pct-walkable-path",
+        default=None,
+        help="转发 PCT walkable 路径。",
+    )
+    parser.add_argument(
+        "--pct-collision-ply-path",
+        default=None,
+        help="转发 PCT collision PLY。",
+    )
+    fallback_group = parser.add_mutually_exclusive_group()
+    fallback_group.add_argument(
+        "--pct-no-fallback",
+        action="store_true",
+        dest="pct_no_fallback",
+        default=None,
+        help="禁止 PCT 失败时回退 A*。",
+    )
+    fallback_group.add_argument(
+        "--pct-allow-fallback",
+        "--pct-fallback-to-astar",
+        action="store_false",
+        dest="pct_no_fallback",
+        help="允许 PCT 失败时回退 A*。",
+    )
+    parser.add_argument(
+        "--pct-coord-mode",
+        choices=("sim_to_pct_180deg", "identity"),
+        default=None,
+        help="转发 Isaac 到 PCT 的坐标变换模式。",
+    )
+    parser.add_argument(
+        "--pct-cross-floor-gateway",
+        action="append",
+        default=None,
+        help="转发跨层 gateway；良渚单层默认 none。",
+    )
+    parser.add_argument(
+        "--pct-cross-floor-stair-exit",
+        action="append",
+        default=None,
+        help="转发跨层楼梯出口；良渚单层默认 none。",
+    )
+    parser.add_argument(
+        "--pct-cross-floor-stair-midpoint",
+        action="append",
+        default=None,
+        help="转发跨层楼梯中点；良渚单层默认 none。",
+    )
+    parser.add_argument(
+        "--policy-profile",
+        choices=("flat", "pct_multifloor"),
+        default=None,
+        help="转发 locomotion policy profile。",
+    )
+    parser.add_argument("--locomotion-task", default=None, help="转发 locomotion task 名称。")
+    parser.add_argument(
+        "--locomotion-checkpoint",
+        default=None,
+        help="转发 locomotion checkpoint。",
+    )
+    parser.add_argument(
+        "--require-locomotion-checkpoint",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="要求 checkpoint 存在，缺失时立即失败；默认开启。",
     )
     parser.add_argument(
         "--continue-on-failure",
@@ -178,17 +318,48 @@ def _build_parser() -> argparse.ArgumentParser:
         help="是否使用 ANSI 颜色打印 batch 进度；默认开启，可用 --no-color 关闭。",
     )
     parser.add_argument(
-        "--record-video",
+        "--overview",
         action="store_true",
-        help="转发给单 episode pipeline：启用展示/observation 视频录制；默认关闭。",
+        help=(
+            "启用 overview 数采视角并制作展示视频；默认不采集 overview，"
+            "也不制作视频。"
+        ),
+    )
+    parser.add_argument(
+        "--record-video",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "转发低层视频录制开关；默认关闭。日常数采建议使用 --overview。"
+        ),
+    )
+    parser.add_argument(
+        "--record-dataset",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "转发 LeRobot dataset 录制开关；默认保留单 episode pipeline "
+            "的原行为，仿真测评建议显式使用 --no-record-dataset。"
+        ),
+    )
+    parser.add_argument(
+        "--dataset-camera-keys",
+        nargs="+",
+        choices=("front", "wrist", "overview"),
+        default=None,
+        help=(
+            "转发训练数据相机流；默认由单 episode pipeline 使用 front wrist，"
+            "传 --overview 时自动追加 overview。"
+        ),
     )
     parser.add_argument(
         "--video-mode",
-        choices=("overview", "front", "font", "wrist", "all"),
-        default="overview",
+        choices=("overview", "front", "font", "wrist", "composite", "all"),
+        default=None,
         help=(
             "转发给单 episode pipeline：overview 为 third_person 展示视角，front/font 为前视 "
-            "observation，wrist 为腕部 observation，all 同时导出 overview/front/wrist。"
+            "observation，wrist 为腕部 observation，composite 输出同步三视角拼接视频，"
+            "all 同时导出 overview/front/wrist 三路独立视频。"
         ),
     )
     parser.add_argument(
@@ -209,9 +380,19 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--overview-camera-mode",
-        choices=("auto",),
-        default="auto",
-        help="转发给单 episode pipeline：overview camera 自动发现/切换模式。",
+        choices=("fixed", "auto"),
+        default=None,
+        help="转发给单 episode pipeline：fixed 固定相机，auto 按阶段切换。",
+    )
+    parser.add_argument(
+        "--overview-camera-prim-path",
+        default=None,
+        help="转发 image/video/GUI 共用的 overview Camera prim。",
+    )
+    parser.add_argument(
+        "--overview-camera-schedule",
+        default=None,
+        help="转发给单 episode pipeline：headless Camera0-8 切换规则 JSON。",
     )
     parser.add_argument(
         "--overview-capture-backend",
@@ -237,6 +418,17 @@ def _build_parser() -> argparse.ArgumentParser:
         default=2.2,
         help="转发给单 episode pipeline：overview 线性 RGB 转 sRGB gamma，默认 2.2。",
     )
+    parser.add_argument("--vla-endpoint", default="ws://127.0.0.1:10093")
+    parser.add_argument("--vla-connect-timeout-s", type=float, default=10.0)
+    parser.add_argument("--vla-response-timeout-s", type=float, default=120.0)
+    parser.add_argument("--vla-jpeg-quality", type=int, default=90)
+    parser.add_argument("--vla-max-replans", type=int, default=64)
+    parser.add_argument("--vla-max-chunk-steps", type=int, default=250)
+    parser.add_argument(
+        "--vla-arm-mode",
+        choices=("route_only", "shadow"),
+        default="route_only",
+    )
 
     mode_group = parser.add_mutually_exclusive_group()
     mode_group.add_argument("--dry-run", action="store_const", const="dry_run", dest="mode")
@@ -247,7 +439,15 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
-    return _build_parser().parse_args(argv)
+    args = _build_parser().parse_args(argv)
+    try:
+        args.scene_profile = load_scene_profile(
+            args.scene_profile,
+            PROJECT_ROOT,
+        ).name
+    except SceneProfileError as exc:
+        raise SystemExit(str(exc)) from exc
+    return args
 
 
 def _bool_flag(enabled: bool, enabled_flag: str, disabled_flag: str) -> str:
@@ -297,16 +497,23 @@ def _last_json_line(
 ) -> dict[str, object] | None:
     """只读取文件尾部来解析最后一条 JSONL，避免 heartbeat 扫描完整 frames。"""
 
-    if not path.is_file():
+    try:
+        if not path.is_file():
+            return None
+        stat = path.stat()
+    except OSError:
         return None
-    if min_mtime is not None and path.stat().st_mtime < float(min_mtime):
+    if min_mtime is not None and stat.st_mtime < float(min_mtime):
         return None
-    size = path.stat().st_size
+    size = stat.st_size
     if size <= 0:
         return None
-    with path.open("rb") as stream:
-        stream.seek(max(0, size - max_bytes))
-        data = stream.read().decode("utf-8", errors="ignore")
+    try:
+        with path.open("rb") as stream:
+            stream.seek(max(0, size - max_bytes))
+            data = stream.read().decode("utf-8", errors="ignore")
+    except OSError:
+        return None
     for line in reversed(data.splitlines()):
         line = line.strip()
         if not line:
@@ -317,6 +524,54 @@ def _last_json_line(
             continue
         return payload if isinstance(payload, dict) else None
     return None
+
+
+def _progress_file_is_fresh(path: Path, *, min_mtime: float | None) -> bool:
+    """Return whether a progress artifact belongs to the current child run."""
+
+    try:
+        if not path.is_file():
+            return False
+        return min_mtime is None or path.stat().st_mtime >= float(min_mtime)
+    except OSError:
+        return False
+
+
+def _episode_progress_paths(
+    episode_dir: Path,
+    *,
+    summary_name: str = "summary.json",
+) -> tuple[list[Path], list[Path], list[Path]]:
+    """Build direct and legacy-nested progress paths for one episode."""
+
+    roots = (episode_dir, episode_dir / "episode_000000")
+    return (
+        [root / "frames.jsonl" for root in roots],
+        [root / "events.jsonl" for root in roots],
+        [root / summary_name for root in roots],
+    )
+
+
+def _progress_from_jsonl(
+    path: Path,
+    *,
+    source: str,
+    min_mtime: float | None,
+) -> EpisodeProgress | None:
+    payload = _last_json_line(path, min_mtime=min_mtime)
+    if payload is None:
+        return None
+    state = payload.get("pipeline_state")
+    step_index = payload.get("step_index")
+    return EpisodeProgress(
+        state=state if isinstance(state, str) and state else None,
+        step_index=(
+            int(step_index)
+            if isinstance(step_index, int) and not isinstance(step_index, bool)
+            else None
+        ),
+        source=source,
+    )
 
 
 def _progress_from_summary(
@@ -345,31 +600,120 @@ def _read_episode_progress(
     *,
     min_mtime: float | None = None,
 ) -> EpisodeProgress:
-    frames_candidates = [
-        episode.summary_path.parent / "frames.jsonl",
-        episode.output_dir / "episode_000000" / "frames.jsonl",
-    ]
-    summary_candidates = [
-        episode.summary_path,
-        episode.summary_path.parent / "episode_000000" / episode.summary_path.name,
-    ]
-    any_progress_file_exists = any(path.is_file() for path in frames_candidates + summary_candidates)
-    frames_path = next((path for path in frames_candidates if path.is_file()), frames_candidates[0])
-    frame = _last_json_line(frames_path, min_mtime=min_mtime)
-    if frame is not None:
-        state = frame.get("pipeline_state")
-        step_index = frame.get("step_index")
-        return EpisodeProgress(
-            state=state if isinstance(state, str) else None,
-            step_index=int(step_index) if isinstance(step_index, int) else None,
+    active_episode_index = episode.episode_index
+    active_episode_dir = episode.summary_path.parent
+    active_summary_path = episode.summary_path
+    if episode.num_episodes > 1:
+        for candidate_index in range(episode.num_episodes - 1, -1, -1):
+            candidate_dir = episode.output_dir / f"episode_{candidate_index:06d}"
+            candidate_paths = _episode_progress_paths(
+                candidate_dir,
+                summary_name=episode.summary_path.name,
+            )
+            if any(
+                _progress_file_is_fresh(path, min_mtime=min_mtime)
+                for paths in candidate_paths
+                for path in paths
+            ):
+                active_episode_index = candidate_index
+                active_episode_dir = candidate_dir
+                active_summary_path = candidate_dir / episode.summary_path.name
+                break
+    frames_candidates, events_candidates, summary_candidates = _episode_progress_paths(
+        active_episode_dir,
+        summary_name=active_summary_path.name,
+    )
+    episode_seed = episode.seed + active_episode_index - episode.episode_index
+    for path in frames_candidates:
+        frame_progress = _progress_from_jsonl(
+            path,
             source="frames",
+            min_mtime=min_mtime,
         )
-    summary_progress = _progress_from_summary(episode.summary_path, min_mtime=min_mtime)
-    if summary_progress is not None:
-        return summary_progress
-    if any_progress_file_exists:
-        return EpisodeProgress()
-    return EpisodeProgress(state="isaac_startup", source="batch")
+        if frame_progress is None:
+            continue
+        return EpisodeProgress(
+            state=frame_progress.state,
+            step_index=frame_progress.step_index,
+            source=frame_progress.source,
+            episode_index=active_episode_index,
+            seed=episode_seed,
+        )
+    for path in events_candidates:
+        event_progress = _progress_from_jsonl(
+            path,
+            source="events",
+            min_mtime=min_mtime,
+        )
+        if event_progress is None:
+            continue
+        return EpisodeProgress(
+            state=event_progress.state,
+            step_index=event_progress.step_index,
+            source=event_progress.source,
+            episode_index=active_episode_index,
+            seed=episode_seed,
+        )
+    for path in summary_candidates:
+        summary_progress = _progress_from_summary(path, min_mtime=min_mtime)
+        if summary_progress is None:
+            continue
+        return EpisodeProgress(
+            state=summary_progress.state,
+            step_index=summary_progress.step_index,
+            source=summary_progress.source,
+            episode_index=active_episode_index,
+            seed=episode_seed,
+        )
+    has_fresh_progress_file = any(
+        _progress_file_is_fresh(path, min_mtime=min_mtime)
+        for path in frames_candidates + events_candidates + summary_candidates
+    )
+    return EpisodeProgress(
+        state="progress_pending" if has_fresh_progress_file else "isaac_startup",
+        source="batch",
+        episode_index=active_episode_index,
+        seed=episode_seed,
+    )
+
+
+def _progress_is_low_information(progress: EpisodeProgress) -> bool:
+    return progress.source == "unavailable" or (
+        progress.source == "batch"
+        and progress.state in {None, "isaac_startup", "progress_pending"}
+    )
+
+
+def _should_print_periodic_progress(
+    progress: EpisodeProgress,
+    *,
+    last_printed_progress: EpisodeProgress | None,
+    now: float,
+    last_low_information_progress_at: float,
+    progress_interval_s: float,
+) -> bool:
+    """Throttle startup/unavailable heartbeats while keeping real states live."""
+
+    if not _progress_is_low_information(progress):
+        return True
+    if last_printed_progress is None:
+        return True
+    identity = (
+        progress.state,
+        progress.source,
+        progress.episode_index,
+        progress.seed,
+    )
+    previous_identity = (
+        last_printed_progress.state,
+        last_printed_progress.source,
+        last_printed_progress.episode_index,
+        last_printed_progress.seed,
+    )
+    return identity != previous_identity or (
+        now - last_low_information_progress_at
+        >= max(30.0, float(progress_interval_s))
+    )
 
 
 def _print_progress_line(
@@ -382,10 +726,16 @@ def _print_progress_line(
     """用独立块打印 batch heartbeat，避免被 Isaac 多行日志夹断。"""
 
     prefix = _color("[progress] ", "yellow", enabled=color_enabled)
+    displayed_episode_index = (
+        episode.episode_index
+        if progress.episode_index is None
+        else progress.episode_index
+    )
+    displayed_seed = episode.seed if progress.seed is None else progress.seed
     progress_line = (
         prefix
         + (
-            f"episode={episode.episode_index} seed={episode.seed} "
+            f"episode={displayed_episode_index} seed={displayed_seed} "
             f"running elapsed={_format_duration(elapsed_seconds)}"
         )
         + _format_progress_suffix(progress, color_enabled=color_enabled)
@@ -578,6 +928,7 @@ def _build_episode_result(
         pick_place_xy=_summary_xy(summary),
         base_goal_relative_xy=_summary_base_goal_relative_xy(summary),
         success=success,
+        training_quality_gate_passed=_training_quality_gate_passed(summary),
         failed_state=_failed_state(summary, success=success),
         lerobot_path=_lerobot_path(episode, summary),
         elapsed_seconds=max(0.0, float(elapsed_seconds)),
@@ -586,6 +937,18 @@ def _build_episode_result(
             if summary
             else "summary_missing"
         ),
+    )
+
+
+def _training_quality_gate_passed(
+    summary: dict[str, object] | None,
+) -> bool:
+    """批量训练只接收具有最终物理执行来源证据的 episode。"""
+
+    return bool(
+        summary
+        and summary.get("training_quality_gate_passed") is True
+        and training_quality_success_verified(summary)
     )
 
 
@@ -612,6 +975,7 @@ def _format_result_table(
         "随机化 Pick / Place XY",
         "随机化 BaseGoal / 相对目标",
         "Pipeline 成功",
+        "训练质量门禁",
         "失败 State",
         "LeRobot 数据路径",
         "Episode 耗时",
@@ -622,6 +986,7 @@ def _format_result_table(
             result.pick_place_xy,
             result.base_goal_relative_xy,
             "成功" if result.success else "失败",
+            "通过" if result.training_quality_gate_passed else "拒绝",
             result.failed_state,
             result.lerobot_path,
             _format_duration(result.elapsed_seconds),
@@ -632,7 +997,16 @@ def _format_result_table(
         max(_display_width(headers[index]), *(_display_width(row[index]) for row in rows))
         for index in range(len(headers))
     ]
-    column_colors = ("cyan", "magenta", "yellow", "green", "red", "blue", "white")
+    column_colors = (
+        "cyan",
+        "magenta",
+        "yellow",
+        "green",
+        "green",
+        "red",
+        "blue",
+        "white",
+    )
     separator = "+" + "+".join("-" * (width + 2) for width in widths) + "+"
 
     def _row(values: Sequence[str], *, header: bool = False) -> str:
@@ -640,6 +1014,8 @@ def _format_result_table(
         for index, value in enumerate(values):
             color_name = column_colors[index]
             if not header and index == 3 and value == "失败":
+                color_name = "red"
+            if not header and index == 4 and value == "拒绝":
                 color_name = "red"
             padded = _pad_cell(value, widths[index])
             cells.append(_color(padded, color_name, enabled=color_enabled))
@@ -677,50 +1053,130 @@ def _build_child_command(
         sys.executable,
         "-B",
         str(PIPELINE_ENTRY),
-        "--task-json",
-        str(_project_path(args.task_json)),
+        "--scene-profile",
+        str(args.scene_profile),
         "--output-dir",
         str(episode_output_dir),
         "--num-episodes",
         "1",
         "--seed",
         str(episode_seed),
-        _bool_flag(args.randomize_task, "--randomize-task", "--no-randomize-task"),
-        _bool_flag(
+        _bool_flag(args.headless, "--headless", "--no-headless"),
+    ]
+    if args.task_json:
+        command.extend(["--task-json", str(_project_path(args.task_json))])
+    command.extend(["--box-pair-layout", str(args.box_pair_layout)])
+    if args.overview:
+        command.append("--overview")
+    if args.dataset_camera_keys is not None:
+        command.append("--dataset-camera-keys")
+        command.extend(str(value) for value in args.dataset_camera_keys)
+    for value, enabled_flag, disabled_flag in (
+        (args.randomize_task, "--randomize-task", "--no-randomize-task"),
+        (
             args.randomize_base_goal,
             "--randomize-base-goal",
             "--no-randomize-base-goal",
         ),
-        _bool_flag(args.headless, "--headless", "--no-headless"),
-    ]
+        (
+            args.require_locomotion_checkpoint,
+            "--require-locomotion-checkpoint",
+            "--no-require-locomotion-checkpoint",
+        ),
+        (args.record_video, "--record-video", "--no-record-video"),
+        (args.record_dataset, "--record-dataset", "--no-record-dataset"),
+    ):
+        if value is not None:
+            command.append(_bool_flag(bool(value), enabled_flag, disabled_flag))
+
+    for argument_name in (
+        "navigation_visual_mode",
+        "global_planner",
+        "policy_profile",
+        "pct_coord_mode",
+        "locomotion_task",
+        "overview_camera_mode",
+        "overview_camera_prim_path",
+        "video_mode",
+        "vla_endpoint",
+        "vla_arm_mode",
+    ):
+        value = getattr(args, argument_name)
+        if value is not None:
+            command.extend([f"--{argument_name.replace('_', '-')}", str(value)])
+
+    for argument_name in (
+        "pct_server_script",
+        "pct_server_python",
+        "pct_tomogram_path",
+        "pct_walkable_path",
+        "pct_collision_ply_path",
+        "locomotion_checkpoint",
+    ):
+        value = getattr(args, argument_name)
+        if value:
+            command.extend(
+                [f"--{argument_name.replace('_', '-')}", str(_project_path(value))]
+            )
+
+    for argument_name in (
+        "vla_connect_timeout_s",
+        "vla_response_timeout_s",
+        "vla_jpeg_quality",
+        "vla_max_replans",
+        "vla_max_chunk_steps",
+    ):
+        command.extend(
+            [f"--{argument_name.replace('_', '-')}", str(getattr(args, argument_name))]
+        )
+
+    if args.pct_no_fallback is not None:
+        command.append(
+            "--pct-no-fallback" if args.pct_no_fallback else "--pct-allow-fallback"
+        )
+    for argument_name in (
+        "pct_cross_floor_gateway",
+        "pct_cross_floor_stair_exit",
+        "pct_cross_floor_stair_midpoint",
+    ):
+        values = getattr(args, argument_name)
+        if values is None:
+            continue
+        for value in values:
+            command.extend([f"--{argument_name.replace('_', '-')}", str(value)])
+
     if args.mode == "dry_run":
         command.append("--dry-run")
     elif args.mode != "full_physics":
         command.append(_REAL_MODES[args.mode])
     if args.show_randomization_debug:
         command.append("--show-randomization-debug")
-    if args.pick_plan_json and args.mode != "full_physics":
+    if args.pick_plan_json and args.mode not in _FULL_PHYSICS_MODES:
         command.extend(["--pick-plan-json", str(_project_path(args.pick_plan_json))])
-    if args.place_plan_json and args.mode != "full_physics":
+    if args.place_plan_json and args.mode not in _FULL_PHYSICS_MODES:
         command.extend(["--place-plan-json", str(_project_path(args.place_plan_json))])
-    if args.record_video:
-        command.append("--record-video")
-        command.extend(["--video-mode", str(args.video_mode)])
-        command.extend(["--video-width", str(int(args.video_width))])
-        command.extend(["--video-height", str(int(args.video_height))])
-        command.extend(["--overview-camera-mode", str(args.overview_camera_mode)])
-        command.extend(["--overview-capture-backend", str(args.overview_capture_backend)])
+
+    command.extend(["--video-width", str(int(args.video_width))])
+    command.extend(["--video-height", str(int(args.video_height))])
+    command.extend(["--overview-capture-backend", str(args.overview_capture_backend)])
+    command.extend(
+        [
+            "--overview-initial-hold-frames",
+            str(int(args.overview_initial_hold_frames)),
+        ]
+    )
+    command.extend(["--overview-exposure", str(float(args.overview_exposure))])
+    command.extend(["--overview-gamma", str(float(args.overview_gamma))])
+    if args.overview_camera_schedule:
         command.extend(
             [
-                "--overview-initial-hold-frames",
-                str(int(args.overview_initial_hold_frames)),
+                "--overview-camera-schedule",
+                str(_project_path(args.overview_camera_schedule)),
             ]
         )
-        command.extend(["--overview-exposure", str(float(args.overview_exposure))])
-        command.extend(["--overview-gamma", str(float(args.overview_gamma))])
-        if args.video_out:
-            video_output_dir = _project_path(args.video_out) / f"episode_{episode_index:06d}"
-            command.extend(["--video-out", str(video_output_dir)])
+    if args.video_out:
+        video_output_dir = _project_path(args.video_out) / f"episode_{episode_index:06d}"
+        command.extend(["--video-out", str(video_output_dir)])
 
     return BatchEpisodeCommand(
         episode_index=episode_index,
@@ -731,20 +1187,58 @@ def _build_child_command(
     )
 
 
+def _replace_command_option(command: list[str], option: str, value: str) -> None:
+    try:
+        index = command.index(option)
+    except ValueError as exc:
+        raise RuntimeError(f"child command is missing required option: {option}") from exc
+    if index + 1 >= len(command):
+        raise RuntimeError(f"child command option has no value: {option}")
+    command[index + 1] = value
+
+
+def _build_reused_process_command(args: argparse.Namespace) -> BatchEpisodeCommand:
+    """Build one child command that runs every episode in one live Isaac stage."""
+
+    base = _build_child_command(args, episode_index=0)
+    output_root = _project_path(args.output_dir)
+    command = list(base.command)
+    _replace_command_option(command, "--output-dir", str(output_root))
+    _replace_command_option(command, "--num-episodes", str(int(args.num_episodes)))
+    if "--no-reuse-isaac-stage" in command:
+        command.remove("--no-reuse-isaac-stage")
+    if "--reuse-isaac-stage" not in command:
+        command.append("--reuse-isaac-stage")
+    if args.video_out and "--video-out" in command:
+        _replace_command_option(command, "--video-out", str(_project_path(args.video_out)))
+    return BatchEpisodeCommand(
+        episode_index=0,
+        seed=int(args.seed),
+        output_dir=output_root,
+        summary_path=output_root / "episode_000000" / "summary.json",
+        command=command,
+        num_episodes=int(args.num_episodes),
+    )
+
+
 def _read_summary(
     path: Path,
     *,
     min_mtime: float | None = None,
 ) -> dict[str, object] | None:
-    if not path.is_file():
-        legacy_path = path.parent / "episode_000000" / path.name
-        if legacy_path.is_file():
-            path = legacy_path
-    if not path.is_file():
+    try:
+        if not path.is_file():
+            legacy_path = path.parent / "episode_000000" / path.name
+            if legacy_path.is_file():
+                path = legacy_path
+        if not path.is_file():
+            return None
+        if min_mtime is not None and path.stat().st_mtime < float(min_mtime):
+            return None
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
         return None
-    if min_mtime is not None and path.stat().st_mtime < float(min_mtime):
-        return None
-    return json.loads(path.read_text(encoding="utf-8"))
+    return payload if isinstance(payload, dict) else None
 
 
 def _run_child_process(
@@ -802,7 +1296,7 @@ def _run_child_process(
     selector.register(process.stdout, selectors.EVENT_READ)
     last_progress_at = started_at
     last_printed_progress: EpisodeProgress | None = None
-    last_unknown_progress_at = started_at
+    last_low_information_progress_at = started_at
     select_timeout_s = min(0.5, progress_interval_s * 0.5)
     launching_progress = EpisodeProgress(state="launching", source="batch")
     _print_progress_line(
@@ -823,12 +1317,14 @@ def _run_child_process(
                     episode,
                     min_mtime=started_at_epoch,
                 )
-                startup_waiting = progress.source == "batch" and progress.state == "isaac_startup"
-                should_print = (
-                    (progress.source != "unavailable" and not startup_waiting)
-                    or last_printed_progress is None
-                    or progress.state != last_printed_progress.state
-                    or now - last_unknown_progress_at >= max(30.0, progress_interval_s)
+                should_print = _should_print_periodic_progress(
+                    progress,
+                    last_printed_progress=last_printed_progress,
+                    now=now,
+                    last_low_information_progress_at=(
+                        last_low_information_progress_at
+                    ),
+                    progress_interval_s=progress_interval_s,
                 )
                 if should_print:
                     _print_progress_line(
@@ -838,8 +1334,8 @@ def _run_child_process(
                         color_enabled=color_enabled,
                     )
                     last_printed_progress = progress
-                    if progress.source == "batch" and progress.state == "isaac_startup":
-                        last_unknown_progress_at = now
+                    if _progress_is_low_information(progress):
+                        last_low_information_progress_at = now
                 last_progress_at = now
             if returncode is not None:
                 remaining = process.stdout.read()
@@ -879,6 +1375,10 @@ def _write_batch_record(
         "output_dir": str(episode.output_dir),
         "summary_path": str(episode.summary_path),
         "success": bool(summary.get("success")) if summary else False,
+        "training_quality_gate_passed": _training_quality_gate_passed(summary),
+        "lerobot_training_eligible": (
+            summary.get("lerobot_training_eligible") if summary else False
+        ),
         "failure_reason": summary.get("failure_reason") if summary else "summary_missing",
         "execution_mode": summary.get("execution_mode") if summary else None,
         "base_goal_randomization_enabled": (
@@ -897,6 +1397,7 @@ def _write_batch_record(
         "failed_state": result.failed_state,
         "lerobot_path": result.lerobot_path,
         "elapsed_seconds": result.elapsed_seconds,
+        "remote_vla": summary.get("remote_vla") if summary else None,
     }
     stream.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")))
     stream.write("\n")
@@ -907,7 +1408,7 @@ def _materialize_batch_lerobot(
     output_root: Path,
     episode_dirs: Sequence[Path],
 ) -> dict[str, object]:
-    """只把本次 batch 成功的 episode 合并，避免旧目录污染训练数据。"""
+    """只合并本次通过物理来源门禁的 episode，避免旧目录和 smoke 污染。"""
 
     from source.recording import materialize_lerobot_dataset
 
@@ -923,8 +1424,32 @@ def _materialize_batch_lerobot(
     return {**report, "manifest_path": str(manifest_path)}
 
 
+def _summary_elapsed_seconds(summary: dict[str, object] | None) -> float:
+    if summary is None:
+        return 0.0
+    performance = summary.get("performance_report")
+    if isinstance(performance, dict):
+        wall_seconds = performance.get("wall_seconds")
+        if isinstance(wall_seconds, (int, float)):
+            return max(0.0, float(wall_seconds))
+    duration = summary.get("duration_seconds")
+    return max(0.0, float(duration)) if isinstance(duration, (int, float)) else 0.0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parse_args(argv)
+    if (
+        args.dataset_camera_keys is not None
+        and "overview" in args.dataset_camera_keys
+        and not args.overview
+    ):
+        raise SystemExit("--dataset-camera-keys overview 需要同时传 --overview。")
+    if args.record_video is True and not args.overview:
+        raise SystemExit("--record-video 需要同时传 --overview。")
+    if args.overview and args.record_video is False:
+        raise SystemExit("--overview 会制作视频，请不要同时传 --no-record-video。")
+    if args.record_video is None:
+        args.record_video = bool(args.overview)
     if args.num_episodes < 1:
         raise SystemExit("--num-episodes must be positive.")
     if not args.headless and args.num_episodes > 1:
@@ -952,86 +1477,158 @@ def main(argv: Sequence[str] | None = None) -> int:
     env["PYTHONUNBUFFERED"] = "1"
     # batch 只在全部子进程结束后生成统一 dataset，避免每个 episode 重复编码一份。
     env["FULL_PHYSICS_DEFER_LEROBOT_EXPORT"] = "1"
-    # 子进程已经位于 batch episode 目录，不再额外创建 episode_000000。
-    env["FULL_PHYSICS_FLAT_EPISODE_OUTPUT"] = "1"
+    reuse_isaac_process = bool(
+        args.reuse_isaac_process
+        and args.mode in _FULL_PHYSICS_MODES
+        and args.num_episodes > 1
+        and args.headless
+        and args.continue_on_failure
+    )
+    if reuse_isaac_process:
+        # One child owns output_root/episode_N and one live Isaac stage.
+        env.pop("FULL_PHYSICS_FLAT_EPISODE_OUTPUT", None)
+        env["FULL_PHYSICS_BATCH_SUMMARY_NAME"] = "pipeline_batch_summary.jsonl"
+    else:
+        # Isolated children already run inside their final episode directory.
+        env["FULL_PHYSICS_FLAT_EPISODE_OUTPUT"] = "1"
+        env.pop("FULL_PHYSICS_BATCH_SUMMARY_NAME", None)
     all_success = True
     completed = 0
     batch_started_at = time.monotonic()
     color_enabled = bool(args.color) and "NO_COLOR" not in env
     episode_results: list[BatchEpisodeResult] = []
-    successful_episode_dirs: list[Path] = []
+    training_accepted_episode_dirs: list[Path] = []
     _print_banner(
         (
             f"[full-physics-batch] mode={args.mode} episodes={args.num_episodes} "
             f"seed_range={args.seed}..{args.seed + args.num_episodes - 1} "
-            f"output={output_root}"
+            f"reuse_isaac_process={reuse_isaac_process} output={output_root}"
         ),
         color_enabled=color_enabled,
     )
+
+    def _consume_completed_episode(
+        summary_stream,
+        *,
+        episode: BatchEpisodeCommand,
+        returncode: int,
+        elapsed_seconds: float,
+        min_mtime: float,
+        require_zero_returncode: bool,
+    ) -> bool:
+        nonlocal all_success, completed
+        summary = _read_summary(episode.summary_path, min_mtime=min_mtime)
+        success = bool(
+            summary
+            and summary.get("success")
+            and (returncode == 0 or not require_zero_returncode)
+        )
+        result = _build_episode_result(
+            episode=episode,
+            summary=summary,
+            success=success,
+            elapsed_seconds=elapsed_seconds,
+        )
+        episode_results.append(result)
+        training_quality_passed = _training_quality_gate_passed(summary)
+        if args.mode in _FULL_PHYSICS_MODES and success and training_quality_passed:
+            training_accepted_episode_dirs.append(episode.output_dir)
+        episode_accepted = bool(
+            success and (args.mode not in _FULL_PHYSICS_MODES or training_quality_passed)
+        )
+        all_success = all_success and episode_accepted
+        completed += 1
+        _write_batch_record(
+            summary_stream,
+            episode=episode,
+            returncode=returncode,
+            summary=summary,
+            result=result,
+        )
+        status_text = (
+            "success"
+            if episode_accepted
+            else ("quality-rejected" if success else "failed")
+        )
+        status_color = "green" if episode_accepted else "red"
+        final_progress = _progress_from_summary(
+            episode.summary_path,
+            min_mtime=min_mtime,
+        ) or _read_episode_progress(episode, min_mtime=min_mtime)
+        print(
+            _color(f"[{status_text}] ", status_color, enabled=color_enabled)
+            + (
+                f"episode={episode.episode_index} seed={episode.seed} "
+                f"returncode={returncode} "
+                f"elapsed={_format_duration(elapsed_seconds)} "
+                f"summary={episode.summary_path}"
+            ),
+            _format_progress_suffix(final_progress, color_enabled=color_enabled),
+            flush=True,
+        )
+        return episode_accepted
+
     with batch_summary_path.open("a", encoding="utf-8") as summary_stream:
-        for episode_index in range(args.num_episodes):
-            episode = _build_child_command(args, episode_index=episode_index)
-            episode.output_dir.mkdir(parents=True, exist_ok=True)
-            episode_started_at = time.monotonic()
-            episode_started_at_epoch = time.time()
+        if reuse_isaac_process:
+            shared_command = _build_reused_process_command(args)
+            shared_started_at_epoch = time.time()
             returncode = _run_child_process(
-                episode,
+                shared_command,
                 env=env,
                 progress_interval_s=args.progress_interval_s,
                 color_enabled=color_enabled,
             )
-            episode_elapsed_seconds = time.monotonic() - episode_started_at
-            summary = _read_summary(
-                episode.summary_path,
-                min_mtime=episode_started_at_epoch,
-            )
-            success = returncode == 0 and bool(summary and summary.get("success"))
-            result = _build_episode_result(
-                episode=episode,
-                summary=summary,
-                success=success,
-                elapsed_seconds=episode_elapsed_seconds,
-            )
-            episode_results.append(result)
-            if success:
-                successful_episode_dirs.append(episode.output_dir)
-            all_success = all_success and success
-            completed += 1
-            _write_batch_record(
-                summary_stream,
-                episode=episode,
-                returncode=returncode,
-                summary=summary,
-                result=result,
-            )
-            status_text = "success" if success else "failed"
-            status_color = "green" if success else "red"
-            final_progress = _progress_from_summary(
-                episode.summary_path,
-                min_mtime=episode_started_at_epoch,
-            ) or _read_episode_progress(
-                episode,
-                min_mtime=episode_started_at_epoch,
-            )
-            print(
-                _color(f"[{status_text}] ", status_color, enabled=color_enabled)
-                + (
-                    f"episode={episode_index} seed={episode.seed} "
-                    f"returncode={returncode} "
-                    f"elapsed={_format_duration(episode_elapsed_seconds)} "
-                    f"summary={episode.summary_path}"
-                ),
-                _format_progress_suffix(final_progress, color_enabled=color_enabled),
-                flush=True,
-            )
-            if not success and not args.continue_on_failure:
-                break
+            for episode_index in range(args.num_episodes):
+                episode_output_dir = output_root / f"episode_{episode_index:06d}"
+                episode = BatchEpisodeCommand(
+                    episode_index=episode_index,
+                    seed=int(args.seed) + episode_index,
+                    output_dir=episode_output_dir,
+                    summary_path=episode_output_dir / "summary.json",
+                    command=shared_command.command,
+                )
+                summary = _read_summary(
+                    episode.summary_path,
+                    min_mtime=shared_started_at_epoch,
+                )
+                _consume_completed_episode(
+                    summary_stream,
+                    episode=episode,
+                    returncode=returncode,
+                    elapsed_seconds=_summary_elapsed_seconds(summary),
+                    min_mtime=shared_started_at_epoch,
+                    require_zero_returncode=False,
+                )
+        else:
+            for episode_index in range(args.num_episodes):
+                episode = _build_child_command(args, episode_index=episode_index)
+                episode.output_dir.mkdir(parents=True, exist_ok=True)
+                episode_started_at = time.monotonic()
+                episode_started_at_epoch = time.time()
+                returncode = _run_child_process(
+                    episode,
+                    env=env,
+                    progress_interval_s=args.progress_interval_s,
+                    color_enabled=color_enabled,
+                )
+                episode_elapsed_seconds = time.monotonic() - episode_started_at
+                episode_accepted = _consume_completed_episode(
+                    summary_stream,
+                    episode=episode,
+                    returncode=returncode,
+                    elapsed_seconds=episode_elapsed_seconds,
+                    min_mtime=episode_started_at_epoch,
+                    require_zero_returncode=True,
+                )
+                if not episode_accepted and not args.continue_on_failure:
+                    break
     lerobot_report: dict[str, object] | None = None
-    if args.mode == "full_physics":
+    if args.mode in _FULL_PHYSICS_MODES:
         lerobot_report = _materialize_batch_lerobot(
             output_root,
-            successful_episode_dirs,
+            training_accepted_episode_dirs,
         )
+        all_success = bool(all_success and lerobot_report.get("lerobot_exported"))
         export_status = "success" if lerobot_report.get("lerobot_exported") else "pending"
         export_color = "green" if export_status == "success" else "yellow"
         print(

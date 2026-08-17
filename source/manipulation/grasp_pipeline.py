@@ -19,8 +19,8 @@ from typing import Any
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-MAX_PREFLIGHT_GRASP_XY_RADIUS_M = 1.00
-MAX_PREFLIGHT_PREGRASP_RADIUS_3D_M = 1.20
+MAX_PREFLIGHT_GRASP_XY_RADIUS_M = 0.68
+MAX_PREFLIGHT_PREGRASP_RADIUS_3D_M = 0.75
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -67,9 +67,12 @@ class GraspPipelineConfig:
     workspace: Path = PROJECT_ROOT
     curobo_python: str = os.environ.get(
         "GO2_X5_CUROBO_PYTHON",
-        "/data/conda_envs/isaacsim51_3dgs_grasp/bin/python",
+        sys.executable,
     )
-    curobo_source_root: str = os.environ.get("GO2_X5_CUROBO_SOURCE_ROOT", "/home/light/workspace/curobo")
+    curobo_source_root: str = os.environ.get(
+        "GO2_X5_CUROBO_SOURCE_ROOT",
+        str(PROJECT_ROOT / "external/curobo"),
+    )
     planner_host: str = "127.0.0.1"
     planner_port: int = 8765
     planner_timeout_s: float = 30.0
@@ -116,9 +119,59 @@ class GraspPipeline:
 
         Path(task.plan_json).unlink(missing_ok=True)
         task_mode = (task.curobo_task_mode or "grasp").strip().lower()
-        if task.use_planner_server and self._try_server(task):
+        target_data: dict[str, Any] | None = None
+        if task_mode == "grasp":
+            # 在启动耗时规划前拦截错误的 nav-to-pick 交接位姿。
+            target_data = self._read_json(task.target_json)
+            self._validate_target_workspace(target_data)
+        use_server = bool(task.use_planner_server)
+        grasp_mode = str(
+            ((target_data or {}).get("source") or {}).get("grasp_mode") or "side"
+        )
+        if (
+            use_server
+            and task_mode == "grasp"
+            and grasp_mode == "top_down"
+            and not self._server_supports_top_down_reverse_lift()
+        ):
+            print(
+                "[grasp] planner server 未声明 top_down_reverse_lift；"
+                "保留外部服务并改用当前代码的一次性 planner。",
+                flush=True,
+            )
+            use_server = False
+        if use_server and self._try_server(task):
             return self._read_json(task.plan_json)
         return self._run_one_shot_planner(task, task_mode=task_mode or "grasp")
+
+    def _server_supports_top_down_reverse_lift(self) -> bool:
+        """查询共享 server 是否已加载稳定的 top-down 反向抬升实现。"""
+
+        request = {"command": "capabilities"}
+        try:
+            with socket.create_connection(
+                (self.config.planner_host, self.config.planner_port),
+                timeout=1.0,
+            ) as sock:
+                sock.settimeout(min(3.0, self.config.planner_timeout_s))
+                sock.sendall(
+                    (json.dumps(request, ensure_ascii=False) + "\n").encode("utf-8")
+                )
+                response_line = sock.makefile("r", encoding="utf-8").readline()
+        except OSError:
+            return False
+        if not response_line:
+            return False
+        try:
+            response = json.loads(response_line)
+        except json.JSONDecodeError:
+            return False
+        features = response.get("features")
+        return bool(
+            response.get("ok", False)
+            and isinstance(features, dict)
+            and features.get("top_down_reverse_lift") is True
+        )
 
     def _run_one_shot_planner(self, task: GraspTask, *, task_mode: str) -> dict[str, Any]:
         if not self.script_plan.exists():
@@ -229,7 +282,7 @@ class GraspPipeline:
 
     @staticmethod
     def _validate_target_workspace(target: dict[str, Any]) -> None:
-        """Reject obviously mismatched nav-to-pick handoffs before invoking cuRobo."""
+        """在调用 cuRobo 前拒绝明显错误的 nav-to-pick 交接位姿。"""
 
         workspace = target.get("diagnostics", {}).get("target_workspace_base", {})
         grasp = workspace.get("grasp", {})
@@ -238,8 +291,11 @@ class GraspPipeline:
         pregrasp_radius = float(pregrasp.get("radius_3d_m", 0.0))
         if grasp_xy > MAX_PREFLIGHT_GRASP_XY_RADIUS_M or pregrasp_radius > MAX_PREFLIGHT_PREGRASP_RADIUS_3D_M:
             raise RuntimeError(
-                "grasp_target_unreachable: navigation base pose is not near the selected object: "
-                f"grasp_xy_radius={grasp_xy:.3f} m, pregrasp_radius_3d={pregrasp_radius:.3f} m"
+                "grasp_target_unreachable: 导航交接位姿超出机械臂工作空间: "
+                f"grasp_xy_radius={grasp_xy:.3f} m "
+                f"(limit={MAX_PREFLIGHT_GRASP_XY_RADIUS_M:.3f} m), "
+                f"pregrasp_radius_3d={pregrasp_radius:.3f} m "
+                f"(limit={MAX_PREFLIGHT_PREGRASP_RADIUS_3D_M:.3f} m)"
             )
 
     @staticmethod

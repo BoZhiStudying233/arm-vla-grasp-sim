@@ -31,6 +31,102 @@ def _xy_range(
     return (x_min, x_max), (y_min, y_max)
 
 
+def _forward_sector_spec(
+    randomization: dict[str, Any],
+) -> dict[str, Any] | None:
+    """解析 episode 实际使用的机器人前向扇区。"""
+
+    if randomization.get("mode") != "robot_forward_sector_v1":
+        return None
+    config = randomization.get("forward_sector")
+    sample = randomization.get("sample")
+    if not isinstance(config, dict) or not isinstance(sample, dict):
+        return None
+    try:
+        robot_xyz = tuple(float(value) for value in config["robot_translate_xyz"])
+        robot_yaw = float(sample["robot_yaw_rad"])
+        half_angle = math.radians(float(config["sector_half_angle_deg"]))
+        cola_radius = tuple(float(value) for value in config["cola_radius_range_m"])
+        mat_radius = tuple(float(value) for value in config["mat_radius_range_m"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if (
+        len(robot_xyz) != 3
+        or len(cola_radius) != 2
+        or len(mat_radius) != 2
+        or not all(
+            math.isfinite(value)
+            for value in (*robot_xyz, robot_yaw, half_angle, *cola_radius, *mat_radius)
+        )
+    ):
+        return None
+    return {
+        "origin_xyz": robot_xyz,
+        "robot_yaw_rad": robot_yaw,
+        "sector_half_angle_rad": half_angle,
+        "cola_radius_range_m": cola_radius,
+        "mat_radius_range_m": mat_radius,
+    }
+
+
+def _box_pair_layout_spec(
+    randomization: dict[str, Any],
+) -> dict[str, Any] | None:
+    """解析中央圆环、episode 分界线与场边禁止区。"""
+
+    if randomization.get("mode") != "liangzhu_box_pair_xy_v1":
+        return None
+    config = randomization.get("box_pair")
+    sample = randomization.get("sample")
+    if not isinstance(config, dict) or not isinstance(sample, dict):
+        return None
+    layout_config = config.get("layout_sampling")
+    layout_sample = sample.get("layout_geometry")
+    if not isinstance(layout_config, dict) or not isinstance(layout_sample, dict):
+        return None
+    if layout_config.get("mode") != "central_annulus_opposite_halfplane_v1":
+        return None
+    try:
+        center_xy = tuple(float(value) for value in layout_sample["field_center_xy"])
+        box1_radius = tuple(
+            float(value) for value in layout_sample["box1_radius_range_m"]
+        )
+        box2_radius = tuple(
+            float(value) for value in layout_sample["box2_radius_range_m"]
+        )
+        divider_normal = tuple(
+            float(value) for value in layout_sample["divider_normal_xy"]
+        )
+        forbidden = tuple(
+            {
+                "id": str(region["id"]),
+                "polygon_xy": tuple(
+                    tuple(float(value) for value in point)
+                    for point in region["polygon_xy"]
+                ),
+            }
+            for region in layout_sample["forbidden_regions_xy"]
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
+    values = (*center_xy, *box1_radius, *box2_radius, *divider_normal)
+    if (
+        len(center_xy) != 2
+        or len(box1_radius) != 2
+        or len(box2_radius) != 2
+        or len(divider_normal) != 2
+        or not all(math.isfinite(value) for value in values)
+    ):
+        return None
+    return {
+        "field_center_xy": center_xy,
+        "box1_radius_range_m": box1_radius,
+        "box2_radius_range_m": box2_radius,
+        "divider_normal_xy": divider_normal,
+        "forbidden_regions_xy": forbidden,
+    }
+
+
 def randomization_debug_spec(raw_task: dict[str, Any]) -> dict[str, Any]:
     """提取与 episode 采样结果一致的可视化描述。"""
 
@@ -44,6 +140,8 @@ def randomization_debug_spec(raw_task: dict[str, Any]) -> dict[str, Any]:
         "usd_purpose": "default",
         "physics_enabled": False,
         "collision_enabled": False,
+        "forward_sector": _forward_sector_spec(randomization),
+        "box_pair_layout": _box_pair_layout_spec(randomization),
         "pick": {
             "xy_range": _xy_range(randomization, "object_xy_randomization"),
             "pose_world": pick_pose,
@@ -54,6 +152,180 @@ def randomization_debug_spec(raw_task: dict[str, Any]) -> dict[str, Any]:
             "pose_world": place_pose,
             "color_rgb": (0.1, 0.4, 1.0),
         },
+    }
+
+
+def _sector_outline_points(
+    *,
+    origin_xy: tuple[float, float],
+    yaw_rad: float,
+    half_angle_rad: float,
+    radius_range_m: tuple[float, float],
+    z: float,
+) -> list[tuple[float, float, float]]:
+    """生成闭合扇环轮廓，用于显示实际可采样区域。"""
+
+    inner_radius, outer_radius = radius_range_m
+    angles = [
+        -half_angle_rad + 2.0 * half_angle_rad * index / 24.0
+        for index in range(25)
+    ]
+
+    def _point(radius: float, angle: float) -> tuple[float, float, float]:
+        world_angle = yaw_rad + angle
+        return (
+            origin_xy[0] + radius * math.cos(world_angle),
+            origin_xy[1] + radius * math.sin(world_angle),
+            z,
+        )
+
+    inner = [_point(inner_radius, angle) for angle in angles]
+    outer = [_point(outer_radius, angle) for angle in reversed(angles)]
+    return [*inner, *outer, inner[0]]
+
+
+def _circle_points(
+    *,
+    center_xy: tuple[float, float],
+    radius_m: float,
+    z: float,
+) -> list[tuple[float, float, float]]:
+    return [
+        (
+            center_xy[0] + radius_m * math.cos(2.0 * math.pi * index / 64.0),
+            center_xy[1] + radius_m * math.sin(2.0 * math.pi * index / 64.0),
+            z,
+        )
+        for index in range(65)
+    ]
+
+
+def _create_box_pair_layout_guides(
+    stage: Any,
+    spec: dict[str, Any] | None,
+    *,
+    z: float,
+) -> dict[str, Any]:
+    if spec is None:
+        return {"created": False, "reason": "box_pair_layout_not_configured"}
+    from pxr import UsdGeom
+
+    root_path = "/World/RandomizationDebug/BoxPairLayout"
+    UsdGeom.Xform.Define(stage, root_path)
+    center = tuple(spec["field_center_xy"])
+    paths: dict[str, Any] = {"annulus": {}, "forbidden": {}}
+    for name, radius_key, color in (
+        ("Box1", "box1_radius_range_m", (0.1, 1.0, 0.2)),
+        ("Box2", "box2_radius_range_m", (0.1, 0.4, 1.0)),
+    ):
+        paths["annulus"][name.lower()] = []
+        for boundary, radius in zip(
+            ("Inner", "Outer"), spec[radius_key]
+        ):
+            path = f"{root_path}/{name}{boundary}Radius"
+            _create_curve(
+                stage,
+                path,
+                _circle_points(center_xy=center, radius_m=float(radius), z=z),
+                color,
+                width=0.014,
+            )
+            paths["annulus"][name.lower()].append(path)
+
+    normal = tuple(spec["divider_normal_xy"])
+    norm = math.hypot(*normal)
+    if norm > 1.0e-9:
+        perpendicular = (-normal[1] / norm, normal[0] / norm)
+        half_length = 1.15 * max(
+            float(spec["box1_radius_range_m"][1]),
+            float(spec["box2_radius_range_m"][1]),
+        )
+        divider_path = f"{root_path}/RegionDivider"
+        _create_curve(
+            stage,
+            divider_path,
+            [
+                (
+                    center[0] - half_length * perpendicular[0],
+                    center[1] - half_length * perpendicular[1],
+                    z + 0.01,
+                ),
+                (
+                    center[0] + half_length * perpendicular[0],
+                    center[1] + half_length * perpendicular[1],
+                    z + 0.01,
+                ),
+            ],
+            (1.0, 0.85, 0.1),
+            width=0.018,
+        )
+        paths["divider"] = divider_path
+
+    for region in spec["forbidden_regions_xy"]:
+        polygon = list(region["polygon_xy"])
+        path = f"{root_path}/Forbidden_{region['id']}"
+        _create_curve(
+            stage,
+            path,
+            [(point[0], point[1], z + 0.015) for point in (*polygon, polygon[0])],
+            (1.0, 0.1, 0.1),
+            width=0.02,
+        )
+        paths["forbidden"][region["id"]] = path
+    return {
+        "created": True,
+        "root_prim_path": root_path,
+        "prim_paths": paths,
+        **spec,
+        "physics_enabled": False,
+        "collision_enabled": False,
+    }
+
+
+def _create_forward_sector_guides(
+    stage: Any,
+    spec: dict[str, Any] | None,
+    *,
+    z: float,
+) -> dict[str, Any]:
+    """创建可乐与地垫的前向扇环 guide。"""
+
+    if spec is None:
+        return {"created": False, "reason": "forward_sector_not_configured"}
+    from pxr import UsdGeom
+
+    root_path = "/World/RandomizationDebug/ForwardSector"
+    UsdGeom.Xform.Define(stage, root_path)
+    origin = tuple(float(value) for value in spec["origin_xyz"][:2])
+    yaw = float(spec["robot_yaw_rad"])
+    half_angle = float(spec["sector_half_angle_rad"])
+    paths: dict[str, str] = {}
+    for name, radius_key, color in (
+        ("Cola", "cola_radius_range_m", (0.1, 1.0, 0.2)),
+        ("Mat", "mat_radius_range_m", (0.1, 0.4, 1.0)),
+    ):
+        path = f"{root_path}/{name}Region"
+        _create_curve(
+            stage,
+            path,
+            _sector_outline_points(
+                origin_xy=origin,
+                yaw_rad=yaw,
+                half_angle_rad=half_angle,
+                radius_range_m=tuple(spec[radius_key]),
+                z=z,
+            ),
+            color,
+            width=0.016,
+        )
+        paths[name.lower()] = path
+    return {
+        "created": True,
+        "root_prim_path": root_path,
+        "region_prim_paths": paths,
+        **spec,
+        "physics_enabled": False,
+        "collision_enabled": False,
     }
 
 
@@ -145,8 +417,22 @@ def create_randomization_debug(stage: Any, raw_task: dict[str, Any]) -> dict[str
     if stage.GetPrimAtPath(root_path).IsValid():
         stage.RemovePrim(root_path)
     UsdGeom.Xform.Define(stage, root_path)
+    guide_z = min(
+        float(spec["pick"]["pose_world"].get("z", 0.0)),
+        float(spec["place"]["pose_world"].get("z", 0.0)),
+    ) + 0.02
     report = {
         **spec,
+        "forward_sector": _create_forward_sector_guides(
+            stage,
+            spec["forward_sector"],
+            z=guide_z,
+        ),
+        "box_pair_layout": _create_box_pair_layout_guides(
+            stage,
+            spec["box_pair_layout"],
+            z=guide_z,
+        ),
         "pick": _create_group(stage, name="Pick", spec=spec["pick"]),
         "place": _create_group(stage, name="Place", spec=spec["place"]),
     }
@@ -156,7 +442,7 @@ def create_randomization_debug(stage: Any, raw_task: dict[str, Any]) -> dict[str
         f"pick={report['pick'].get('pose_world')} "
         f"place_range={report['place'].get('xy_range')} "
         f"place={report['place'].get('pose_world')} "
-        "legend=green:pick,blue:place",
+        "legend=green:box1/pick,blue:box2/place,yellow:divider,red:forbidden",
         flush=True,
     )
     return report

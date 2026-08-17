@@ -10,13 +10,16 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 from pathlib import Path
 
 from scripts.pipeline.run_full_physics_batch import (
     BatchEpisodeCommand,
+    EpisodeProgress,
     _build_episode_result,
     _build_child_command,
     _build_parser,
+    _build_reused_process_command,
     _color,
     _format_duration,
     _format_progress_suffix,
@@ -24,11 +27,16 @@ from scripts.pipeline.run_full_physics_batch import (
     _read_episode_progress,
     _read_summary,
     _run_child_process,
+    _should_print_periodic_progress,
+)
+from scripts.pipeline.run_full_physics_pipeline import (
+    _parse_args as _parse_pipeline_args,
 )
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 TASK_PATH = PROJECT_ROOT / "tasks/nav_pick_place_apple_contact.json"
+LIANGZHU_TASK_PATH = PROJECT_ROOT / "tasks/nav_pick_place_cola_liangzhu_pct.json"
 PICK_PLAN = (
     PROJECT_ROOT
     / "outputs/random_pick_place_dataset/apple_pick_place_contact/episode_0000"
@@ -42,6 +50,141 @@ PLACE_PLAN = (
 
 
 class FullPhysicsBatchTest(unittest.TestCase):
+    def test_remote_vla_eval_forwards_loopback_protocol_options(self) -> None:
+        args = _build_parser().parse_args(
+            [
+                "--output-dir",
+                "/tmp/remote_vla_eval",
+                "--remote-vla-eval",
+                "--vla-endpoint",
+                "ws://127.0.0.1:10193",
+                "--vla-max-replans",
+                "12",
+                "--vla-max-chunk-steps",
+                "180",
+                "--vla-arm-mode",
+                "shadow",
+                "--box-pair-layout",
+                "legacy_xy",
+                "--no-record-dataset",
+            ]
+        )
+
+        command = _build_child_command(args, episode_index=0).command
+        child_args = _parse_pipeline_args(command[3:])
+
+        self.assertIn("--remote-vla-eval", command)
+        self.assertEqual(child_args.mode, "remote_vla_eval")
+        self.assertEqual(child_args.vla_endpoint, "ws://127.0.0.1:10193")
+        self.assertEqual(child_args.vla_max_replans, 12)
+        self.assertEqual(child_args.vla_max_chunk_steps, 180)
+        self.assertEqual(child_args.vla_arm_mode, "shadow")
+        self.assertEqual(child_args.box_pair_layout, "legacy_xy")
+        self.assertIn("--box-pair-layout", command)
+        self.assertFalse(child_args.record_dataset)
+
+    def test_reused_process_command_runs_all_episodes_in_one_output_root(self) -> None:
+        args = _build_parser().parse_args(
+            [
+                "--output-dir",
+                "/tmp/reused_full_physics_batch",
+                "--num-episodes",
+                "3",
+                "--seed",
+                "7",
+                "--no-record-video",
+            ]
+        )
+
+        child = _build_reused_process_command(args)
+
+        self.assertTrue(args.reuse_isaac_process)
+        self.assertEqual(child.num_episodes, 3)
+        self.assertEqual(child.output_dir, Path("/tmp/reused_full_physics_batch"))
+        self.assertEqual(
+            child.summary_path,
+            Path("/tmp/reused_full_physics_batch/episode_000000/summary.json"),
+        )
+        self.assertEqual(
+            child.command[child.command.index("--num-episodes") + 1],
+            "3",
+        )
+        self.assertEqual(
+            child.command[child.command.index("--output-dir") + 1],
+            "/tmp/reused_full_physics_batch",
+        )
+        self.assertIn("--reuse-isaac-stage", child.command)
+
+    def test_liangzhu_stable_profile_is_the_batch_default(self) -> None:
+        args = _build_parser().parse_args(
+            ["--output-dir", "/tmp/liangzhu_default_batch"]
+        )
+
+        episode = _build_child_command(args, episode_index=0)
+        command = episode.command
+        child_args = _parse_pipeline_args(command[3:])
+
+        self.assertEqual(args.scene_profile, "liangzhu")
+        self.assertIsNone(args.task_json)
+        self.assertEqual(
+            command[command.index("--scene-profile") + 1],
+            "liangzhu",
+        )
+        self.assertNotIn("--task-json", command)
+        self.assertNotIn("--pct-tomogram-path", command)
+        self.assertEqual(
+            child_args.task_json,
+            "tasks/nav_pick_place_cola_box1_to_box2_liangzhu_pct.json",
+        )
+        self.assertEqual(child_args.global_planner, "pct")
+        self.assertEqual(child_args.pct_coord_mode, "identity")
+        self.assertTrue(child_args.pct_no_fallback)
+        self.assertEqual(child_args.policy_profile, "pct_multifloor")
+        self.assertTrue(args.require_locomotion_checkpoint)
+        self.assertEqual(child_args.navigation_visual_mode, "collision")
+        self.assertFalse(child_args.record_video)
+        self.assertEqual(child_args.video_mode, "composite")
+        self.assertNotIn("--pct-no-fallback", command)
+        self.assertIn("--require-locomotion-checkpoint", command)
+        self.assertEqual(
+            child_args.pct_collision_ply_path,
+            "source/scene/liangzhu/ply/liangzhu_collision.ply",
+        )
+        for flag in (
+            "--pct-cross-floor-gateway",
+            "--pct-cross-floor-stair-exit",
+            "--pct-cross-floor-stair-midpoint",
+        ):
+            self.assertNotIn(flag, command)
+
+    def test_multi_floor_batch_reuses_single_pipeline_scene_profile(self) -> None:
+        args = _build_parser().parse_args(
+            [
+                "--scene-profile",
+                "multi_floor",
+                "--output-dir",
+                "/tmp/multi_floor_batch",
+            ]
+        )
+
+        command = _build_child_command(args, episode_index=0).command
+        child_args = _parse_pipeline_args(command[3:])
+
+        self.assertEqual(
+            command[command.index("--scene-profile") + 1],
+            "multi_floor",
+        )
+        self.assertEqual(
+            child_args.task_json,
+            "tasks/nav_pick_place_apple_multifloor_pct.json",
+        )
+        self.assertEqual(child_args.pct_coord_mode, "sim_to_pct_180deg")
+        self.assertFalse(child_args.randomize_task)
+        self.assertTrue(child_args.pct_stair_float)
+        self.assertEqual(child_args.overview_camera_mode, "auto")
+        self.assertFalse(child_args.record_video)
+        self.assertEqual(child_args.video_mode, "composite")
+
     def test_full_physics_batch_builds_one_episode_command_without_plan_json(self) -> None:
         args = _build_parser().parse_args(
             [
@@ -69,13 +212,20 @@ class FullPhysicsBatchTest(unittest.TestCase):
             Path("/tmp/full_physics_batch_test/episode_000002/summary.json"),
         )
         command = episode.command
+        child_args = _parse_pipeline_args(command[3:])
         self.assertNotIn("--full-physics", command)
         self.assertIn("--num-episodes", command)
         self.assertEqual(command[command.index("--num-episodes") + 1], "1")
         self.assertEqual(command[command.index("--seed") + 1], "102")
-        self.assertIn("--randomize-task", command)
-        self.assertIn("--randomize-base-goal", command)
+        self.assertNotIn("--randomize-task", command)
+        self.assertNotIn("--randomize-base-goal", command)
+        self.assertTrue(child_args.randomize_task)
+        self.assertTrue(child_args.randomize_base_goal)
         self.assertIn("--headless", command)
+        self.assertNotIn("--navigation-visual-mode", command)
+        self.assertEqual(child_args.navigation_visual_mode, "collision")
+        self.assertNotIn("--overview-camera-prim-path", command)
+        self.assertEqual(child_args.overview_camera_prim_path, "/World/overview")
         self.assertNotIn("--auto-start-curobo-server", command)
         self.assertNotIn("--lock-base-during-manipulation", command)
         self.assertNotIn("--lock-support-joints-during-manipulation", command)
@@ -109,6 +259,67 @@ class FullPhysicsBatchTest(unittest.TestCase):
         self.assertIn("--no-randomize-base-goal", command)
         self.assertIn("--no-headless", command)
         self.assertIn("--show-randomization-debug", command)
+
+    def test_batch_forwards_liangzhu_pct_and_policy_assets(self) -> None:
+        """批采集入口必须能复用单 episode 的良渚 PCT/locomotion 配置。"""
+
+        args = _build_parser().parse_args(
+            [
+                "--task-json",
+                str(LIANGZHU_TASK_PATH),
+                "--output-dir",
+                "/tmp/liangzhu_batch_test",
+                "--global-planner",
+                "pct",
+                "--pct-no-fallback",
+                "--pct-coord-mode",
+                "identity",
+                "--pct-server-script",
+                "scripts/navigation/pct_grid_server.py",
+                "--pct-tomogram-path",
+                "source/scene/liangzhu/pct/liangzhu_single_floor.pickle",
+                "--pct-walkable-path",
+                "source/scene/liangzhu/pct/liangzhu_single_floor_walkable.npy",
+                "--pct-collision-ply-path",
+                "/mnt/sage_data/ply/Liangzhu/liangzhu_collision.ply",
+                "--pct-cross-floor-gateway",
+                "none",
+                "--pct-cross-floor-stair-exit",
+                "none",
+                "--pct-cross-floor-stair-midpoint",
+                "none",
+                "--policy-profile",
+                "pct_multifloor",
+                "--locomotion-checkpoint",
+                "checkpoints/go2_x5/pct_multifloor/model_26000.pt",
+                "--require-locomotion-checkpoint",
+                "--navigation-visual-mode",
+                "full",
+            ]
+        )
+
+        command = _build_child_command(args, episode_index=0).command
+
+        self.assertEqual(command[command.index("--global-planner") + 1], "pct")
+        self.assertIn("--pct-no-fallback", command)
+        self.assertEqual(command[command.index("--pct-coord-mode") + 1], "identity")
+        self.assertEqual(
+            command[command.index("--policy-profile") + 1],
+            "pct_multifloor",
+        )
+        self.assertIn("--require-locomotion-checkpoint", command)
+        self.assertEqual(
+            command[command.index("--navigation-visual-mode") + 1],
+            "full",
+        )
+        self.assertEqual(
+            command[command.index("--pct-cross-floor-gateway") + 1],
+            "none",
+        )
+        self.assertEqual(
+            command[command.index("--pct-collision-ply-path") + 1],
+            "/mnt/sage_data/ply/Liangzhu/liangzhu_collision.ply",
+        )
 
     def test_batch_forwards_video_recording_arguments(self) -> None:
         args = _build_parser().parse_args(
@@ -157,6 +368,68 @@ class FullPhysicsBatchTest(unittest.TestCase):
             "/tmp/full_physics_batch_test/videos/episode_000001",
         )
 
+    def test_batch_forwards_dataset_camera_keys(self) -> None:
+        args = _build_parser().parse_args(
+            [
+                "--output-dir",
+                "/tmp/full_physics_batch_test",
+                "--dataset-camera-keys",
+                "front",
+                "wrist",
+            ]
+        )
+
+        command = _build_child_command(args, episode_index=0).command
+        child_args = _parse_pipeline_args(command[3:])
+
+        self.assertEqual(child_args.dataset_camera_keys, ["front", "wrist"])
+
+    def test_batch_defaults_to_no_video_and_overview_enables_composite(self) -> None:
+        default_args = _build_parser().parse_args(
+            ["--output-dir", "/tmp/full_physics_batch_test"]
+        )
+        default_command = _build_child_command(
+            default_args,
+            episode_index=0,
+        ).command
+        default_child = _parse_pipeline_args(default_command[3:])
+
+        self.assertFalse(default_child.record_video)
+        self.assertEqual(default_child.video_mode, "composite")
+
+        overview_args = _build_parser().parse_args(
+            [
+                "--output-dir",
+                "/tmp/full_physics_batch_test",
+                "--overview",
+            ]
+        )
+        overview_command = _build_child_command(
+            overview_args,
+            episode_index=0,
+        ).command
+        overview_child = _parse_pipeline_args(overview_command[3:])
+
+        self.assertIn("--overview", overview_command)
+        self.assertTrue(overview_child.record_video)
+        self.assertEqual(overview_child.video_mode, "composite")
+
+        disabled_args = _build_parser().parse_args(
+            [
+                "--output-dir",
+                "/tmp/full_physics_batch_test",
+                "--no-record-video",
+            ]
+        )
+        disabled_command = _build_child_command(
+            disabled_args,
+            episode_index=0,
+        ).command
+        disabled_child = _parse_pipeline_args(disabled_command[3:])
+
+        self.assertIn("--no-record-video", disabled_command)
+        self.assertFalse(disabled_child.record_video)
+
     def test_progress_format_helpers(self) -> None:
         args = _build_parser().parse_args(
             [
@@ -183,6 +456,9 @@ class FullPhysicsBatchTest(unittest.TestCase):
         )
         success_summary = {
             "success": True,
+            "training_quality_gate_passed": True,
+            "success_semantics": "physical_execution",
+            "execution_provenance_verified": True,
             "task_config": {
                 "randomization": {
                     "object_xy_randomization": {
@@ -237,6 +513,9 @@ class FullPhysicsBatchTest(unittest.TestCase):
             elapsed_seconds=7.0,
         )
 
+        self.assertTrue(success_result.training_quality_gate_passed)
+        self.assertFalse(failed_result.training_quality_gate_passed)
+
         plain = _format_result_table(
             [success_result, failed_result],
             color_enabled=False,
@@ -250,6 +529,7 @@ class FullPhysicsBatchTest(unittest.TestCase):
         self.assertIn("随机化 Pick / Place XY", plain)
         self.assertIn("随机化 BaseGoal / 相对目标", plain)
         self.assertIn("Pipeline 成功", plain)
+        self.assertIn("训练质量门禁", plain)
         self.assertIn("失败 State", plain)
         self.assertIn("LeRobot 数据路径", plain)
         self.assertIn("Episode 耗时", plain)
@@ -265,6 +545,7 @@ class FullPhysicsBatchTest(unittest.TestCase):
         self.assertIn("plan_place", plain)
         self.assertIn("lerobot_manifest.json", plain)
         self.assertIn("1m05s", plain)
+        self.assertIn("通过", plain)
         self.assertIn("\033[36m", colored)
         self.assertIn("\033[35m", colored)
         self.assertIn("\033[32m", colored)
@@ -436,9 +717,135 @@ class FullPhysicsBatchTest(unittest.TestCase):
             summary = _read_summary(summary_path, min_mtime=time.time())
 
         self.assertIsNone(summary)
-        self.assertIsNone(progress.state)
+        self.assertEqual(progress.state, "isaac_startup")
         self.assertIsNone(progress.step_index)
-        self.assertEqual(progress.source, "unavailable")
+        self.assertEqual(progress.source, "batch")
+
+    def test_reused_process_progress_ignores_stale_higher_episode(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            output_root = Path(tmp_dir)
+            current_dir = output_root / "episode_000000"
+            stale_dir = output_root / "episode_000002"
+            current_dir.mkdir()
+            stale_dir.mkdir()
+            run_started_at = time.time()
+            stale_frames = stale_dir / "frames.jsonl"
+            stale_frames.write_text(
+                json.dumps({"pipeline_state": "failed", "step_index": 999}) + "\n",
+                encoding="utf-8",
+            )
+            stale_mtime = run_started_at - 60.0
+            os.utime(stale_frames, (stale_mtime, stale_mtime))
+            current_events = current_dir / "events.jsonl"
+            current_events.write_text(
+                json.dumps(
+                    {
+                        "name": "state_entered",
+                        "pipeline_state": "exec_pick",
+                        "step_index": 123,
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            fresh_mtime = run_started_at + 1.0
+            os.utime(current_events, (fresh_mtime, fresh_mtime))
+            episode = BatchEpisodeCommand(
+                episode_index=0,
+                seed=5160,
+                output_dir=output_root,
+                summary_path=current_dir / "summary.json",
+                command=[],
+                num_episodes=3,
+            )
+
+            progress = _read_episode_progress(
+                episode,
+                min_mtime=run_started_at,
+            )
+
+        self.assertEqual(progress.state, "exec_pick")
+        self.assertEqual(progress.step_index, 123)
+        self.assertEqual(progress.source, "events")
+        self.assertEqual(progress.episode_index, 0)
+        self.assertEqual(progress.seed, 5160)
+
+    def test_episode_progress_uses_events_when_frames_are_incomplete(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            episode_dir = Path(tmp_dir)
+            run_started_at = time.time()
+            (episode_dir / "frames.jsonl").write_text(
+                '{"pipeline_state":"exec_nav_to_place"',
+                encoding="utf-8",
+            )
+            (episode_dir / "events.jsonl").write_text(
+                json.dumps(
+                    {
+                        "name": "state_entered",
+                        "pipeline_state": "exec_nav_to_place",
+                        "step_index": 456,
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            fresh_mtime = run_started_at + 1.0
+            os.utime(
+                episode_dir / "frames.jsonl",
+                (fresh_mtime, fresh_mtime),
+            )
+            os.utime(
+                episode_dir / "events.jsonl",
+                (fresh_mtime, fresh_mtime),
+            )
+            episode = BatchEpisodeCommand(
+                episode_index=0,
+                seed=5160,
+                output_dir=episode_dir,
+                summary_path=episode_dir / "summary.json",
+                command=[],
+            )
+
+            progress = _read_episode_progress(
+                episode,
+                min_mtime=run_started_at,
+            )
+
+        self.assertEqual(progress.state, "exec_nav_to_place")
+        self.assertEqual(progress.step_index, 456)
+        self.assertEqual(progress.source, "events")
+
+    def test_unavailable_progress_is_throttled_after_it_is_printed(self) -> None:
+        unavailable = EpisodeProgress()
+        launching = EpisodeProgress(state="launching", source="batch")
+
+        self.assertTrue(
+            _should_print_periodic_progress(
+                unavailable,
+                last_printed_progress=launching,
+                now=5.0,
+                last_low_information_progress_at=0.0,
+                progress_interval_s=5.0,
+            )
+        )
+        self.assertFalse(
+            _should_print_periodic_progress(
+                unavailable,
+                last_printed_progress=unavailable,
+                now=10.0,
+                last_low_information_progress_at=5.0,
+                progress_interval_s=5.0,
+            )
+        )
+        self.assertTrue(
+            _should_print_periodic_progress(
+                unavailable,
+                last_printed_progress=unavailable,
+                now=35.0,
+                last_low_information_progress_at=5.0,
+                progress_interval_s=5.0,
+            )
+        )
 
     def test_summary_reader_accepts_legacy_nested_episode_directory(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:

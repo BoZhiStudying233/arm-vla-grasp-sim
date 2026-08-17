@@ -2,13 +2,459 @@
 
 from __future__ import annotations
 
+import copy
 import math
+import os
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from source.interfaces import EpisodeSpec, RobotAction, SimulationState
+
+from .object_initialization import resolve_object_initialization_policy
+from .receptacle_support import (
+    inspect_task_receptacle_support_stage,
+    inspect_task_receptacle_support_usd,
+)
+from .scene_runtime import resolve_scene_runtime_settings
+
+FRONT_CAMERA_PRIM_PATH = "{ENV_REGEX_NS}/Robot/base/head_cam"
+FRONT_CAMERA_MOUNT_POS_XYZ_M = (0.28, 0.0, 0.07)
+FRONT_CAMERA_MOUNT_ROT_WXYZ = (0.5, -0.5, 0.5, -0.5)
+WRIST_CAMERA_PRIM_PATH = "{ENV_REGEX_NS}/Robot/arm_link6/arm_vla_camera"
+WRIST_CAMERA_CALIBRATION_FRAME = "arm_link6_T_camera_color_optical"
+D436_CAMERA_RESOLUTION_WH = (640, 480)
+WRIST_CAMERA_HAND_EYE_POS_XYZ_M = (
+    0.0559054476,
+    0.0026732239,
+    0.0767149320,
+)
+# 标定板弯曲时仅凭 PnP 无法可靠恢复精确外参。根据实机 wrist 图像只看到双爪、
+# 看不到夹爪根部的特征，在 camera_color_optical 坐标系沿 -Y 平移 20 mm，
+# 将近端夹爪移到画面下方。禁止再沿 optical +Z 前移：该方向会缩短相机到 TCP
+# 与抓持物体的深度，并使 30 mm near clipping 切入可乐 mesh。
+WRIST_CAMERA_VISUAL_ALIGNMENT_OFFSET_CAMERA_XYZ_M = (0.0, -0.02, 0.0)
+WRIST_CAMERA_MOUNT_POS_XYZ_M = (
+    0.0666580792,
+    0.0028071889,
+    0.0935779972,
+)
+WRIST_CAMERA_MOUNT_ROT_WXYZ = (
+    0.3377891849,
+    -0.6214992221,
+    0.6185057335,
+    -0.3421810063,
+)
+D436_CAMERA_FX_PX = 383.44608095
+D436_CAMERA_FY_PX = 383.52724198
+D436_CAMERA_CX_PX = 324.33479864
+D436_CAMERA_CY_PX = 238.90275478
+D436_CAMERA_DISTORTION_COEFFICIENTS = (0.0,) * 12
+D436_CAMERA_FALLBACK_FOCAL_LENGTH_MM = 18.0
+D436_CAMERA_FALLBACK_FX_FY_PX = 383.486661465
+D436_CAMERA_FALLBACK_CX_PX = 320.0
+D436_CAMERA_FALLBACK_CY_PX = 240.0
+# 普通 USD pinhole 仅作为 schema 不可用时的近似 fallback；精确渲染由 OpenCV schema 决定。
+D436_CAMERA_FALLBACK_HORIZONTAL_APERTURE_MM = 30.040158257372415
+D436_CAMERA_FALLBACK_VERTICAL_APERTURE_MM = 22.530118693029312
+WRIST_CAMERA_NEAR_CLIPPING_M = 0.03
+WRIST_CAMERA_TCP_OFFSET_LINK6_XYZ_M = (0.15757, 0.0, 0.0)
+
+
+def _d436_camera_intrinsics_metadata() -> dict[str, Any]:
+    """返回 front/wrist 共用的 D436 640x480 标定内参。"""
+
+    width, height = D436_CAMERA_RESOLUTION_WH
+    return {
+        "resolution_wh": [width, height],
+        "intrinsic_matrix": [
+            [D436_CAMERA_FX_PX, 0.0, D436_CAMERA_CX_PX],
+            [0.0, D436_CAMERA_FY_PX, D436_CAMERA_CY_PX],
+            [0.0, 0.0, 1.0],
+        ],
+        "intrinsics": {
+            "fx": D436_CAMERA_FX_PX,
+            "fy": D436_CAMERA_FY_PX,
+            "cx": D436_CAMERA_CX_PX,
+            "cy": D436_CAMERA_CY_PX,
+        },
+        "distortion_model": "opencv_pinhole",
+        "distortion_coefficients": list(D436_CAMERA_DISTORTION_COEFFICIENTS),
+        "renderer_schema_requested": "OmniLensDistortionOpenCvPinholeAPI",
+        "standard_usd_pinhole_fallback_intrinsics": {
+            "fx": D436_CAMERA_FALLBACK_FX_FY_PX,
+            "fy": D436_CAMERA_FALLBACK_FX_FY_PX,
+            "cx": D436_CAMERA_FALLBACK_CX_PX,
+            "cy": D436_CAMERA_FALLBACK_CY_PX,
+        },
+    }
+
+
+def _front_camera_calibration_metadata() -> dict[str, Any]:
+    """返回 front camera 的既有外参与新 D436 内参。"""
+
+    return {
+        "frame": "base_T_front_camera_color_optical",
+        "parent_link": "base",
+        "prim_path": FRONT_CAMERA_PRIM_PATH,
+        "position_xyz_m": list(FRONT_CAMERA_MOUNT_POS_XYZ_M),
+        "rotation_wxyz": list(FRONT_CAMERA_MOUNT_ROT_WXYZ),
+        "convention": "ros",
+        "extrinsics_source": "dwa_play_nav_cs",
+        **_d436_camera_intrinsics_metadata(),
+    }
+
+
+def _wrist_camera_calibration_metadata() -> dict[str, Any]:
+    """返回与 RGB 数据一同导出的 wrist camera 手眼标定参数。"""
+
+    return {
+        "frame": WRIST_CAMERA_CALIBRATION_FRAME,
+        "parent_link": "arm_link6",
+        "prim_path": WRIST_CAMERA_PRIM_PATH,
+        "position_xyz_m": list(WRIST_CAMERA_MOUNT_POS_XYZ_M),
+        "rotation_wxyz": list(WRIST_CAMERA_MOUNT_ROT_WXYZ),
+        "convention": "ros",
+        "extrinsics_source": "hand_eye_calibration_with_visual_alignment_v3",
+        "raw_hand_eye_position_xyz_m": list(WRIST_CAMERA_HAND_EYE_POS_XYZ_M),
+        "raw_hand_eye_rotation_wxyz": list(WRIST_CAMERA_MOUNT_ROT_WXYZ),
+        "visual_alignment": {
+            "method": "image_plane_vertical_reframe_with_grasp_clearance",
+            "offset_frame": "camera_color_optical",
+            "translation_xyz_m": list(
+                WRIST_CAMERA_VISUAL_ALIGNMENT_OFFSET_CAMERA_XYZ_M
+            ),
+            "rotation_rpy_rad": [0.0, 0.0, 0.0],
+            "raw_gripper_root_depth_m": 0.06710842,
+            "corrected_gripper_root_depth_m": 0.06710842,
+            "raw_tcp_depth_m": 0.12697417,
+            "corrected_tcp_depth_m": 0.12697417,
+            "near_clipping_range_m": WRIST_CAMERA_NEAR_CLIPPING_M,
+            "gripper_root_expected_clipped": False,
+            "predicted_initial_finger_top_v_px": 318.5,
+            "alignment_goal": "move_gripper_base_below_image_keep_object_depth",
+            "preserves_optical_depth": True,
+            "metric_recalibration": False,
+        },
+        **_d436_camera_intrinsics_metadata(),
+    }
+
+
+def _normalized_quaternion_wxyz(raw: Any, *, field_name: str) -> tuple[float, ...]:
+    """将 wxyz 四元数归一化，供纯 Python 相机安全检查使用。"""
+
+    try:
+        values = tuple(float(value) for value in raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field_name} 必须是 4 维数值") from exc
+    if len(values) != 4 or not all(math.isfinite(value) for value in values):
+        raise ValueError(f"{field_name} 必须是 4 维有限数值")
+    norm = math.sqrt(sum(value * value for value in values))
+    if norm <= 1.0e-12:
+        raise ValueError(f"{field_name} 不能是零四元数")
+    return tuple(value / norm for value in values)
+
+
+def _rotate_vector_wxyz(quaternion: Any, vector: Any) -> tuple[float, float, float]:
+    """使用 wxyz 四元数旋转三维向量。"""
+
+    qw, qx, qy, qz = _normalized_quaternion_wxyz(
+        quaternion,
+        field_name="quaternion_wxyz",
+    )
+    try:
+        vx, vy, vz = (float(value) for value in vector)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("vector 必须是 3 维数值") from exc
+    if not all(math.isfinite(value) for value in (vx, vy, vz)):
+        raise ValueError("vector 必须是 3 维有限数值")
+    tx = 2.0 * (qy * vz - qz * vy)
+    ty = 2.0 * (qz * vx - qx * vz)
+    tz = 2.0 * (qx * vy - qy * vx)
+    return (
+        vx + qw * tx + qy * tz - qz * ty,
+        vy + qw * ty + qz * tx - qx * tz,
+        vz + qw * tz + qx * ty - qy * tx,
+    )
+
+
+def _compute_wrist_camera_object_clearance_sample(
+    *,
+    tcp_pose_world: Any,
+    object_pose_world: Any,
+    object_radius_m: float,
+    object_half_length_m: float,
+    near_clipping_m: float,
+    minimum_surface_margin_m: float,
+    camera_position_link6_xyz_m: Any = WRIST_CAMERA_MOUNT_POS_XYZ_M,
+) -> dict[str, Any]:
+    """计算圆柱目标与 wrist 相机近裁剪面的保守间距。"""
+
+    try:
+        tcp_pose = tuple(float(value) for value in tcp_pose_world)
+        object_pose = tuple(float(value) for value in object_pose_world)
+        camera_position = tuple(float(value) for value in camera_position_link6_xyz_m)
+        radius = float(object_radius_m)
+        half_length = float(object_half_length_m)
+        near_clipping = float(near_clipping_m)
+        minimum_margin = float(minimum_surface_margin_m)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("wrist camera clearance 输入必须是数值") from exc
+    if len(tcp_pose) != 7 or len(object_pose) != 7 or len(camera_position) != 3:
+        raise ValueError("tcp/object pose 必须为 7 维，camera position 必须为 3 维")
+    if not all(
+        math.isfinite(value)
+        for value in (*tcp_pose, *object_pose, *camera_position)
+    ):
+        raise ValueError("wrist camera clearance pose 必须全部有限")
+    if radius <= 0.0 or half_length <= 0.0 or near_clipping <= 0.0:
+        raise ValueError("物体尺寸和 near clipping 必须为正数")
+    if minimum_margin < 0.0 or not all(
+        math.isfinite(value)
+        for value in (radius, half_length, near_clipping, minimum_margin)
+    ):
+        raise ValueError("minimum surface margin 必须为非负有限数")
+
+    tcp_quaternion = tcp_pose[3:7]
+    object_quaternion = object_pose[3:7]
+    tcp_offset_world = _rotate_vector_wxyz(
+        tcp_quaternion,
+        WRIST_CAMERA_TCP_OFFSET_LINK6_XYZ_M,
+    )
+    link6_position_world = tuple(
+        tcp_pose[index] - tcp_offset_world[index] for index in range(3)
+    )
+    camera_offset_world = _rotate_vector_wxyz(tcp_quaternion, camera_position)
+    camera_center_world = tuple(
+        link6_position_world[index] + camera_offset_world[index]
+        for index in range(3)
+    )
+    camera_axis_link6 = {
+        "x": _rotate_vector_wxyz(WRIST_CAMERA_MOUNT_ROT_WXYZ, (1.0, 0.0, 0.0)),
+        "y": _rotate_vector_wxyz(WRIST_CAMERA_MOUNT_ROT_WXYZ, (0.0, 1.0, 0.0)),
+        "z": _rotate_vector_wxyz(WRIST_CAMERA_MOUNT_ROT_WXYZ, (0.0, 0.0, 1.0)),
+    }
+    camera_axis_world = {
+        axis: _rotate_vector_wxyz(tcp_quaternion, vector)
+        for axis, vector in camera_axis_link6.items()
+    }
+    relative_world = tuple(
+        object_pose[index] - camera_center_world[index] for index in range(3)
+    )
+
+    def _dot(left: Any, right: Any) -> float:
+        return float(sum(float(left[index]) * float(right[index]) for index in range(3)))
+
+    center_camera = tuple(
+        _dot(relative_world, camera_axis_world[axis]) for axis in ("x", "y", "z")
+    )
+    object_axis_world = _rotate_vector_wxyz(
+        object_quaternion,
+        (0.0, 0.0, 1.0),
+    )
+    axis_alignment = min(1.0, abs(_dot(camera_axis_world["z"], object_axis_world)))
+    projected_half_depth = (
+        half_length * axis_alignment
+        + radius * math.sqrt(max(0.0, 1.0 - axis_alignment * axis_alignment))
+    )
+    center_depth = center_camera[2]
+    surface_depth = center_depth - projected_half_depth
+    far_surface_depth = center_depth + projected_half_depth
+    surface_clearance = surface_depth - near_clipping
+
+    width, height = D436_CAMERA_RESOLUTION_WH
+    bounding_sphere_radius = math.hypot(half_length, radius)
+    depth_for_fov = max(center_depth, near_clipping)
+    horizontal_limit = (
+        depth_for_fov
+        * max(D436_CAMERA_CX_PX, width - D436_CAMERA_CX_PX)
+        / D436_CAMERA_FX_PX
+        + bounding_sphere_radius
+    )
+    vertical_limit = (
+        depth_for_fov
+        * max(D436_CAMERA_CY_PX, height - D436_CAMERA_CY_PX)
+        / D436_CAMERA_FY_PX
+        + bounding_sphere_radius
+    )
+    potentially_visible = bool(
+        far_surface_depth > near_clipping
+        and abs(center_camera[0]) <= horizontal_limit
+        and abs(center_camera[1]) <= vertical_limit
+    )
+    verified = bool(not potentially_visible or surface_clearance >= minimum_margin)
+    return {
+        "shape": "cylinder_local_z",
+        "camera_center_world_xyz_m": list(camera_center_world),
+        "object_center_camera_xyz_m": list(center_camera),
+        "object_axis_camera_z_abs_dot": axis_alignment,
+        "projected_half_depth_m": projected_half_depth,
+        "surface_depth_m": surface_depth,
+        "far_surface_depth_m": far_surface_depth,
+        "near_clipping_m": near_clipping,
+        "minimum_surface_margin_m": minimum_margin,
+        "surface_clearance_m": surface_clearance,
+        "potentially_visible": potentially_visible,
+        "near_plane_intersection": bool(
+            potentially_visible
+            and surface_depth < near_clipping < far_surface_depth
+        ),
+        "verified": verified,
+    }
+
+
+def _validate_d436_camera_calibration_resolution(
+    camera_name: str,
+    width: int,
+    height: int,
+) -> None:
+    """拒绝把 640x480 标定参数静默用于其他渲染分辨率。"""
+
+    expected_width, expected_height = D436_CAMERA_RESOLUTION_WH
+    if (int(width), int(height)) != (expected_width, expected_height):
+        raise ValueError(
+            f"{camera_name} camera 的 D436 标定内参仅适用于 "
+            f"{expected_width}x{expected_height}，当前请求为 {width}x{height}"
+        )
+
+
+def _apply_d436_camera_opencv_pinhole_schema(prim: Any) -> bool:
+    """在 USD Camera 上写入 Isaac Sim 5.1 支持的完整 OpenCV 内参。"""
+
+    from pxr import Gf
+
+    try:
+        schema_applied = prim.ApplyAPI("OmniLensDistortionOpenCvPinholeAPI")
+    except Exception:
+        # IsaacLab 的精简 headless experience 可能未加载 lens-distortion schema。
+        # 标准 USD pinhole fallback 已按平均焦距配置，不能因此阻塞 pipeline。
+        return False
+    if not schema_applied:
+        return False
+    attributes: tuple[tuple[str, Any], ...] = (
+        ("omni:lensdistortion:model", "opencvPinhole"),
+        (
+            "omni:lensdistortion:opencvPinhole:imageSize",
+            Gf.Vec2i(*D436_CAMERA_RESOLUTION_WH),
+        ),
+        ("omni:lensdistortion:opencvPinhole:fx", D436_CAMERA_FX_PX),
+        ("omni:lensdistortion:opencvPinhole:fy", D436_CAMERA_FY_PX),
+        ("omni:lensdistortion:opencvPinhole:cx", D436_CAMERA_CX_PX),
+        ("omni:lensdistortion:opencvPinhole:cy", D436_CAMERA_CY_PX),
+    )
+    coefficient_names = (
+        "k1",
+        "k2",
+        "p1",
+        "p2",
+        "k3",
+        "k4",
+        "k5",
+        "k6",
+        "s1",
+        "s2",
+        "s3",
+        "s4",
+    )
+    attributes += tuple(
+        (f"omni:lensdistortion:opencvPinhole:{name}", value)
+        for name, value in zip(
+            coefficient_names,
+            D436_CAMERA_DISTORTION_COEFFICIENTS,
+        )
+    )
+    for attribute_name, value in attributes:
+        attribute = prim.GetAttribute(attribute_name)
+        if not attribute.IsValid() or not attribute.Set(value):
+            return False
+    return True
+
+
+def _enable_d436_lens_distortion_schema() -> dict[str, Any]:
+    """显式启用 Isaac Sim camera schema；失败时由标准 USD pinhole 安全回退。"""
+
+    extension_name = "omni.usd.schema.omni_lens_distortion"
+    try:
+        import omni.kit.app
+
+        manager = omni.kit.app.get_app().get_extension_manager()
+        enabled_before = bool(manager.is_extension_enabled(extension_name))
+        if not enabled_before:
+            manager.set_extension_enabled_immediate(extension_name, True)
+        enabled_after = bool(manager.is_extension_enabled(extension_name))
+    except Exception as exc:
+        return {
+            "requested": True,
+            "extension": extension_name,
+            "enabled": False,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+    return {
+        "requested": True,
+        "extension": extension_name,
+        "enabled_before": enabled_before,
+        "enabled": enabled_after,
+    }
+
+
+def _make_d436_camera_spawn_function() -> Any:
+    """构造先写入标定 schema、再克隆到各环境的 Camera spawner。"""
+
+    from isaaclab.sim.spawners.sensors.sensors import spawn_camera
+    from isaaclab.sim.utils import clone
+
+    @clone
+    def _spawn_calibrated_d436_camera(
+        prim_path: str,
+        cfg: Any,
+        translation: tuple[float, float, float] | None = None,
+        orientation: tuple[float, float, float, float] | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        # 调用未包装实现，确保标定 schema 在 clone 复制 source prim 前写入。
+        prim = spawn_camera.__wrapped__(
+            prim_path,
+            cfg,
+            translation=translation,
+            orientation=orientation,
+            **kwargs,
+        )
+        _apply_d436_camera_opencv_pinhole_schema(prim)
+        return prim
+
+    return _spawn_calibrated_d436_camera
+
+
+def _overwrite_d436_intrinsic_matrices(matrices: Any) -> int:
+    """把 IsaacLab 的居中近似 K 改为渲染器实际使用的标定 K。"""
+
+    shape = tuple(int(value) for value in getattr(matrices, "shape", ()))
+    if len(shape) < 2 or shape[-2:] != (3, 3):
+        raise ValueError(f"camera intrinsic matrix shape 非法：{shape}")
+    matrices[..., :, :] = 0.0
+    matrices[..., 0, 0] = D436_CAMERA_FX_PX
+    matrices[..., 0, 2] = D436_CAMERA_CX_PX
+    matrices[..., 1, 1] = D436_CAMERA_FY_PX
+    matrices[..., 1, 2] = D436_CAMERA_CY_PX
+    matrices[..., 2, 2] = 1.0
+    return math.prod(shape[:-2]) if len(shape) > 2 else 1
+
+
+def _overwrite_d436_fallback_intrinsic_matrices(matrices: Any) -> int:
+    """写入标准 USD pinhole 在当前分辨率下实际使用的中心主点近似 K。"""
+
+    shape = tuple(int(value) for value in getattr(matrices, "shape", ()))
+    if len(shape) < 2 or shape[-2:] != (3, 3):
+        raise ValueError(f"camera intrinsic matrix shape 非法：{shape}")
+    matrices[..., :, :] = 0.0
+    matrices[..., 0, 0] = D436_CAMERA_FALLBACK_FX_FY_PX
+    matrices[..., 0, 2] = D436_CAMERA_FALLBACK_CX_PX
+    matrices[..., 1, 1] = D436_CAMERA_FALLBACK_FX_FY_PX
+    matrices[..., 1, 2] = D436_CAMERA_FALLBACK_CY_PX
+    matrices[..., 2, 2] = 1.0
+    return math.prod(shape[:-2]) if len(shape) > 2 else 1
 
 
 @dataclass(frozen=True)
@@ -19,24 +465,58 @@ class IsaacLabNavigationRuntimeConfig:
     agent_entry_point: str = "rsl_rl_cfg_entry_point"
     checkpoint: Path | None = None
     device: str = "cuda:0"
+    standing_command_threshold: float = 0.0
+    policy_action_warmup_steps: int = 0
     terrain_prim_path: str = "/World/scene_collision"
+    collision_floor_proxy_profile: str | None = None
     visual_prim_path: str = "/World/gauss"
-    viewport_camera_prim_path: str = "/World/Camera1"
+    enable_scene_visual: bool = False
+    viewport_camera_prim_path: str = "/World/overview"
+    auto_manage_viewport_camera: bool = True
     hide_navigation_collision_visual: bool = True
+    scene_light_mode: str = "camera"
+    camera_light_intensity: float = 3500.0
+    camera_light_radius: float = 2.0
+    camera_light_name: str = "camera_light"
+    # 场景可覆盖 IsaacLab RenderCfg；NuRec 在 Isaac Sim 5.1 中不能使用默认 DLSS。
+    render_antialiasing_mode: str | None = None
     # 数据相机严格对齐 DWA：Go2 头部前视、480x640 RGB、每个控制步更新。
     enable_front_camera: bool = False
     front_camera_height: int = 480
     front_camera_width: int = 640
-    # 末端相机外参与 DWA ground-pick 环境保持一致；输出分辨率由 recorder 配置统一。
+    # 末端相机使用 arm_link6_T_camera_color_optical 手眼标定，只支持 640x480。
     enable_wrist_camera: bool = False
     wrist_camera_height: int = 480
     wrist_camera_width: int = 640
+    # 绑定场景中已标定的 overview Camera，不生成或改写相机位姿。
+    enable_overview_camera: bool = False
+    overview_camera_prim_path: str = "/World/overview"
+    overview_camera_height: int = 480
+    overview_camera_width: int = 640
+    # Headless dataset collection can render on the dataset sampling grid.
+    # GUI and composite video keep this at one control step.
+    camera_render_interval_control_steps: int = 1
+    # Multi-episode stage reuse requires randomized support colliders to expose a
+    # live PhysX pose.  They remain immovable kinematic bodies during an episode.
+    enable_relocatable_episode_supports: bool = False
     patch_gripper_collision: bool = True
     gripper_collision_robot_root: str = "/World/go2_x5"
     gripper_collision_links: tuple[str, str] = ("arm_link7", "arm_link8")
     gripper_collision_approximation: str = "convexDecomposition"
     gripper_collision_contact_offset: float = 0.002
     gripper_collision_rest_offset: float = 0.0
+    # Rubber-pad contact model used after locomotion-domain material
+    # randomization.  Keeping this deterministic prevents the grasp quality
+    # from changing with the navigation seed while retaining a finite drive
+    # force on the single actuated finger coordinate.
+    gripper_contact_static_friction: float = 2.0
+    gripper_contact_dynamic_friction: float = 1.5
+    gripper_contact_restitution: float = 0.0
+    enable_verified_grasp_fixed_joint: bool = True
+    grasp_fixed_joint_prim_path: str = (
+        "/World/pct_runtime/verified_grasp_fixed_joint"
+    )
+    grasp_fixed_joint_parent_body: str = "arm_link6"
     patch_apple_collision: bool = True
     apple_collision_root_path: str = "/World"
     apple_collision_keywords: tuple[str, ...] = ("apple", "Apple")
@@ -58,6 +538,7 @@ class IsaacLabNavigationRuntimeConfig:
     gripper_joint_names: tuple[str, str] = ("arm_joint7", "arm_joint8")
     gripper_open_position: float = 0.04
     gripper_close_position: float = 0.0
+    gripper_symmetry_tolerance_m: float = 0.0005
     place_release_clearance_min_m: float = 0.013
     place_pre_clearance_min_m: float = 0.06
     # 这是 cuRobo 规划用的虚拟障碍膨胀，不改变 Isaac 真实物理碰撞体。
@@ -72,10 +553,169 @@ class IsaacLabNavigationRuntimeConfig:
     world_collision_clip_large_support_obstacles: bool = False
     world_collision_large_obstacle_clip_half_extent_m: float = 0.45
     show_randomization_debug: bool = False
+    show_velocity_command_debug: bool = False
+
+
+def _inspect_gripper_physics_control(stage: Any) -> dict[str, Any]:
+    """Verify one master drive and one correctly configured hard mimic follower."""
+
+    expected_names = ("arm_joint7", "arm_joint8")
+    joints: dict[str, list[dict[str, Any]]] = {name: [] for name in expected_names}
+    if stage is None:
+        return {
+            "available": False,
+            "verified": False,
+            "reason": "usd_stage_unavailable",
+            "physical_control_mode": "single_master_hard_physx_mimic",
+            "joints": joints,
+        }
+    for prim in stage.Traverse():
+        name = str(prim.GetName())
+        if name not in joints:
+            continue
+        schemas = tuple(str(schema) for schema in prim.GetAppliedSchemas())
+        has_linear_drive = "PhysicsDriveAPI:linear" in schemas
+        has_mimic = any(
+            schema.startswith("PhysxMimicJointAPI:") for schema in schemas
+        )
+        mimic_entries = []
+        for schema in schemas:
+            if not schema.startswith("PhysxMimicJointAPI:"):
+                continue
+            instance_name = schema.split(":", 1)[1]
+            prefix = f"physxMimicJoint:{instance_name}:"
+            relationship = prim.GetRelationship(prefix + "referenceJoint")
+            targets = (
+                tuple(str(path) for path in relationship.GetTargets())
+                if relationship
+                else ()
+            )
+
+            def _attribute_value(suffix: str) -> Any:
+                attribute = prim.GetAttribute(prefix + suffix)
+                return attribute.Get() if attribute else None
+
+            mimic_entries.append(
+                {
+                    "instance_name": instance_name,
+                    "reference_joint_targets": targets,
+                    "gearing": _attribute_value("gearing"),
+                    "offset": _attribute_value("offset"),
+                    "natural_frequency": _attribute_value("naturalFrequency"),
+                    "damping_ratio": _attribute_value("dampingRatio"),
+                }
+            )
+        joints[name].append(
+            {
+                "prim_path": str(prim.GetPath()),
+                "applied_schemas": schemas,
+                "has_linear_drive": has_linear_drive,
+                "has_mimic": has_mimic,
+                "mimic_entries": mimic_entries,
+            }
+        )
+    counts = {name: len(entries) for name, entries in joints.items()}
+    master_entries = joints[expected_names[0]]
+    follower_entries = joints[expected_names[1]]
+    mimic_entries = [
+        mimic
+        for entry in follower_entries
+        for mimic in entry["mimic_entries"]
+    ]
+    mimic = mimic_entries[0] if len(mimic_entries) == 1 else None
+    reference_targets = tuple(mimic["reference_joint_targets"]) if mimic else ()
+    reference_is_master = (
+        len(reference_targets) == 1
+        and reference_targets[0].split("/")[-1] == expected_names[0]
+    )
+
+    def _matches(value: Any, expected: float, tolerance: float) -> bool:
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            return False
+        return math.isfinite(numeric) and abs(numeric - expected) <= tolerance
+
+    verified = (
+        bool(
+            len(master_entries) == 1
+            and len(follower_entries) == 1
+            and master_entries[0]["has_linear_drive"]
+            and not master_entries[0]["has_mimic"]
+            and not follower_entries[0]["has_linear_drive"]
+            and len(mimic_entries) == 1
+            and reference_is_master
+            and _matches(mimic["gearing"], -1.0, 1.0e-6)
+            and _matches(mimic["offset"], 0.0, 1.0e-9)
+            and _matches(mimic["natural_frequency"], 0.0, 1.0e-9)
+            and _matches(mimic["damping_ratio"], 0.0, 1.0e-9)
+        )
+        if mimic is not None
+        else False
+    )
+    return {
+        "available": all(counts.values()),
+        "verified": verified,
+        "physical_control_mode": "single_master_hard_physx_mimic",
+        "master_joint_name": expected_names[0],
+        "follower_joint_name": expected_names[1],
+        "reference_is_master": reference_is_master,
+        "joint_prim_counts": counts,
+        "joints": joints,
+    }
+
+
+def _disable_unrequested_camera_sensors(
+    scene_cfg: Any,
+    *,
+    front: bool,
+    wrist: bool,
+    overview: bool,
+) -> dict[str, Any]:
+    """从 env cfg 移除未请求的相机，允许真正的无渲染 headless 运行。"""
+
+    requested = {
+        "head_camera": bool(front),
+        "arm_camera": bool(wrist),
+        "overview_camera": bool(overview),
+    }
+    disabled: list[str] = []
+    retained: list[str] = []
+    for name, enabled in requested.items():
+        if not hasattr(scene_cfg, name):
+            continue
+        if enabled:
+            retained.append(name)
+            continue
+        if getattr(scene_cfg, name) is not None:
+            setattr(scene_cfg, name, None)
+            disabled.append(name)
+    return {
+        "requested": requested,
+        "disabled_sensors": disabled,
+        "retained_sensors": retained,
+        "rendering_required": any(requested.values()),
+    }
 
 
 def _item(value: Any) -> float:
     return float(value.item() if hasattr(value, "item") else value)
+
+
+def _coerce_xyzyaw(value: Any) -> tuple[float, float, float, float] | None:
+    """把 action metadata 中的 root lock 目标解析为 xyzyaw 四元组。"""
+
+    if not isinstance(value, (list, tuple)) or len(value) != 4:
+        return None
+    try:
+        return (
+            float(value[0]),
+            float(value[1]),
+            float(value[2]),
+            float(value[3]),
+        )
+    except (TypeError, ValueError):
+        return None
 
 
 def _quat_to_yaw(quat_wxyz: Any) -> float:
@@ -103,6 +743,202 @@ def _quat_angle_error_rad(left: tuple[float, ...], right: tuple[float, ...]) -> 
     return 2.0 * math.acos(dot)
 
 
+def _quat_normalize_wxyz(
+    quat: tuple[float, float, float, float],
+) -> tuple[float, float, float, float]:
+    """归一化标量在前的四元数，拒绝无效零范数输入。"""
+
+    norm = math.sqrt(sum(float(value) ** 2 for value in quat))
+    if norm <= 1.0e-12:
+        raise ValueError("四元数范数必须大于零。")
+    return tuple(float(value) / norm for value in quat)  # type: ignore[return-value]
+
+
+def _quat_multiply_wxyz(
+    left: tuple[float, float, float, float],
+    right: tuple[float, float, float, float],
+) -> tuple[float, float, float, float]:
+    """计算标量在前四元数的 Hamilton 乘积。"""
+
+    lw, lx, ly, lz = left
+    rw, rx, ry, rz = right
+    return (
+        lw * rw - lx * rx - ly * ry - lz * rz,
+        lw * rx + lx * rw + ly * rz - lz * ry,
+        lw * ry - lx * rz + ly * rw + lz * rx,
+        lw * rz + lx * ry - ly * rx + lz * rw,
+    )
+
+
+def _quat_conjugate_wxyz(
+    quat: tuple[float, float, float, float],
+) -> tuple[float, float, float, float]:
+    """返回单位四元数的共轭。"""
+
+    return (quat[0], -quat[1], -quat[2], -quat[3])
+
+
+def _quat_rotate_vector_wxyz(
+    quat: tuple[float, float, float, float],
+    vector: tuple[float, float, float],
+) -> tuple[float, float, float]:
+    """用标量在前四元数旋转三维向量。"""
+
+    normalized = _quat_normalize_wxyz(quat)
+    vector_quat = (0.0, float(vector[0]), float(vector[1]), float(vector[2]))
+    rotated = _quat_multiply_wxyz(
+        _quat_multiply_wxyz(normalized, vector_quat),
+        _quat_conjugate_wxyz(normalized),
+    )
+    return (rotated[1], rotated[2], rotated[3])
+
+
+def _transform_authored_aabb_to_live_rigid_pose(
+    *,
+    authored_bbox_min: Any,
+    authored_bbox_max: Any,
+    authored_rigid_position: Any,
+    authored_rigid_quaternion_wxyz: Any,
+    live_rigid_position: Any,
+    live_rigid_quaternion_wxyz: Any,
+) -> dict[str, Any]:
+    """把 authored world AABB 先还原到刚体局部系，再映射到 live PhysX pose。
+
+    这样不会假设刚体原点恰好等于 Mesh bbox 中心。输入 AABB 是保守包围盒；
+    物体旋转后输出仍是该包围盒刚性变换后的 world AABB。
+    """
+
+    import itertools
+    import numpy as np
+
+    def _vector(value: Any, *, field_name: str, length: int) -> np.ndarray:
+        vector = np.asarray(value, dtype=float)
+        if vector.shape != (length,) or not bool(np.all(np.isfinite(vector))):
+            raise RuntimeError(f"{field_name} 必须是 {length} 个有限数值")
+        return vector
+
+    bbox_min = _vector(authored_bbox_min, field_name="authored_bbox_min", length=3)
+    bbox_max = _vector(authored_bbox_max, field_name="authored_bbox_max", length=3)
+    if bool(np.any(bbox_max <= bbox_min)):
+        raise RuntimeError("authored object bbox 必须具有正尺寸")
+    authored_position = _vector(
+        authored_rigid_position,
+        field_name="authored_rigid_position",
+        length=3,
+    )
+    live_position = _vector(
+        live_rigid_position,
+        field_name="live_rigid_position",
+        length=3,
+    )
+    authored_quaternion = tuple(
+        _vector(
+            authored_rigid_quaternion_wxyz,
+            field_name="authored_rigid_quaternion_wxyz",
+            length=4,
+        ).tolist()
+    )
+    live_quaternion = tuple(
+        _vector(
+            live_rigid_quaternion_wxyz,
+            field_name="live_rigid_quaternion_wxyz",
+            length=4,
+        ).tolist()
+    )
+    authored_quaternion = _quat_normalize_wxyz(authored_quaternion)  # type: ignore[arg-type]
+    live_quaternion = _quat_normalize_wxyz(live_quaternion)  # type: ignore[arg-type]
+    world_to_authored_rigid = _quat_conjugate_wxyz(authored_quaternion)
+
+    authored_corners = [
+        np.asarray(corner, dtype=float)
+        for corner in itertools.product(
+            (bbox_min[0], bbox_max[0]),
+            (bbox_min[1], bbox_max[1]),
+            (bbox_min[2], bbox_max[2]),
+        )
+    ]
+    rigid_local_corners = [
+        np.asarray(
+            _quat_rotate_vector_wxyz(
+                world_to_authored_rigid,
+                tuple((corner - authored_position).tolist()),
+            ),
+            dtype=float,
+        )
+        for corner in authored_corners
+    ]
+    live_world_corners = np.stack(
+        [
+            live_position
+            + np.asarray(
+                _quat_rotate_vector_wxyz(
+                    live_quaternion,
+                    tuple(local_corner.tolist()),
+                ),
+                dtype=float,
+            )
+            for local_corner in rigid_local_corners
+        ],
+        axis=0,
+    )
+    live_bbox_min = np.min(live_world_corners, axis=0)
+    live_bbox_max = np.max(live_world_corners, axis=0)
+    live_bbox_center = 0.5 * (live_bbox_min + live_bbox_max)
+    authored_bbox_center = 0.5 * (bbox_min + bbox_max)
+    center_offset_rigid = np.asarray(
+        _quat_rotate_vector_wxyz(
+            world_to_authored_rigid,
+            tuple((authored_bbox_center - authored_position).tolist()),
+        ),
+        dtype=float,
+    )
+    expected_live_center = live_position + np.asarray(
+        _quat_rotate_vector_wxyz(
+            live_quaternion,
+            tuple(center_offset_rigid.tolist()),
+        ),
+        dtype=float,
+    )
+    if not bool(np.allclose(live_bbox_center, expected_live_center, atol=1.0e-9)):
+        raise RuntimeError("live bbox center 与刚体局部中心偏移变换不一致")
+    # authored world AABB 是当前资产已审计的保守 OBB。把它的三个 world 轴经
+    # authored-rigid -> live-rigid 旋转，恢复 live PhysX 下的主轴方向。
+    live_oriented_axes_world = []
+    for authored_world_axis in np.eye(3, dtype=float):
+        rigid_local_axis = _quat_rotate_vector_wxyz(
+            world_to_authored_rigid,
+            tuple(authored_world_axis.tolist()),
+        )
+        live_oriented_axes_world.append(
+            list(
+                _quat_rotate_vector_wxyz(
+                    live_quaternion,
+                    rigid_local_axis,
+                )
+            )
+        )
+    authored_bbox_size = bbox_max - bbox_min
+    long_axis_index = int(np.argmax(authored_bbox_size))
+    return {
+        "min_xyz": live_bbox_min.tolist(),
+        "max_xyz": live_bbox_max.tolist(),
+        "center_xyz": live_bbox_center.tolist(),
+        "size_xyz": (live_bbox_max - live_bbox_min).tolist(),
+        "authored_bbox_center_xyz": authored_bbox_center.tolist(),
+        "authored_rigid_position_xyz": authored_position.tolist(),
+        "authored_rigid_quaternion_wxyz": list(authored_quaternion),
+        "bbox_center_offset_rigid_xyz": center_offset_rigid.tolist(),
+        "live_rigid_position_xyz": live_position.tolist(),
+        "live_rigid_quaternion_wxyz": list(live_quaternion),
+        "authored_bbox_size_xyz": authored_bbox_size.tolist(),
+        "live_oriented_bbox_axes_world": live_oriented_axes_world,
+        "long_axis_index": long_axis_index,
+        "long_axis_world_xyz": live_oriented_axes_world[long_axis_index],
+        "long_axis_length_m": float(authored_bbox_size[long_axis_index]),
+        "transform_mode": "authored_world_aabb_via_live_rigid_pose",
+    }
+
+
 def _as_tuple(values: Any) -> tuple[float, ...]:
     if values is None:
         return ()
@@ -111,6 +947,64 @@ def _as_tuple(values: Any) -> tuple[float, ...]:
     if hasattr(values, "tolist"):
         values = values.tolist()
     return tuple(float(value) for value in values)
+
+
+def _sensor_vector_tuple(values: Any, *, length: int) -> tuple[float, ...]:
+    """Read a single-env IsaacLab sensor vector as a flat float tuple."""
+
+    if values is None:
+        return ()
+    if hasattr(values, "detach"):
+        values = values.detach().cpu()
+    if hasattr(values, "tolist"):
+        values = values.tolist()
+    while (
+        isinstance(values, (list, tuple))
+        and len(values) == 1
+        and isinstance(values[0], (list, tuple))
+    ):
+        values = values[0]
+    if not isinstance(values, (list, tuple)) or len(values) < length:
+        return ()
+    try:
+        vector = tuple(float(value) for value in values[:length])
+    except (TypeError, ValueError):
+        return ()
+    if not all(math.isfinite(value) for value in vector):
+        return ()
+    return vector
+
+
+def _read_camera_sensor_pose(sensor: Any, *, camera_key: str, sensor_name: str) -> dict[str, Any] | None:
+    """Return the camera optical-frame world pose when IsaacLab exposes it."""
+
+    data = getattr(sensor, "data", None)
+    if data is None:
+        return None
+    position = _sensor_vector_tuple(getattr(data, "pos_w", None), length=3)
+    if len(position) != 3:
+        return None
+    quaternion_source = ""
+    quaternion: tuple[float, ...] = ()
+    for attr_name in ("quat_w_ros", "quat_w_world", "quat_w_opengl", "quat_w"):
+        quaternion = _sensor_vector_tuple(getattr(data, attr_name, None), length=4)
+        if len(quaternion) == 4:
+            quaternion_source = attr_name
+            break
+    if len(quaternion) != 4:
+        return None
+    norm = math.sqrt(sum(value * value for value in quaternion))
+    if norm <= 1.0e-12:
+        return None
+    quaternion = tuple(value / norm for value in quaternion)
+    return {
+        "camera_key": camera_key,
+        "sensor_name": sensor_name,
+        "frame": "world",
+        "position_xyz": list(position),
+        "quaternion_wxyz": list(quaternion),
+        "quaternion_source": quaternion_source,
+    }
 
 
 def _get_or_add_xform_op(xformable: Any, op_type: Any) -> Any:
@@ -251,6 +1145,330 @@ def _distance_point_to_aabb_xy(point_xy: Any, bbox_min: Any, bbox_max: Any) -> f
     return float(np.linalg.norm(delta))
 
 
+def _derive_mesh_truth_place_pose(
+    *,
+    raw_place: dict[str, Any],
+    receptacle_support_report: dict[str, Any] | None,
+    pick_object_bbox: dict[str, Any] | None,
+) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    """由运行时支撑 Mesh 与抓取前物体 bbox 推导最终物体中心。
+
+    ``place_pose_world`` 仍作为 Phase-0 人工标注的一致性基准，但启用该模式后
+    不再直接作为运行时 XYZ 来源。任何支撑几何、物体尺寸或标注点漂移都会显式
+    失败，避免 CuRobo 静默使用过期目标。
+    """
+
+    mesh_config = raw_place.get("mesh_truth_target")
+    if mesh_config is None:
+        return None
+    if not isinstance(mesh_config, dict):
+        raise RuntimeError("task.place.mesh_truth_target 必须是对象")
+    if not bool(mesh_config.get("enabled", False)):
+        return None
+
+    expected_sources = {
+        "target_xy_source": "runtime_placement_region_center",
+        "support_surface_source": "runtime_target_support_bbox_top",
+        "object_support_extent_source": (
+            "pick_live_object_bbox_center_to_min_z"
+        ),
+    }
+    for field_name, expected_value in expected_sources.items():
+        if mesh_config.get(field_name) != expected_value:
+            raise RuntimeError(
+                "task.place.mesh_truth_target source contract mismatch: "
+                f"{field_name}={mesh_config.get(field_name)!r}, "
+                f"expected={expected_value!r}"
+            )
+    if mesh_config.get("visual_localization_required") is not False:
+        raise RuntimeError(
+            "Mesh-truth place target 必须显式配置 visual_localization_required=false"
+        )
+
+    if not isinstance(receptacle_support_report, dict):
+        raise RuntimeError("Mesh-truth place target 缺少运行时 receptacle support 报告")
+    if receptacle_support_report.get("configured") is not True:
+        raise RuntimeError("Mesh-truth place target 的 receptacle support 未配置")
+    if receptacle_support_report.get("geometry_verified") is not True:
+        raise RuntimeError("Mesh-truth place target 的运行时 support geometry 未验证")
+    region_report = receptacle_support_report.get("placement_region_report")
+    if not isinstance(region_report, dict) or region_report.get("verified") is not True:
+        raise RuntimeError("Mesh-truth place target 的 placement region 未验证")
+
+    placement_region = receptacle_support_report.get("placement_region")
+    if not isinstance(placement_region, dict):
+        raise RuntimeError("运行时 support 报告缺少 placement_region")
+    if placement_region.get("frame") != "world":
+        raise RuntimeError("Mesh-truth placement_region.frame 必须是 world")
+
+    def _finite_float(value: Any, *, field_name: str) -> float:
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(f"{field_name} 必须是有限数值") from exc
+        if not math.isfinite(parsed):
+            raise RuntimeError(f"{field_name} 必须是有限数值")
+        return parsed
+
+    def _finite_xyz(value: Any, *, field_name: str) -> tuple[float, float, float]:
+        if not isinstance(value, (list, tuple)) or len(value) != 3:
+            raise RuntimeError(f"{field_name} 必须包含三个有限数值")
+        return tuple(
+            _finite_float(item, field_name=f"{field_name}[{index}]")
+            for index, item in enumerate(value)
+        )
+
+    x_min = _finite_float(placement_region.get("x_min"), field_name="placement_region.x_min")
+    x_max = _finite_float(placement_region.get("x_max"), field_name="placement_region.x_max")
+    y_min = _finite_float(placement_region.get("y_min"), field_name="placement_region.y_min")
+    y_max = _finite_float(placement_region.get("y_max"), field_name="placement_region.y_max")
+    region_surface_z = _finite_float(
+        placement_region.get("z_surface"),
+        field_name="placement_region.z_surface",
+    )
+    if not x_min < x_max or not y_min < y_max:
+        raise RuntimeError("Mesh-truth placement region 边界顺序无效")
+
+    support_bbox_min = _finite_xyz(
+        receptacle_support_report.get("world_bbox_min_xyz"),
+        field_name="support_report.world_bbox_min_xyz",
+    )
+    support_bbox_max = _finite_xyz(
+        receptacle_support_report.get("world_bbox_max_xyz"),
+        field_name="support_report.world_bbox_max_xyz",
+    )
+    support_surface_z = _finite_float(
+        receptacle_support_report.get("support_surface_z"),
+        field_name="support_report.support_surface_z",
+    )
+    geometry_tolerance_m = _finite_float(
+        mesh_config.get("configured_pose_consistency_tolerance_m", 1.0e-6),
+        field_name=(
+            "task.place.mesh_truth_target."
+            "configured_pose_consistency_tolerance_m"
+        ),
+    )
+    if geometry_tolerance_m < 0.0:
+        raise RuntimeError("Mesh-truth geometry tolerance 不能为负数")
+    if abs(support_surface_z - support_bbox_max[2]) > geometry_tolerance_m:
+        raise RuntimeError("运行时 support_surface_z 与 support bbox 顶面不一致")
+    if abs(region_surface_z - support_surface_z) > geometry_tolerance_m:
+        raise RuntimeError("运行时 placement region 与 support bbox 顶面不一致")
+
+    if not isinstance(pick_object_bbox, dict):
+        raise RuntimeError("Mesh-truth place target 缺少抓取前实时物体 bbox")
+    if pick_object_bbox.get("center_source") != "live_physx_object_pose":
+        raise RuntimeError(
+            "Mesh-truth place target 要求抓取前 bbox center 来自 live PhysX pose"
+        )
+    pick_bbox_min = _finite_xyz(
+        pick_object_bbox.get("min_xyz"),
+        field_name="pick_object_bbox.min_xyz",
+    )
+    pick_bbox_max = _finite_xyz(
+        pick_object_bbox.get("max_xyz"),
+        field_name="pick_object_bbox.max_xyz",
+    )
+    pick_bbox_center = _finite_xyz(
+        pick_object_bbox.get("center_xyz"),
+        field_name="pick_object_bbox.center_xyz",
+    )
+    object_bbox_center_to_min_z_m = pick_bbox_center[2] - pick_bbox_min[2]
+    if object_bbox_center_to_min_z_m <= 0.0:
+        raise RuntimeError("抓取前物体 bbox 的 center-to-min-z 必须为正数")
+    expected_extent_field = "expected_object_bbox_center_to_min_z_m"
+    if expected_extent_field in mesh_config:
+        expected_extent_raw = mesh_config.get(expected_extent_field)
+    else:
+        # 兼容早期任务配置；新任务应使用准确表达 bbox 几何的字段名。
+        expected_extent_field = "expected_object_center_to_support_m"
+        expected_extent_raw = mesh_config.get(expected_extent_field)
+    expected_extent_m = _finite_float(
+        expected_extent_raw,
+        field_name=f"task.place.mesh_truth_target.{expected_extent_field}",
+    )
+    extent_tolerance_m = _finite_float(
+        mesh_config.get("object_extent_tolerance_m"),
+        field_name="task.place.mesh_truth_target.object_extent_tolerance_m",
+    )
+    if extent_tolerance_m < 0.0:
+        raise RuntimeError("Mesh-truth object extent tolerance 不能为负数")
+    extent_error_m = abs(object_bbox_center_to_min_z_m - expected_extent_m)
+    if extent_error_m > extent_tolerance_m:
+        raise RuntimeError(
+            "抓取前物体 Mesh extent 与任务标定不一致: "
+            f"error_m={extent_error_m}, tolerance_m={extent_tolerance_m}"
+        )
+
+    configured_pose = raw_place.get("place_pose_world")
+    if not isinstance(configured_pose, dict):
+        raise RuntimeError("Mesh-truth place target 要求 place_pose_world 作为审计基准")
+    configured_xyz = tuple(
+        _finite_float(configured_pose.get(axis), field_name=f"place_pose_world.{axis}")
+        for axis in ("x", "y", "z")
+    )
+    calibrated_xyz = (
+        0.5 * (x_min + x_max),
+        0.5 * (y_min + y_max),
+        support_surface_z + expected_extent_m,
+    )
+    configured_pose_errors_m = {
+        axis: abs(calibrated_xyz[index] - configured_xyz[index])
+        for index, axis in enumerate(("x", "y", "z"))
+    }
+    configured_pose_max_abs_error_m = max(configured_pose_errors_m.values())
+    if configured_pose_max_abs_error_m > geometry_tolerance_m:
+        raise RuntimeError(
+            "Mesh-derived place pose 与 configured place pose drifted: "
+            f"max_abs_error_m={configured_pose_max_abs_error_m}, "
+            f"tolerance_m={geometry_tolerance_m}"
+        )
+
+    # 运行目标使用本 episode 抓取前的 live bbox；静态标注只与离线标定半高比较。
+    # 因此 PhysX settle 引起、且仍在 object_extent_tolerance_m 内的微小变化不会被
+    # 更严格的静态标注漂移门禁误拒绝。
+    derived_xyz = (
+        calibrated_xyz[0],
+        calibrated_xyz[1],
+        support_surface_z + object_bbox_center_to_min_z_m,
+    )
+    runtime_to_configured_errors_m = {
+        axis: abs(derived_xyz[index] - configured_xyz[index])
+        for index, axis in enumerate(("x", "y", "z"))
+    }
+
+    payload = dict(configured_pose)
+    payload.update(
+        {
+            "x": derived_xyz[0],
+            "y": derived_xyz[1],
+            "z": derived_xyz[2],
+        }
+    )
+    report = {
+        "configured": True,
+        "enabled": True,
+        "verified": True,
+        "visual_localization_required": False,
+        "visual_localization_used": False,
+        **expected_sources,
+        "target_receptacle_prim_path": receptacle_support_report.get(
+            "target_receptacle_prim_path"
+        ),
+        "target_support_prim_path": receptacle_support_report.get(
+            "target_support_prim_path"
+        ),
+        "support_report_source": receptacle_support_report.get("source"),
+        "support_geometry_verified": True,
+        "support_bbox_world": {
+            "min_xyz": list(support_bbox_min),
+            "max_xyz": list(support_bbox_max),
+        },
+        "placement_region_world": {
+            "x_min": x_min,
+            "x_max": x_max,
+            "y_min": y_min,
+            "y_max": y_max,
+            "z_surface": region_surface_z,
+        },
+        "pick_object_bbox_world": {
+            "min_xyz": list(pick_bbox_min),
+            "max_xyz": list(pick_bbox_max),
+            "center_xyz": list(pick_bbox_center),
+            "center_source": pick_object_bbox.get("center_source"),
+        },
+        "object_bbox_center_to_min_z_m": object_bbox_center_to_min_z_m,
+        "expected_object_bbox_center_to_min_z_m": expected_extent_m,
+        "expected_object_extent_config_field": expected_extent_field,
+        "object_extent_error_m": extent_error_m,
+        "object_extent_tolerance_m": extent_tolerance_m,
+        "object_extent_consistency_verified": True,
+        "derived_place_pose_world": {
+            "x": derived_xyz[0],
+            "y": derived_xyz[1],
+            "z": derived_xyz[2],
+            "roll": float(payload.get("roll", 0.0)),
+            "pitch": float(payload.get("pitch", 0.0)),
+            "yaw": float(payload.get("yaw", 0.0)),
+        },
+        "configured_place_pose_world": {
+            "x": configured_xyz[0],
+            "y": configured_xyz[1],
+            "z": configured_xyz[2],
+        },
+        "calibrated_place_pose_world": {
+            "x": calibrated_xyz[0],
+            "y": calibrated_xyz[1],
+            "z": calibrated_xyz[2],
+        },
+        "configured_pose_errors_m": configured_pose_errors_m,
+        "configured_pose_max_abs_error_m": configured_pose_max_abs_error_m,
+        "configured_pose_consistency_tolerance_m": geometry_tolerance_m,
+        "configured_pose_consistency_verified": True,
+        "runtime_to_configured_pose_errors_m": runtime_to_configured_errors_m,
+        "runtime_to_configured_pose_max_abs_error_m": max(
+            runtime_to_configured_errors_m.values()
+        ),
+        "xyz_source": "runtime_mesh_truth",
+        "orientation_source": "task_place_pose_world",
+    }
+    return payload, report
+
+
+def _resolve_mesh_truth_manipulation_contract(
+    raw_task: dict[str, Any],
+) -> dict[str, Any]:
+    """解析运行时 Mesh-truth 操作目标合同；旧任务默认不要求。"""
+
+    raw_config = raw_task.get("mesh_truth_manipulation_targets")
+    if raw_config is None:
+        return {"configured": False, "required": False}
+    if not isinstance(raw_config, dict):
+        raise RuntimeError("task.mesh_truth_manipulation_targets 必须是对象")
+    required = bool(raw_config.get("required", False))
+    report = {
+        **raw_config,
+        "configured": True,
+        "required": required,
+    }
+    if not required:
+        return report
+    expected = {
+        "visual_localization_required": False,
+        "pick_tcp_source": "runtime_live_object_bbox",
+        "place_tcp_source": (
+            "runtime_receptacle_bbox_plus_pick_object_bbox_plus_current_tcp_offset"
+        ),
+    }
+    mismatches = {
+        key: {"actual": raw_config.get(key), "expected": expected_value}
+        for key, expected_value in expected.items()
+        if raw_config.get(key) != expected_value
+    }
+    if mismatches:
+        raise RuntimeError(
+            "task.mesh_truth_manipulation_targets contract mismatch: "
+            f"{mismatches}"
+        )
+    return report
+
+
+def _resolve_pick_grasp_mode(raw_task: dict[str, Any]) -> dict[str, str]:
+    """解析 task.pick.grasp_mode，并保留 auto 的旧 side 兼容语义。"""
+
+    raw_pick = raw_task.get("pick")
+    raw_pick = raw_pick if isinstance(raw_pick, dict) else {}
+    requested = str(raw_pick.get("grasp_mode") or "auto").strip().lower()
+    requested = requested.replace("-", "_")
+    if requested not in {"auto", "side", "top_down"}:
+        raise RuntimeError(
+            "task.pick.grasp_mode 必须是 auto、side 或 top_down，"
+            f"当前为 {requested!r}"
+        )
+    resolved = "side" if requested == "auto" else requested
+    return {"requested": requested, "resolved": resolved}
+
+
 def _point_inside_aabb(point: Any, bbox_min: Any, bbox_max: Any, *, margin: float = 0.0) -> bool:
     """判断 point 是否在 AABB 内部。"""
 
@@ -271,19 +1489,280 @@ def _sanitize_obstacle_name(prim_path: str, index: int) -> str:
     return f"obs_{index:03d}_{safe[-80:]}"
 
 
+def _collision_vector(
+    value: Any,
+    *,
+    field_name: str,
+    length: int,
+) -> Any:
+    """严格解析任务中的碰撞向量，禁止 NaN 或隐式补维。"""
+
+    import numpy as np
+
+    vector = np.asarray(value, dtype=float)
+    if vector.shape != (length,) or not bool(np.all(np.isfinite(vector))):
+        raise RuntimeError(
+            f"{field_name} 必须是 {length} 个有限数值，实际为 {value!r}"
+        )
+    return vector
+
+
+def _task_world_collision_cuboids(
+    *,
+    raw_task: dict[str, Any],
+    phase: str,
+    T_world_base: Any,
+    reference_point: Any,
+    padding_xy_m: float,
+    padding_z_m: float,
+) -> list[dict[str, Any]]:
+    """把任务显式声明的局部 world cuboid 转成 cuRobo base frame。
+
+    该入口用于没有独立桌子 prim 的合并碰撞场景。只有任务显式配置时才生效，
+    因而不会改变旧场景的默认 USD CollisionAPI 导出行为。
+    """
+
+    import numpy as np
+
+    from source.manipulation.current_state_curobo import (
+        pose_dict_from_matrix,
+        pose_to_matrix,
+    )
+
+    if phase not in {"pick", "place"}:
+        raise RuntimeError(f"不支持的任务碰撞阶段: {phase}")
+    raw_phase = raw_task.get(phase) or {}
+    if not isinstance(raw_phase, dict):
+        raise RuntimeError(f"task.{phase} 必须是对象")
+    raw_config = raw_phase.get("curobo_world_collision")
+    if raw_config is None:
+        return []
+    if not isinstance(raw_config, dict):
+        raise RuntimeError(f"task.{phase}.curobo_world_collision 必须是对象")
+
+    required = bool(raw_config.get("required", False))
+    enabled = bool(raw_config.get("enabled", True))
+    if not enabled:
+        if required:
+            raise RuntimeError(
+                f"task.{phase}.curobo_world_collision 同时配置 required=true 和 enabled=false"
+            )
+        return []
+    raw_cuboids = raw_config.get("cuboids_world", [])
+    if not isinstance(raw_cuboids, list):
+        raise RuntimeError(
+            f"task.{phase}.curobo_world_collision.cuboids_world 必须是数组"
+        )
+    if required and not raw_cuboids:
+        raise RuntimeError(f"task.{phase} 要求 CuRobo world collision，但未提供 cuboid")
+
+    T_world_base = np.asarray(T_world_base, dtype=float)
+    if T_world_base.shape != (4, 4) or not bool(np.all(np.isfinite(T_world_base))):
+        raise RuntimeError("T_world_base 必须是有限的 4x4 矩阵")
+    T_base_world = np.linalg.inv(T_world_base)
+    reference_point = _collision_vector(
+        reference_point,
+        field_name="reference_point",
+        length=3,
+    )
+    output: list[dict[str, Any]] = []
+    seen_names: set[str] = set()
+
+    for index, raw_cuboid in enumerate(raw_cuboids):
+        config_path = (
+            f"task.{phase}.curobo_world_collision.cuboids_world[{index}]"
+        )
+        if not isinstance(raw_cuboid, dict):
+            raise RuntimeError(f"{config_path} 必须是对象")
+        name = str(raw_cuboid.get("name") or "").strip()
+        if not name:
+            raise RuntimeError(f"{config_path}.name 不能为空")
+        if name in seen_names:
+            raise RuntimeError(f"{config_path}.name 重复: {name}")
+        seen_names.add(name)
+        if str(raw_cuboid.get("frame", "world")) != "world":
+            raise RuntimeError(f"{config_path}.frame 当前只支持 world")
+
+        center = _collision_vector(
+            raw_cuboid.get("center_xyz"),
+            field_name=f"{config_path}.center_xyz",
+            length=3,
+        )
+        dims = _collision_vector(
+            raw_cuboid.get("dims_xyz"),
+            field_name=f"{config_path}.dims_xyz",
+            length=3,
+        )
+        if bool(np.any(dims <= 0.0)):
+            raise RuntimeError(f"{config_path}.dims_xyz 必须全部大于 0")
+        quaternion = _collision_vector(
+            raw_cuboid.get("quaternion_wxyz", [1.0, 0.0, 0.0, 0.0]),
+            field_name=f"{config_path}.quaternion_wxyz",
+            length=4,
+        )
+        quaternion_norm = float(np.linalg.norm(quaternion))
+        if quaternion_norm <= 1.0e-8:
+            raise RuntimeError(f"{config_path}.quaternion_wxyz 不能是零四元数")
+        quaternion = quaternion / quaternion_norm
+        padding_mode = str(raw_cuboid.get("padding_mode", "symmetric"))
+        if padding_mode not in {"none", "symmetric", "preserve_top"}:
+            raise RuntimeError(
+                f"{config_path}.padding_mode 必须是 none/symmetric/preserve_top"
+            )
+
+        T_world_raw = pose_to_matrix(center, quaternion)
+        T_world_obstacle = T_world_raw.copy()
+        padded_dims = dims.copy()
+        if padding_mode == "symmetric":
+            padded_dims += np.asarray(
+                [2.0 * padding_xy_m, 2.0 * padding_xy_m, 2.0 * padding_z_m],
+                dtype=float,
+            )
+        elif padding_mode == "preserve_top":
+            # 支撑面膨胀只向局部 -Z 延伸，不能把人工标定的桌面虚拟抬高。
+            padded_dims += np.asarray(
+                [2.0 * padding_xy_m, 2.0 * padding_xy_m, padding_z_m],
+                dtype=float,
+            )
+            T_world_obstacle[:3, 3] -= (
+                T_world_raw[:3, 2] * float(padding_z_m) * 0.5
+            )
+
+        T_base_obstacle = T_base_world @ T_world_obstacle
+        source_prim_path = str(raw_cuboid.get("source_prim_path") or "")
+        semantic_role = str(raw_cuboid.get("semantic_role") or "task_obstacle")
+        output.append(
+            {
+                "prim_path": source_prim_path or f"task://{phase}/{name}",
+                "type": "task_configured_world_cuboid",
+                "task_configured": True,
+                "task_collision_required": required,
+                "task_collision_id": f"{phase}:{name}",
+                "task_collision_name": name,
+                "task_config_path": config_path,
+                "phase": phase,
+                "semantic_role": semantic_role,
+                "distance_to_reference_xy_m": float(
+                    np.linalg.norm(T_world_obstacle[:2, 3] - reference_point[:2])
+                ),
+                "dims_xyz": padded_dims.tolist(),
+                "raw_dims_xyz": dims.tolist(),
+                "pose_world": pose_dict_from_matrix(T_world_obstacle),
+                "raw_pose_world": pose_dict_from_matrix(T_world_raw),
+                "pose_base": pose_dict_from_matrix(T_base_obstacle),
+                "padding_m": float(padding_xy_m),
+                "padding_xy_m": float(padding_xy_m),
+                "padding_z_m": float(padding_z_m),
+                "padding_mode": padding_mode,
+                "source_prim_path": source_prim_path or None,
+                "source": dict(raw_cuboid.get("source") or {}),
+                "clipped_from_large_obstacle": False,
+            }
+        )
+
+    return output
+
+
 def _collision_candidate_sort_key(candidate: dict[str, Any]) -> tuple[int, float, str]:
     """优先保留任务物体附近的碰撞体，避免 stage 遍历顺序挤掉桌面。"""
 
     prim_path = str(candidate["prim_path"])
-    table_priority = 0 if any(
+    semantic_role = str(candidate.get("semantic_role") or "").lower()
+    if candidate.get("task_collision_required"):
+        collision_priority = 0
+    elif candidate.get("task_configured"):
+        collision_priority = 1
+    elif semantic_role == "table_support" or any(
         keyword in prim_path.lower()
         for keyword in ("table", "tabletop", "desk", "counter")
-    ) else 1
+    ):
+        collision_priority = 2
+    else:
+        collision_priority = 3
     return (
-        table_priority,
+        collision_priority,
         float(candidate["distance_to_reference_xy_m"]),
         prim_path,
     )
+
+
+def _retarget_height_scanners(scene_cfg: Any, terrain_mesh_prim_path: str) -> tuple[str, ...]:
+    """让地形高度扫描器跟随 runtime 实际导入的碰撞 Mesh。"""
+
+    updated: list[str] = []
+    for sensor_name in ("height_scanner", "height_scanner_base"):
+        sensor_cfg = getattr(scene_cfg, sensor_name, None)
+        if sensor_cfg is None:
+            continue
+        sensor_cfg.mesh_prim_paths = [terrain_mesh_prim_path]
+        updated.append(sensor_name)
+    return tuple(updated)
+
+
+def _episode_reset_pose_configuration(
+    episode_spec: EpisodeSpec,
+    *,
+    default_root_pos: tuple[float, float, float],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Build the exact IsaacLab reset event parameters for one episode."""
+
+    start_z = (
+        default_root_pos[2]
+        if episode_spec.start.z is None
+        else float(episode_spec.start.z)
+    )
+    start_offset = (
+        float(episode_spec.start.x) - default_root_pos[0],
+        float(episode_spec.start.y) - default_root_pos[1],
+        start_z - default_root_pos[2],
+    )
+    params = {
+        "pose_range": {
+            "x": (start_offset[0], start_offset[0]),
+            "y": (start_offset[1], start_offset[1]),
+            "z": (start_offset[2], start_offset[2]),
+            "roll": (0.0, 0.0),
+            "pitch": (0.0, 0.0),
+            "yaw": (episode_spec.start.yaw, episode_spec.start.yaw),
+        },
+        "velocity_range": {
+            key: (0.0, 0.0)
+            for key in ("x", "y", "z", "roll", "pitch", "yaw")
+        },
+    }
+    report = {
+        "target_world_xyz_yaw": (
+            float(episode_spec.start.x),
+            float(episode_spec.start.y),
+            start_z,
+            float(episode_spec.start.yaw),
+        ),
+        "default_root_pos": default_root_pos,
+        "pose_range_offset_xyz": start_offset,
+        "event_semantics": "default_root_state_plus_offset",
+    }
+    return params, report
+
+
+def _resolve_rigid_body_prim_path(stage: Any, object_root_path: str) -> str:
+    """解析物体子树中的真实动态刚体，避免把外层定位 Xform 变成父刚体。"""
+
+    from pxr import Usd, UsdPhysics
+
+    root = stage.GetPrimAtPath(object_root_path)
+    if not root or not root.IsValid():
+        raise RuntimeError(f"task object prim is unavailable: {object_root_path}")
+    candidates: list[str] = []
+    for prim in Usd.PrimRange(root):
+        if not prim.HasAPI(UsdPhysics.RigidBodyAPI):
+            continue
+        enabled_attr = prim.GetAttribute("physics:rigidBodyEnabled")
+        if enabled_attr and enabled_attr.IsValid() and enabled_attr.Get() is False:
+            continue
+        candidates.append(str(prim.GetPath()))
+    if not candidates:
+        raise RuntimeError(f"no enabled RigidBodyAPI exists under {object_root_path}")
+    return object_root_path if object_root_path in candidates else candidates[0]
 
 
 def _collision_cuboid_diagnostics(
@@ -295,7 +1774,8 @@ def _collision_cuboid_diagnostics(
     table_paths = [
         str(cuboid.get("prim_path") or "")
         for cuboid in cuboids
-        if any(
+        if str(cuboid.get("semantic_role") or "").lower() == "table_support"
+        or any(
             keyword in str(cuboid.get("prim_path") or "").lower()
             for keyword in table_keywords
         )
@@ -303,6 +1783,11 @@ def _collision_cuboid_diagnostics(
     return {
         "collision_cuboids_table_present": bool(table_paths),
         "table_collision_prim_paths": table_paths,
+        "task_configured_collision_ids": [
+            str(cuboid.get("task_collision_id"))
+            for cuboid in cuboids
+            if cuboid.get("task_configured")
+        ],
         "nearest_collision_prim_paths": [
             str(cuboid.get("prim_path") or "") for cuboid in cuboids[:8]
         ],
@@ -326,16 +1811,34 @@ class IsaacLabNavigationRuntime:
         self._runtime = None
         self._adapter = None
         self._object = None
+        self._episode_support_bodies: dict[str, dict[str, Any]] = {}
+        self._settled_object_pose: tuple[float, ...] | None = None
         self._episode_spec: EpisodeSpec | None = None
+        self._default_robot_root_pos: tuple[float, float, float] | None = None
+        self._stage_reuse_fingerprint: dict[str, Any] | None = None
+        self._stage_build_count = 0
+        self._stage_reuse_count = 0
         self._step_calls = 0
         self._closed = False
+        self._performance_profiler: Any | None = None
+        self._cached_camera_step: int | None = None
+        self._cached_camera_images: dict[str, Any] = {}
+        self._camera_render_generation = 0
+        self._last_camera_render_step: int | None = None
+        self._last_camera_render_reason: str | None = None
         self._action_prepared = False
         self._environment_terminated = False
         self._last_action = RobotAction.idle()
         self._pending_arm_tracking_target: dict[str, Any] | None = None
         self._manipulation_base_lock_active = False
         self._manipulation_support_joint_lock_active = False
+        self._navigation_joint_pose_lock_active = False
+        self._navigation_object_follow_active = False
+        self._navigation_object_relative_pose: tuple[float, ...] | None = None
+        self._navigation_object_follow_root_target: tuple[float, ...] | None = None
+        self._navigation_object_follow_target_pose: tuple[float, ...] | None = None
         self._hidden_distractor_root_paths: tuple[str, ...] = ()
+        self._grasp_fixed_joint_active = False
         self._viewport_config_attempts = 0
         self._metadata: dict[str, Any] = {
             "simulation_ready": False,
@@ -343,16 +1846,30 @@ class IsaacLabNavigationRuntime:
             "used_base_teleport": False,
             "used_direct_joint_state": False,
             "used_object_teleport": False,
+            "used_object_initialization_pose_stabilization": False,
+            "object_initialization_pose_stabilization_apply_count": 0,
+            "last_object_initialization_pose_stabilization_report": None,
             "used_kinematic_object_follow": False,
             "used_visual_replay": False,
             "used_manipulation_base_lock": False,
             "used_manipulation_support_joint_lock": False,
+            "used_navigation_base_lock": False,
+            "used_navigation_support_joint_lock": False,
+            "used_navigation_joint_pose_lock": False,
+            "navigation_object_follow_active": False,
+            "navigation_object_follow_apply_count": 0,
+            "last_navigation_object_follow_report": None,
             "manipulation_base_lock_active": False,
             "manipulation_base_lock_apply_count": 0,
             "last_manipulation_base_lock_report": None,
+            "last_navigation_base_lock_report": None,
             "manipulation_support_joint_lock_active": False,
             "manipulation_support_joint_lock_apply_count": 0,
             "last_manipulation_support_joint_lock_report": None,
+            "last_navigation_support_joint_lock_report": None,
+            "navigation_joint_pose_lock_active": False,
+            "navigation_joint_pose_lock_apply_count": 0,
+            "last_navigation_joint_pose_lock_report": None,
             "arm_joint_position_target_apply_count": 0,
             "last_arm_joint_position_target_report": None,
             "gripper_joint_position_target_apply_count": 0,
@@ -374,17 +1891,545 @@ class IsaacLabNavigationRuntime:
             "gripper_joint_action_apply_count": 0,
             "gripper_close_apply_count": 0,
             "gripper_open_apply_count": 0,
+            "gripper_symmetry_report": {
+                "available": False,
+                "required_for_training": True,
+                "sample_count": 0,
+                "max_abs_error_m": 0.0,
+                "tolerance_m": float(self._config.gripper_symmetry_tolerance_m),
+                "verified": False,
+            },
+            "gripper_physics_control_report": None,
+            "gripper_contact_material_report": None,
+            "grasp_fixed_joint_report": {
+                "active": False,
+                "created": False,
+                "released": False,
+            },
             "world_count": 1,
             "opened_stage_count": 1,
+            "stage_build_count": 0,
+            "stage_reuse_count": 0,
         }
+
+    def set_performance_profiler(self, profiler: Any | None) -> None:
+        """Attach the episode profiler without coupling runtime interfaces to diagnostics."""
+
+        self._performance_profiler = profiler
+
+    def _configure_gripper_contact_material(self) -> dict[str, Any]:
+        """Apply deterministic rubber-pad friction to both finger colliders.
+
+        The locomotion environment randomizes material properties for every
+        robot body at startup.  That unintentionally includes arm_link7/8 and
+        makes an otherwise identical grasp seed-dependent.  Update only the
+        two finger-body shape slots through the live PhysX view after every
+        environment reset; this leaves foot/body domain randomization intact.
+        """
+
+        import torch
+
+        robot = self._runtime.scene["robot"]
+        body_names = tuple(str(name) for name in robot.body_names)
+        target_names = tuple(str(name) for name in self._config.gripper_collision_links)
+        target_ids = [
+            body_names.index(name)
+            for name in target_names
+            if name in body_names
+        ]
+        if len(target_ids) != len(target_names):
+            raise RuntimeError(
+                "X5 gripper contact material requires both finger bodies: "
+                f"requested={target_names} available={body_names}"
+            )
+
+        static_friction = float(self._config.gripper_contact_static_friction)
+        dynamic_friction = float(self._config.gripper_contact_dynamic_friction)
+        restitution = float(self._config.gripper_contact_restitution)
+        if not (
+            static_friction >= dynamic_friction >= 0.0
+            and 0.0 <= restitution <= 1.0
+        ):
+            raise ValueError(
+                "invalid gripper contact material: "
+                f"static={static_friction} dynamic={dynamic_friction} "
+                f"restitution={restitution}"
+            )
+
+        root_view = robot.root_physx_view
+        link_paths = tuple(str(path) for path in root_view.link_paths[0])
+        if len(link_paths) != len(body_names):
+            raise RuntimeError(
+                "X5 body/link ordering unavailable for contact material patch: "
+                f"bodies={len(body_names)} links={len(link_paths)}"
+            )
+        shape_counts = [
+            int(robot._physics_sim_view.create_rigid_body_view(path).max_shapes)
+            for path in link_paths
+        ]
+        materials = root_view.get_material_properties()
+        before: dict[str, list[list[float]]] = {}
+        shape_ranges: dict[str, list[int]] = {}
+        for body_id in target_ids:
+            start = sum(shape_counts[:body_id])
+            stop = start + shape_counts[body_id]
+            body_name = body_names[body_id]
+            shape_ranges[body_name] = [start, stop]
+            before[body_name] = materials[:, start:stop, :].tolist()
+            materials[:, start:stop, 0] = static_friction
+            materials[:, start:stop, 1] = dynamic_friction
+            materials[:, start:stop, 2] = restitution
+
+        env_ids = torch.arange(int(materials.shape[0]), device="cpu")
+        root_view.set_material_properties(materials, env_ids)
+        applied = root_view.get_material_properties()
+        after = {
+            body_name: applied[:, limits[0] : limits[1], :].tolist()
+            for body_name, limits in shape_ranges.items()
+        }
+        expected = (static_friction, dynamic_friction, restitution)
+        verified = all(
+            all(
+                abs(float(shape[index]) - expected[index]) <= 1.0e-6
+                for index in range(3)
+            )
+            for per_body in after.values()
+            for per_env in per_body
+            for shape in per_env
+        )
+        if not verified:
+            raise RuntimeError(
+                "X5 gripper contact material readback mismatch: "
+                f"expected={expected} after={after}"
+            )
+        return {
+            "applied": True,
+            "verified": True,
+            "mode": "live_physx_shape_material_override",
+            "body_names": list(target_names),
+            "shape_ranges": shape_ranges,
+            "static_friction": static_friction,
+            "dynamic_friction": dynamic_friction,
+            "restitution": restitution,
+            "before": before,
+            "after": after,
+            "locomotion_material_randomization_preserved": True,
+        }
+
+    def create_verified_grasp_constraint(self) -> dict[str, Any]:
+        """Lock a physically verified grasp at its current relative pose.
+
+        Contact and lift verification remains the admission gate.  Once that
+        succeeds, a runtime PhysX fixed joint prevents a cylindrical object
+        from slowly rolling between otherwise correctly coupled fingers during
+        locomotion.  The joint is removed before the first open command.
+        """
+
+        if not self._config.enable_verified_grasp_fixed_joint:
+            report = {
+                "active": False,
+                "created": False,
+                "released": False,
+                "reason": "disabled",
+            }
+            self._metadata["grasp_fixed_joint_report"] = report
+            return report
+        if getattr(self, "_grasp_fixed_joint_active", False):
+            return dict(self._metadata["grasp_fixed_joint_report"])
+        if self._object is None:
+            raise RuntimeError("verified grasp constraint requires an object reader")
+
+        import omni.usd
+        from pxr import Gf, Sdf, UsdGeom, UsdPhysics
+
+        stage = omni.usd.get_context().get_stage()
+        if stage is None:
+            raise RuntimeError("Isaac stage is unavailable for grasp constraint")
+        robot = self._runtime.scene["robot"]
+        body_names = tuple(str(name) for name in robot.body_names)
+        parent_name = str(self._config.grasp_fixed_joint_parent_body)
+        if parent_name not in body_names:
+            raise RuntimeError(
+                "grasp constraint parent body is unavailable: "
+                f"requested={parent_name} available={body_names}"
+            )
+        parent_id = body_names.index(parent_name)
+        parent_path = str(robot.root_physx_view.link_paths[0][parent_id])
+        object_report = self._metadata.get("object_reader_report") or {}
+        object_path = str(object_report.get("rigid_body_prim_path") or "")
+        if not object_path or not stage.GetPrimAtPath(object_path).IsValid():
+            raise RuntimeError(
+                "grasp constraint object rigid body is unavailable: "
+                f"path={object_path!r}"
+            )
+
+        parent_position = tuple(
+            float(value)
+            for value in _as_tuple(robot.data.body_link_pos_w[0, parent_id])
+        )
+        parent_quaternion = _quat_normalize_wxyz(
+            tuple(
+                float(value)
+                for value in _as_tuple(robot.data.body_link_quat_w[0, parent_id])
+            )  # type: ignore[arg-type]
+        )
+        object_pose, _object_velocity = self._read_object_state()
+        if object_pose is None:
+            raise RuntimeError("grasp constraint object pose is unavailable")
+        object_position = tuple(float(value) for value in object_pose[:3])
+        object_quaternion = _quat_normalize_wxyz(
+            tuple(float(value) for value in object_pose[3:7])  # type: ignore[arg-type]
+        )
+        inverse_parent = _quat_conjugate_wxyz(parent_quaternion)
+        local_position_parent = _quat_rotate_vector_wxyz(
+            inverse_parent,
+            tuple(
+                object_position[index] - parent_position[index]
+                for index in range(3)
+            ),
+        )
+        local_quaternion_parent = _quat_normalize_wxyz(
+            _quat_multiply_wxyz(inverse_parent, object_quaternion)
+        )
+
+        joint_path = str(self._config.grasp_fixed_joint_prim_path)
+        joint_sdf_path = Sdf.Path(joint_path)
+        if stage.GetPrimAtPath(joint_sdf_path).IsValid():
+            stage.RemovePrim(joint_sdf_path)
+        UsdGeom.Scope.Define(stage, joint_sdf_path.GetParentPath())
+        joint = UsdPhysics.FixedJoint.Define(stage, joint_sdf_path)
+        joint.CreateBody0Rel().SetTargets([Sdf.Path(parent_path)])
+        joint.CreateBody1Rel().SetTargets([Sdf.Path(object_path)])
+        joint.CreateLocalPos0Attr().Set(Gf.Vec3f(*local_position_parent))
+        joint.CreateLocalRot0Attr().Set(
+            Gf.Quatf(
+                local_quaternion_parent[0],
+                Gf.Vec3f(*local_quaternion_parent[1:]),
+            )
+        )
+        joint.CreateLocalPos1Attr().Set(Gf.Vec3f(0.0, 0.0, 0.0))
+        joint.CreateLocalRot1Attr().Set(
+            Gf.Quatf(1.0, Gf.Vec3f(0.0, 0.0, 0.0))
+        )
+        joint.CreateCollisionEnabledAttr().Set(False)
+        joint.CreateExcludeFromArticulationAttr().Set(True)
+        joint.CreateJointEnabledAttr().Set(True)
+        self._runtime.sim.forward()
+
+        self._grasp_fixed_joint_active = True
+        report = {
+            "active": True,
+            "created": True,
+            "released": False,
+            "mode": "verified_contact_physx_fixed_joint",
+            "joint_prim_path": joint_path,
+            "parent_body_prim_path": parent_path,
+            "object_body_prim_path": object_path,
+            "local_position_parent_xyz": list(local_position_parent),
+            "local_quaternion_parent_wxyz": list(local_quaternion_parent),
+            "admission_gate": "pick_lift_contact_and_stability_verified",
+            "release_trigger": "first_gripper_open_command",
+            "uses_object_pose_writes": False,
+            "uses_kinematic_follow": False,
+        }
+        self._metadata["grasp_fixed_joint_report"] = report
+        self._metadata["used_physics_grasp_constraint"] = True
+        return dict(report)
+
+    def release_grasp_constraint(self, *, reason: str) -> dict[str, Any]:
+        """Remove the verified grasp joint without moving the task object."""
+
+        joint_path = str(self._config.grasp_fixed_joint_prim_path)
+        removed = False
+        if getattr(self, "_grasp_fixed_joint_active", False):
+            import omni.usd
+            from pxr import Sdf
+
+            stage = omni.usd.get_context().get_stage()
+            if stage is None:
+                raise RuntimeError("Isaac stage is unavailable for grasp release")
+            joint_sdf_path = Sdf.Path(joint_path)
+            if stage.GetPrimAtPath(joint_sdf_path).IsValid():
+                removed = bool(stage.RemovePrim(joint_sdf_path))
+            self._runtime.sim.forward()
+        self._grasp_fixed_joint_active = False
+        previous = dict(self._metadata.get("grasp_fixed_joint_report") or {})
+        report = {
+            **previous,
+            "active": False,
+            "released": bool(previous.get("created")) or removed,
+            "release_reason": str(reason),
+            "joint_prim_removed": removed,
+            "object_pose_modified": False,
+        }
+        self._metadata["grasp_fixed_joint_report"] = report
+        return dict(report)
+
+    @property
+    def is_built(self) -> bool:
+        """Whether the IsaacLab environment and stage are ready for reset."""
+
+        return self._env is not None and self._runtime is not None
+
+    def _hard_reset_stage_reuse_physics(
+        self,
+        episode_spec: EpisodeSpec,
+    ) -> dict[str, Any]:
+        """Recreate PhysX views while preserving the already-open USD stage.
+
+        ``ManagerBasedEnv.reset`` only rewrites tensor state for one environment.
+        It does not clear the articulation/contact solver warm-start accumulated by
+        the previous episode.  In a reused stage that stale state can fold the Go2
+        legs on the first physics step even though the visible reset tensors are
+        correct.  A hard ``SimulationContext.reset`` stops and restarts the
+        timeline, which recreates the PhysX simulation view without reopening or
+        rebuilding the USD stage.
+
+        Timeline STOP invalidates both IsaacLab asset handles and the standalone
+        ``SingleRigidPrim`` readers used here.  IsaacLab assets reinitialize from
+        their PLAY callbacks; the standalone object/support readers and calibrated
+        camera matrices must be rebound explicitly before the episode reset.
+        """
+
+        started_at = time.perf_counter()
+        control_step_before = int(self._step_calls)
+        manager_sim_step_before = int(self._runtime._sim_step_counter)
+
+        self._runtime.sim.reset(soft=False)
+        # Match ManagerBasedEnv's initial construction sequence so freshly
+        # reinitialized assets and sensors have populated data buffers.
+        self._runtime.scene.update(dt=float(self._runtime.physics_dt))
+
+        self._initialize_object_reader(episode_spec)
+        self._initialize_episode_support_readers(episode_spec)
+        camera_intrinsics_report = self._apply_d436_runtime_intrinsics(
+            self._runtime
+        )
+        self._metadata["camera_runtime_intrinsics_report"] = (
+            camera_intrinsics_report
+        )
+        self._runtime.sim.forward()
+
+        return {
+            "applied": True,
+            "mode": "simulation_context_hard_reset",
+            "soft": False,
+            "usd_stage_reopened": False,
+            "usd_stage_rebuilt": False,
+            "physx_views_recreated": True,
+            "standalone_tensor_readers_reinitialized": True,
+            "camera_intrinsics_reapplied": camera_intrinsics_report,
+            "control_step_before_after": [
+                control_step_before,
+                int(self._step_calls),
+            ],
+            "manager_sim_step_before_after": [
+                manager_sim_step_before,
+                int(self._runtime._sim_step_counter),
+            ],
+            "physics_time_advanced": False,
+            "wall_seconds": time.perf_counter() - started_at,
+        }
+
+    def prepare_episode(self, episode_spec: EpisodeSpec) -> dict[str, Any]:
+        """Build once, then reconfigure episode-level poses on the live stage."""
+
+        if self._closed:
+            raise RuntimeError("simulation runtime is closed")
+        if not self.is_built:
+            self.build(episode_spec)
+            report = {
+                "stage_reused": False,
+                "stage_build_count": self._stage_build_count,
+                "stage_reuse_count": self._stage_reuse_count,
+                "episode_id": int(episode_spec.episode_id),
+                "reason": "initial_stage_build",
+            }
+            self._metadata["stage_reuse_report"] = report
+            return report
+
+        started_at = time.perf_counter()
+        fingerprint = self._episode_stage_fingerprint(episode_spec)
+        if fingerprint != self._stage_reuse_fingerprint:
+            raise RuntimeError(
+                "episode is incompatible with the existing Isaac stage: "
+                f"built={self._stage_reuse_fingerprint} requested={fingerprint}"
+            )
+        if self._default_robot_root_pos is None:
+            raise RuntimeError("default robot root pose is unavailable for stage reuse")
+
+        import omni.usd
+
+        from source.simulation.task_scene_pose import apply_task_receptacle_pose
+
+        stage = omni.usd.get_context().get_stage()
+        if stage is None:
+            raise RuntimeError("Isaac stage is unavailable during episode reuse")
+
+        previous_episode_id = (
+            None if self._episode_spec is None else int(self._episode_spec.episode_id)
+        )
+        self._episode_spec = episode_spec
+        receptacle_pose_report = apply_task_receptacle_pose(
+            stage,
+            episode_spec.raw_task,
+        )
+        self._metadata["task_receptacle_pose_report"] = receptacle_pose_report
+        # Author every episode-local USD pose before restarting PhysX so the new
+        # simulation view is born from the requested scene configuration rather
+        # than from the previous episode's terminal contact state.
+        self._metadata["object_pose_setup_report"] = self._apply_object_pose(
+            episode_spec
+        )
+        physics_context_reset_report = self._hard_reset_stage_reuse_physics(
+            episode_spec
+        )
+        self._metadata["stage_reuse_physics_context_reset_report"] = (
+            physics_context_reset_report
+        )
+        support_pose_write_report = self._write_episode_support_physics_poses(
+            episode_spec,
+            reason="stage_reuse_prepare_episode",
+        )
+        # Push the kinematic support tensor transforms into Fabric.  Unlike a
+        # rewritten USD-static collider, this does not require a Kit update or a
+        # physics-scene rebuild.
+        self._runtime.sim.forward()
+        support_pose_diagnostic = self._episode_support_pose_diagnostic(
+            label="after_stage_reuse_prepare_forward",
+        )
+        if support_pose_diagnostic.get("verified") is not True:
+            raise RuntimeError(
+                "episode support pose changed during stage-reuse forward sync: "
+                f"{support_pose_diagnostic}"
+            )
+        self._metadata["task_receptacle_support_runtime_stage_report"] = (
+            inspect_task_receptacle_support_stage(
+                stage,
+                episode_spec.raw_task,
+                source="isaaclab_reused_runtime_stage",
+            )
+        )
+        self._metadata["object_visibility_report"] = self._show_only_task_object(
+            stage,
+            episode_spec,
+        )
+        self._metadata["object_collision_visual_hide_report"] = (
+            self._hide_object_collision_visual(stage)
+        )
+
+        reset_params, reset_report = _episode_reset_pose_configuration(
+            episode_spec,
+            default_root_pos=self._default_robot_root_pos,
+        )
+        reset_term_cfg = copy.deepcopy(
+            self._runtime.event_manager.get_term_cfg("randomize_reset_base")
+        )
+        reset_term_cfg.params = reset_params
+        self._runtime.event_manager.set_term_cfg(
+            "randomize_reset_base",
+            reset_term_cfg,
+        )
+        self._metadata["episode_reset_pose_request"] = reset_report
+
+        static_sync_report = {
+            "applied": True,
+            "reason": "kinematic_episode_support_tensor_sync",
+            "support_pose_write_report": support_pose_write_report,
+            "support_pose_diagnostic": support_pose_diagnostic,
+            "render_required": False,
+            "physics_time_advanced": False,
+        }
+        self._step_calls = 0
+        self._runtime._sim_step_counter = 0
+        self._cached_camera_step = None
+        self._cached_camera_images = {}
+        self._clear_previous_episode_metadata()
+        self._stage_reuse_count += 1
+        report = {
+            "stage_reused": True,
+            "stage_build_count": self._stage_build_count,
+            "stage_reuse_count": self._stage_reuse_count,
+            "previous_episode_id": previous_episode_id,
+            "episode_id": int(episode_spec.episode_id),
+            "scene_pose_reapplied": bool(
+                receptacle_pose_report.get("any_scene_pose_configured")
+            ),
+            "robot_reset_event_updated": True,
+            "physics_static_scene_sync": static_sync_report,
+            "physics_context_reset": physics_context_reset_report,
+            "physics_time_advanced": False,
+            "prepare_wall_seconds": time.perf_counter() - started_at,
+        }
+        self._metadata.update(
+            {
+                "stage_build_count": self._stage_build_count,
+                "stage_reuse_count": self._stage_reuse_count,
+                "stage_reuse_report": report,
+            }
+        )
+        return report
+
+    def _episode_stage_fingerprint(self, episode_spec: EpisodeSpec) -> dict[str, Any]:
+        scene_runtime = resolve_scene_runtime_settings(
+            episode_spec.raw_task,
+            default_collision_prim_path=self._config.terrain_prim_path,
+            default_visual_prim_path=self._config.visual_prim_path,
+            default_collision_floor_proxy_profile=(
+                self._config.collision_floor_proxy_profile
+            ),
+        )
+        support_settings = self._episode_support_pose_settings(episode_spec)
+        return {
+            "scene_usd": str(self._resolve_path(episode_spec.scene_usd)),
+            "nav_map": str(self._resolve_path(episode_spec.nav_map)),
+            "object_prim_path": episode_spec.object_prim_path,
+            "collision_prim_path": str(scene_runtime["collision_prim_path"]),
+            "visual_prim_path": str(scene_runtime["visual_prim_path"]),
+            "relocatable_episode_supports": bool(
+                self._config.enable_relocatable_episode_supports
+            ),
+            "episode_support_prim_paths": {
+                role: (
+                    str(settings["prim_path"])
+                    if settings.get("configured") is True
+                    else None
+                )
+                for role, settings in support_settings.items()
+            },
+        }
+
+    def _clear_previous_episode_metadata(self) -> None:
+        """Drop dynamic reports that must never leak into the next summary."""
+
+        for key in (
+            "last_current_state_curobo_pick_export",
+            "last_current_state_curobo_place_export",
+            "last_mesh_truth_pick_target_report",
+            "last_mesh_truth_place_target_report",
+            "object_settle_final_report",
+            "object_settle_begin_report",
+            "object_pose_debug_after_reset",
+            "object_pose_debug_after_reset_render",
+            "episode_support_reset_pose_write_report",
+            "episode_support_pose_after_reset_forward",
+            "episode_support_pose_after_reset_render",
+            "camera_capture_report",
+            "wrist_camera_object_clearance_report",
+        ):
+            self._metadata.pop(key, None)
 
     def build(self, episode_spec: EpisodeSpec) -> None:
         if self._closed:
             raise RuntimeError("simulation runtime is closed")
         if self._env is not None:
             raise RuntimeError("Isaac Lab environment has already been built")
+        if self._config.camera_render_interval_control_steps < 1:
+            raise ValueError("camera_render_interval_control_steps must be positive")
         self._episode_spec = episode_spec
         self._build_environment(episode_spec)
+        self._stage_build_count += 1
+        self._stage_reuse_fingerprint = self._episode_stage_fingerprint(episode_spec)
         if self._config.show_randomization_debug:
             import omni.usd
 
@@ -408,27 +2453,69 @@ class IsaacLabNavigationRuntime:
                 "control_dt": float(self._runtime.step_dt),
                 "physics_dt": float(self._runtime.physics_dt),
                 "decimation": int(self._runtime.cfg.decimation),
+                "camera_render_interval_control_steps": int(
+                    self._config.camera_render_interval_control_steps
+                ),
+                "camera_render_hz": 1.0
+                / (
+                    float(self._runtime.step_dt)
+                    * float(self._config.camera_render_interval_control_steps)
+                ),
                 "checkpoint": str(self._resolve_checkpoint()),
+                "stage_build_count": self._stage_build_count,
+                "stage_reuse_count": self._stage_reuse_count,
             }
         )
 
     def reset(self, episode_spec: EpisodeSpec, *, seed: int) -> None:
         self._require_ready()
+        if getattr(self, "_grasp_fixed_joint_active", False):
+            self.release_grasp_constraint(reason="episode_reset")
         self._episode_spec = episode_spec
-        observations, _extras = self._runtime.reset(seed=seed)
-        self._adapter.update_observations(self._to_tensor_dict(observations))
-        self._environment_terminated = False
-        self._action_prepared = False
-        self._last_action = RobotAction.idle(source="episode_reset")
+        # Episode-local time and the internal render grid both restart at zero.
+        # This preserves camera_capture_step == state.step_index after stage reuse.
+        self._step_calls = 0
+        self._runtime._sim_step_counter = 0
+        self._settled_object_pose = None
+        self._cached_camera_step = None
+        self._cached_camera_images = {}
+        self._last_camera_render_step = None
+        self._last_camera_render_reason = None
+        reset_policy_warmup = getattr(self._adapter, "reset_policy_warmup", None)
+        if callable(reset_policy_warmup):
+            reset_policy_warmup()
+        # Clear every episode-local adapter override before ManagerBasedEnv writes
+        # reset state back to PhysX.  This prevents a previous terminal carry/place
+        # lock from being observed during the new episode's reset transaction.
+        self._adapter.apply_base_command(0.0, 0.0, 0.0)
         self._adapter.set_arm_joint_target(None)
         self._adapter.set_direct_arm_action_override(False)
         self._adapter.set_gripper_joint_target(None)
         self._adapter.set_base_pose_lock(False)
         if hasattr(self._adapter, "set_support_joint_lock"):
             self._adapter.set_support_joint_lock(False)
+        if hasattr(self._adapter, "set_navigation_joint_pose_lock"):
+            self._adapter.set_navigation_joint_pose_lock(False)
+        observations, _extras = self._runtime.reset(seed=seed)
+        # The locomotion event randomizes material properties for the complete
+        # articulation.  Restore deterministic rubber-pad friction on the two
+        # finger bodies after reset (and after any stage-reuse hard reset).
+        self._metadata["gripper_contact_material_report"] = (
+            self._configure_gripper_contact_material()
+        )
+        self._adapter.update_observations(self._to_tensor_dict(observations))
+        self._environment_terminated = False
+        self._action_prepared = False
+        self._last_action = RobotAction.idle(source="episode_reset")
         self._pending_arm_tracking_target = None
         self._manipulation_base_lock_active = False
         self._manipulation_support_joint_lock_active = False
+        self._navigation_joint_pose_lock_active = False
+        self._navigation_object_follow_active = False
+        self._navigation_object_relative_pose = None
+        self._navigation_object_follow_root_target = None
+        self._navigation_object_follow_target_pose = None
+        self._metadata.pop("wrist_camera_object_clearance_report", None)
         self._metadata.update(
             {
                 "seed": int(seed),
@@ -451,18 +2538,56 @@ class IsaacLabNavigationRuntime:
                 "gripper_joint_action_apply_count": 0,
                 "gripper_close_apply_count": 0,
                 "gripper_open_apply_count": 0,
+                "gripper_symmetry_report": {
+                    "available": False,
+                    "required_for_training": True,
+                    "sample_count": 0,
+                    "max_abs_error_m": 0.0,
+                    "tolerance_m": float(
+                        self._config.gripper_symmetry_tolerance_m
+                    ),
+                    "verified": False,
+                },
+                "gripper_physics_control_report": self._metadata.get(
+                    "gripper_physics_control_report"
+                ),
                 "used_direct_joint_state": False,
                 "used_manipulation_base_lock": False,
                 "used_manipulation_support_joint_lock": False,
+                "used_navigation_base_lock": False,
+                "used_navigation_support_joint_lock": False,
+                "used_navigation_joint_pose_lock": False,
+                "used_object_teleport": False,
+                "used_object_initialization_pose_stabilization": False,
+                "object_initialization_pose_stabilization_apply_count": 0,
+                "last_object_initialization_pose_stabilization_report": None,
+                "used_kinematic_object_follow": False,
+                "navigation_object_follow_active": False,
+                "navigation_object_follow_apply_count": 0,
+                "last_navigation_object_follow_report": None,
                 "manipulation_base_lock_active": False,
                 "manipulation_base_lock_apply_count": 0,
                 "last_manipulation_base_lock_report": None,
+                "last_navigation_base_lock_report": None,
                 "manipulation_support_joint_lock_active": False,
                 "manipulation_support_joint_lock_apply_count": 0,
                 "last_manipulation_support_joint_lock_report": None,
+                "last_navigation_support_joint_lock_report": None,
+                "navigation_joint_pose_lock_active": False,
+                "navigation_joint_pose_lock_apply_count": 0,
+                "last_navigation_joint_pose_lock_report": None,
                 # reset 事件写入初始位姿，不属于导航执行中的 teleport。
                 "reset_pose_source": "isaaclab_reset_event",
+                "object_initialization_policy": resolve_object_initialization_policy(
+                    episode_spec.raw_task
+                ),
             }
+        )
+        self._metadata["episode_support_reset_pose_write_report"] = (
+            self._write_episode_support_physics_poses(
+                episode_spec,
+                reason="episode_reset_after_manager_reset",
+            )
         )
         self._metadata["object_reset_for_navigation_report"] = (
             self._reset_object_pose_and_motion(
@@ -475,6 +2600,57 @@ class IsaacLabNavigationRuntime:
             episode_spec,
             label="after_runtime_reset",
         )
+        # SingleRigidPrim writes the reset pose through a PhysX tensor view.  Push
+        # that fresh state into Fabric before RTX reads it; otherwise a render can
+        # re-expose the previous episode's cached transform even though PhysX was
+        # already reset correctly.
+        self._runtime.sim.forward()
+        support_before_render = self._episode_support_pose_diagnostic(
+            label="after_episode_reset_forward",
+        )
+        self._metadata["episode_support_pose_after_reset_forward"] = (
+            support_before_render
+        )
+        if support_before_render.get("verified") is not True:
+            raise RuntimeError(
+                "episode support pose changed during reset forward sync: "
+                f"{support_before_render}"
+            )
+        # ManagerBasedEnv reset deliberately does not rerender by default.  Without
+        # this explicit no-physics render, the first image after reset belongs to
+        # the previous robot/object state even if its logical timestamp says zero.
+        self._metadata["episode_reset_camera_render_sync_report"] = (
+            self._render_without_physics(
+                valid_state_step=0,
+                reason="episode_reset_state_sync",
+            )
+        )
+        post_render_pose_report = self._object_initial_pose_diagnostic(
+            episode_spec,
+            label="after_runtime_reset_fabric_render_sync",
+        )
+        self._metadata["object_pose_debug_after_reset_render"] = (
+            post_render_pose_report
+        )
+        support_after_render = self._episode_support_pose_diagnostic(
+            label="after_episode_reset_render",
+        )
+        self._metadata["episode_support_pose_after_reset_render"] = (
+            support_after_render
+        )
+        if support_after_render.get("verified") is not True:
+            raise RuntimeError(
+                "episode support pose changed during reset render sync: "
+                f"{support_after_render}"
+            )
+        if (
+            post_render_pose_report.get("available") is not True
+            or post_render_pose_report.get("within_tolerance") is not True
+        ):
+            raise RuntimeError(
+                "object pose changed during reset Fabric/render synchronization: "
+                f"{post_render_pose_report}"
+            )
         self.refresh_viewport(reason="reset_episode")
 
     def read(self) -> SimulationState:
@@ -489,12 +2665,19 @@ class IsaacLabNavigationRuntime:
             )
 
         robot = self._adapter.robot
+        self._update_gripper_symmetry_report(robot)
         self._consume_pending_arm_tracking_target(robot)
         root_position = robot.data.root_pos_w[0]
         root_quaternion = robot.data.root_quat_w[0]
         root_linear = robot.data.root_lin_vel_w[0]
         root_angular = robot.data.root_ang_vel_w[0]
         object_pose, object_velocity = self._read_object_state()
+        tcp_pose = self._read_tcp_pose()
+        self._update_wrist_camera_object_clearance(
+            tcp_pose_world=tcp_pose,
+            object_pose_world=object_pose,
+        )
+        camera_images = self._read_camera_images()
         metadata = {
             **self._metadata,
             "environment_terminated": self._environment_terminated,
@@ -522,15 +2705,85 @@ class IsaacLabNavigationRuntime:
             ),
             joint_positions=_as_tuple(robot.data.joint_pos[0]),
             joint_velocities=_as_tuple(robot.data.joint_vel[0]),
-            tcp_pose=self._read_tcp_pose(),
+            tcp_pose=tcp_pose,
             object_pose=object_pose,
             object_velocity=object_velocity,
-            camera_images=self._read_camera_images(),
+            camera_images=camera_images,
             metadata=metadata,
         )
 
+    def _update_gripper_symmetry_report(self, robot: Any) -> None:
+        """汇总 mimic 两指实际开度；仅报告，不改变数据列或物理状态。"""
+
+        joint_ids = tuple(int(index) for index in self._adapter.gripper_joint_ids)
+        tolerance = float(self._config.gripper_symmetry_tolerance_m)
+        previous = self._metadata.get("gripper_symmetry_report")
+        previous = previous if isinstance(previous, dict) else {}
+        if len(joint_ids) != 2:
+            self._metadata["gripper_symmetry_report"] = {
+                "available": False,
+                "required_for_training": True,
+                "reason": "gripper_state_joint_id_count_mismatch",
+                "joint_ids": joint_ids,
+                "sample_count": int(previous.get("sample_count") or 0),
+                "max_abs_error_m": float(previous.get("max_abs_error_m") or 0.0),
+                "tolerance_m": tolerance,
+                "verified": False,
+            }
+            return
+
+        positions = tuple(
+            _item(value) for value in robot.data.joint_pos[0, list(joint_ids)]
+        )
+        error = abs(positions[0] - positions[1])
+        sample_count = int(previous.get("sample_count") or 0) + 1
+        violation_count = int(previous.get("violation_count") or 0)
+        if error > tolerance:
+            violation_count += 1
+        max_error = max(float(previous.get("max_abs_error_m") or 0.0), error)
+        self._metadata["gripper_symmetry_report"] = {
+            "available": True,
+            "required_for_training": True,
+            "joint_names": tuple(self._config.gripper_joint_names),
+            "joint_ids": joint_ids,
+            "master_joint_name": self._config.gripper_joint_names[0],
+            "follower_joint_name": self._config.gripper_joint_names[1],
+            "follower_control_mode": "hard_physx_mimic_only",
+            "physical_control_mode": "single_master_hard_physx_mimic",
+            "sample_count": sample_count,
+            "violation_count": violation_count,
+            "latest_positions_m": positions,
+            "latest_abs_error_m": error,
+            "max_abs_error_m": max_error,
+            "tolerance_m": tolerance,
+            "verified": max_error <= tolerance,
+        }
+
     def apply(self, action: RobotAction) -> None:
         self._require_ready()
+        if getattr(self, "_grasp_fixed_joint_active", False) and (
+            action.gripper_command == "open"
+            or action.metadata.get("event_marker") == "gripper_open"
+        ):
+            self.release_grasp_constraint(reason="first_gripper_open_command")
+        if action.metadata.get("skip_physics_step") is True:
+            # ``skip_physics_step`` 是严格的无物理事务：既不能推进 PhysX，也不能
+            # 提前推进 RL policy warmup、ActionManager history 或 actuator target。
+            # 否则 reset 审计帧会吞掉第一条 warmup action，真正的首个物理步从
+            # 第二条 action 开始，在不规则碰撞地面上会产生明显冲击甚至把机器狗
+            # 直接打翻。状态机动作仍保留在 recorder/last_action 中用于审计。
+            self._last_action = action
+            self._action_prepared = False
+            self._metadata["last_no_physics_action_report"] = {
+                "skipped": True,
+                "source": action.source,
+                "skip_reason": action.metadata.get("skip_reason"),
+                "policy_action_processed": False,
+                "action_history_advanced": False,
+                "physics_step_required": False,
+            }
+            return
+        self._apply_object_initialization_pose_stabilization(action)
         self._configure_manipulation_base_lock(action)
         arm_report = self._stage_arm_target(action)
         gripper_report = self._stage_gripper_target(action)
@@ -539,6 +2792,7 @@ class IsaacLabNavigationRuntime:
         else:
             self._adapter.apply_base_command(*action.base_velocity)
         policy_action = self._adapter.compute_policy_action(refresh_observations=True)
+        self._update_velocity_command_visualization(action)
         self._runtime.action_manager.process_action(policy_action.to(self._runtime.device))
         self._last_action = action
         self._metadata["last_arm_action_report"] = arm_report
@@ -546,28 +2800,92 @@ class IsaacLabNavigationRuntime:
         self._record_joint_action_apply(action, arm_report, gripper_report)
         self._action_prepared = True
 
+    def _update_velocity_command_visualization(self, action: RobotAction) -> None:
+        """按控制 tick 绘制实际进入 locomotion policy 的速度命令。"""
+
+        if not self._config.show_velocity_command_debug:
+            return
+        from source.diagnostics.planned_trajectories import draw_velocity_command
+
+        pose = self._adapter.get_base_pose_full()
+        effective_command_getter = getattr(
+            self._adapter,
+            "get_effective_base_command",
+            None,
+        )
+        effective_command = (
+            effective_command_getter()
+            if callable(effective_command_getter)
+            else action.base_velocity
+        )
+        report = draw_velocity_command(
+            robot_root_pose=(
+                float(pose["x"]),
+                float(pose["y"]),
+                float(pose["z"]),
+                *(float(value) for value in pose["quat_wxyz"]),
+            ),
+            base_velocity=effective_command,
+            source=action.source,
+        )
+        self._metadata["velocity_command_visualization"] = {
+            **report,
+            "requested_base_velocity": [
+                float(value) for value in action.base_velocity
+            ],
+            "effective_base_velocity": [
+                float(value) for value in effective_command
+            ],
+        }
+
     def _configure_manipulation_base_lock(self, action: RobotAction) -> None:
         """按状态机请求启停 root/support lock，并记录非纯物理 provenance。"""
 
-        requested = bool(action.metadata.get("manipulation_base_lock", False))
-        phase = action.metadata.get("manipulation_base_lock_phase")
-        if requested and not self._manipulation_base_lock_active:
-            report = self._adapter.set_base_pose_lock(True)
+        manipulation_requested = bool(action.metadata.get("manipulation_base_lock", False))
+        navigation_requested = bool(action.metadata.get("navigation_base_pose_lock", False))
+        requested = manipulation_requested or navigation_requested
+        phase = (
+            action.metadata.get("navigation_base_pose_lock_phase")
+            if navigation_requested
+            else action.metadata.get("manipulation_base_lock_phase")
+        )
+        pose_xyzyaw = _coerce_xyzyaw(
+            action.metadata.get("navigation_base_pose_lock_xyzyaw")
+        )
+        if navigation_requested and pose_xyzyaw is None:
+            raise RuntimeError(
+                "navigation base pose lock requires navigation_base_pose_lock_xyzyaw"
+            )
+        should_update_pose = navigation_requested and pose_xyzyaw is not None
+        base_lock_was_active = self._manipulation_base_lock_active
+        if requested and (
+            not base_lock_was_active or should_update_pose
+        ):
+            report = self._adapter.set_base_pose_lock(True, pose_xyzyaw=pose_xyzyaw)
             if report.get("enabled") is not True:
                 raise RuntimeError(f"failed to enable manipulation base lock: {report}")
             self._manipulation_base_lock_active = True
-            self._metadata.update(
-                {
-                    "used_base_teleport": True,
-                    "used_manipulation_base_lock": True,
-                    "manipulation_base_lock_active": True,
-                    "last_manipulation_base_lock_report": {
-                        **report,
-                        "transition": "enabled",
-                        "phase": phase,
-                    },
-                }
-            )
+            base_report = {
+                **report,
+                "transition": (
+                    "updated"
+                    if base_lock_was_active and should_update_pose
+                    else "enabled"
+                ),
+                "phase": phase,
+                "source": "navigation" if navigation_requested else "manipulation",
+            }
+            metadata_update = {
+                "used_base_teleport": True,
+                "manipulation_base_lock_active": True,
+                "last_manipulation_base_lock_report": base_report,
+            }
+            if manipulation_requested:
+                metadata_update["used_manipulation_base_lock"] = True
+            if navigation_requested:
+                metadata_update["used_navigation_base_lock"] = True
+                metadata_update["last_navigation_base_lock_report"] = base_report
+            self._metadata.update(metadata_update)
         if not requested and self._manipulation_base_lock_active:
             report = self._adapter.set_base_pose_lock(False)
             self._manipulation_base_lock_active = False
@@ -579,10 +2897,25 @@ class IsaacLabNavigationRuntime:
                         "transition": "disabled",
                         "phase": phase,
                     },
+                    "last_navigation_base_lock_report": {
+                        **report,
+                        "transition": "disabled",
+                        "phase": phase,
+                    },
                 }
             )
-        support_requested = bool(action.metadata.get("manipulation_support_joint_lock", False))
-        support_phase = action.metadata.get("manipulation_support_joint_lock_phase")
+        manipulation_support_requested = bool(action.metadata.get("manipulation_support_joint_lock", False))
+        navigation_support_requested = bool(action.metadata.get("navigation_support_joint_lock", False))
+        support_requested = manipulation_support_requested or navigation_support_requested
+        support_phase = (
+            action.metadata.get("navigation_support_joint_lock_phase")
+            if navigation_support_requested
+            else action.metadata.get("manipulation_support_joint_lock_phase")
+        )
+        navigation_dog_joint_positions = action.metadata.get(
+            "navigation_dog_joint_positions"
+        )
+        navigation_dog_joint_names = action.metadata.get("navigation_dog_joint_names")
         if support_requested and not self._manipulation_support_joint_lock_active:
             if not hasattr(self._adapter, "set_support_joint_lock"):
                 report = {
@@ -590,20 +2923,42 @@ class IsaacLabNavigationRuntime:
                     "reason": "adapter_missing_set_support_joint_lock",
                 }
             else:
-                report = self._adapter.set_support_joint_lock(True)
+                if navigation_support_requested:
+                    report = self._adapter.set_support_joint_lock(
+                        True,
+                        dog_joint_target=navigation_dog_joint_positions,
+                        dog_joint_names=navigation_dog_joint_names,
+                    )
+                else:
+                    report = self._adapter.set_support_joint_lock(True)
             self._manipulation_support_joint_lock_active = bool(report.get("enabled"))
-            self._metadata.update(
-                {
-                    "used_direct_joint_state": bool(report.get("uses_direct_joint_state", False)),
-                    "used_manipulation_support_joint_lock": bool(report.get("enabled")),
-                    "manipulation_support_joint_lock_active": bool(report.get("enabled")),
-                    "last_manipulation_support_joint_lock_report": {
-                        **report,
-                        "transition": "enabled",
-                        "phase": support_phase,
-                    },
-                }
-            )
+            support_report = {
+                **report,
+                "transition": "enabled",
+                "phase": support_phase,
+                "source": (
+                    "navigation"
+                    if navigation_support_requested
+                    else "manipulation"
+                ),
+            }
+            metadata_update = {
+                "used_direct_joint_state": bool(report.get("uses_direct_joint_state", False)),
+                "manipulation_support_joint_lock_active": bool(report.get("enabled")),
+                "last_manipulation_support_joint_lock_report": support_report,
+            }
+            if manipulation_support_requested:
+                metadata_update["used_manipulation_support_joint_lock"] = bool(
+                    report.get("enabled")
+                )
+            if navigation_support_requested:
+                metadata_update["used_navigation_support_joint_lock"] = bool(
+                    report.get("enabled")
+                )
+                metadata_update["last_navigation_support_joint_lock_report"] = (
+                    support_report
+                )
+            self._metadata.update(metadata_update)
         if not support_requested and self._manipulation_support_joint_lock_active:
             report = self._adapter.set_support_joint_lock(False)
             self._manipulation_support_joint_lock_active = False
@@ -615,8 +2970,307 @@ class IsaacLabNavigationRuntime:
                         "transition": "disabled",
                         "phase": support_phase,
                     },
+                    "last_navigation_support_joint_lock_report": {
+                        **report,
+                        "transition": "disabled",
+                        "phase": support_phase,
+                    },
                 }
             )
+        self._configure_navigation_joint_pose_lock(action)
+        self._configure_navigation_object_follow(
+            action,
+            root_target_xyzyaw=pose_xyzyaw,
+            navigation_base_lock_requested=navigation_requested,
+        )
+
+    def _configure_navigation_joint_pose_lock(self, action: RobotAction) -> None:
+        """楼梯漂移期间强制保持四足和机械臂姿态，避免 root 锁定拉出奇异构型。"""
+
+        requested = bool(action.metadata.get("navigation_full_body_joint_lock", False))
+        phase = action.metadata.get("navigation_full_body_joint_lock_phase")
+        if requested and not self._navigation_joint_pose_lock_active:
+            if not hasattr(self._adapter, "set_navigation_joint_pose_lock"):
+                report = {
+                    "enabled": False,
+                    "reason": "adapter_missing_set_navigation_joint_pose_lock",
+                }
+            else:
+                report = self._adapter.set_navigation_joint_pose_lock(
+                    True,
+                    arm_joint_target=action.arm_joint_positions,
+                    dog_joint_target=action.metadata.get(
+                        "navigation_dog_joint_positions"
+                    ),
+                    dog_joint_names=action.metadata.get("navigation_dog_joint_names"),
+                )
+            self._navigation_joint_pose_lock_active = bool(report.get("enabled"))
+            lock_report = {
+                **report,
+                "transition": "enabled",
+                "phase": phase,
+                "source": "navigation",
+            }
+            self._metadata.update(
+                {
+                    "used_navigation_joint_pose_lock": bool(report.get("enabled")),
+                    "used_direct_joint_state": (
+                        bool(self._metadata.get("used_direct_joint_state", False))
+                        or bool(report.get("uses_direct_joint_state", False))
+                    ),
+                    "navigation_joint_pose_lock_active": bool(report.get("enabled")),
+                    "last_navigation_joint_pose_lock_report": lock_report,
+                }
+            )
+        if not requested and self._navigation_joint_pose_lock_active:
+            report = self._adapter.set_navigation_joint_pose_lock(False)
+            self._navigation_joint_pose_lock_active = False
+            reset_policy_warmup = getattr(self._adapter, "reset_policy_warmup", None)
+            policy_warmup_reset = False
+            if callable(reset_policy_warmup):
+                # 楼梯漂移期间写过 root 和关节状态；解除 direct joint lock 后，
+                # 让 locomotion policy 重新渐入，避免第一帧目标阶跃。
+                reset_policy_warmup()
+                policy_warmup_reset = True
+            self._metadata.update(
+                {
+                    "navigation_joint_pose_lock_active": False,
+                    "last_navigation_joint_pose_lock_report": {
+                        **report,
+                        "transition": "disabled",
+                        "phase": phase,
+                        "source": "navigation",
+                        "policy_warmup_reset": policy_warmup_reset,
+                    },
+                }
+            )
+
+    def _configure_navigation_object_follow(
+        self,
+        action: RobotAction,
+        *,
+        root_target_xyzyaw: tuple[float, float, float, float] | None,
+        navigation_base_lock_requested: bool,
+    ) -> None:
+        """仅在 PCT 楼梯漂移期间同步携物，避免 root 写姿态时苹果留在原地。"""
+
+        requested = bool(action.metadata.get("navigation_carry_object_follow", False))
+        if requested and (
+            not navigation_base_lock_requested or root_target_xyzyaw is None
+        ):
+            raise RuntimeError(
+                "navigation carry object follow requires an active navigation base pose lock"
+            )
+        if requested:
+            self._navigation_object_follow_root_target = tuple(
+                float(value) for value in root_target_xyzyaw
+            )
+            if not self._navigation_object_follow_active:
+                self._capture_navigation_object_follow()
+            self._update_navigation_object_follow_target()
+            return
+        if self._navigation_object_follow_active:
+            self._release_navigation_object_follow()
+
+    def _capture_navigation_object_follow(self) -> None:
+        """保存物体相对 TCP 的刚体变换，并让 PhysX 暂停自由落体。"""
+
+        if self._object is None or self._adapter is None:
+            raise RuntimeError("navigation carry object follow requires robot and object handles")
+        tcp_pose = self._read_tcp_pose()
+        if tcp_pose is None:
+            raise RuntimeError("navigation carry object follow requires live TCP pose")
+        tcp_position = tuple(float(value) for value in tcp_pose[:3])
+        tcp_quaternion = _quat_normalize_wxyz(
+            tuple(float(value) for value in tcp_pose[3:7])  # type: ignore[arg-type]
+        )
+        object_position_raw, object_quaternion_raw = self._object.get_world_pose()
+        object_position = tuple(float(value) for value in _as_tuple(object_position_raw))
+        object_quaternion = _quat_normalize_wxyz(
+            tuple(float(value) for value in _as_tuple(object_quaternion_raw))  # type: ignore[arg-type]
+        )
+        inverse_tcp = _quat_conjugate_wxyz(tcp_quaternion)
+        relative_position = _quat_rotate_vector_wxyz(
+            inverse_tcp,
+            (
+                object_position[0] - tcp_position[0],
+                object_position[1] - tcp_position[1],
+                object_position[2] - tcp_position[2],
+            ),
+        )
+        relative_quaternion = _quat_normalize_wxyz(
+            _quat_multiply_wxyz(inverse_tcp, object_quaternion)
+        )
+        self._navigation_object_relative_pose = (
+            *relative_position,
+            *relative_quaternion,
+        )
+        self._navigation_object_follow_active = True
+        sleep_report = self._set_object_sleeping(enabled=True)
+        self._metadata.update(
+            {
+                "used_object_teleport": True,
+                "used_kinematic_object_follow": True,
+                "navigation_object_follow_active": True,
+                "last_navigation_object_follow_report": {
+                    "transition": "enabled",
+                    "relative_pose_tcp": list(self._navigation_object_relative_pose),
+                    "sleep_report": sleep_report,
+                },
+            }
+        )
+
+    def _update_navigation_object_follow_target(self) -> None:
+        """用实时 TCP 姿态和下一 root 目标计算本控制步的物体世界位姿。"""
+
+        relative_pose = self._navigation_object_relative_pose
+        root_target = self._navigation_object_follow_root_target
+        if relative_pose is None or root_target is None or self._adapter is None:
+            raise RuntimeError("navigation carry object follow state is incomplete")
+        tcp_pose = self._read_tcp_pose()
+        if tcp_pose is None:
+            raise RuntimeError("navigation carry object follow requires live TCP pose")
+        robot = self._adapter.robot
+        root_position = tuple(float(value) for value in _as_tuple(robot.data.root_pos_w[0]))
+        root_quaternion = _quat_normalize_wxyz(
+            tuple(float(value) for value in _as_tuple(robot.data.root_quat_w[0]))  # type: ignore[arg-type]
+        )
+        tcp_position = tuple(float(value) for value in tcp_pose[:3])
+        tcp_quaternion = _quat_normalize_wxyz(
+            tuple(float(value) for value in tcp_pose[3:7])  # type: ignore[arg-type]
+        )
+        inverse_root = _quat_conjugate_wxyz(root_quaternion)
+        tcp_position_root = _quat_rotate_vector_wxyz(
+            inverse_root,
+            (
+                tcp_position[0] - root_position[0],
+                tcp_position[1] - root_position[1],
+                tcp_position[2] - root_position[2],
+            ),
+        )
+        tcp_quaternion_root = _quat_normalize_wxyz(
+            _quat_multiply_wxyz(inverse_root, tcp_quaternion)
+        )
+        target_root_position = (root_target[0], root_target[1], root_target[2])
+        target_root_quaternion = _quat_wxyz_from_rpy(0.0, 0.0, root_target[3])
+        rotated_tcp_position = _quat_rotate_vector_wxyz(
+            target_root_quaternion,
+            tcp_position_root,
+        )
+        target_tcp_position = (
+            target_root_position[0] + rotated_tcp_position[0],
+            target_root_position[1] + rotated_tcp_position[1],
+            target_root_position[2] + rotated_tcp_position[2],
+        )
+        target_tcp_quaternion = _quat_normalize_wxyz(
+            _quat_multiply_wxyz(
+                target_root_quaternion,
+                tcp_quaternion_root,
+            )
+        )
+        rotated_object_position = _quat_rotate_vector_wxyz(
+            target_tcp_quaternion,
+            (relative_pose[0], relative_pose[1], relative_pose[2]),
+        )
+        target_object_position = (
+            target_tcp_position[0] + rotated_object_position[0],
+            target_tcp_position[1] + rotated_object_position[1],
+            target_tcp_position[2] + rotated_object_position[2],
+        )
+        target_object_quaternion = _quat_normalize_wxyz(
+            _quat_multiply_wxyz(
+                target_tcp_quaternion,
+                tuple(relative_pose[3:7]),  # type: ignore[arg-type]
+            )
+        )
+        self._navigation_object_follow_target_pose = (
+            *target_object_position,
+            *target_object_quaternion,
+        )
+
+    def _release_navigation_object_follow(self) -> None:
+        """在楼梯漂移结束后恢复动态物理，并保留夹爪闭合产生的真实约束。"""
+
+        self._apply_active_navigation_object_follow(timing="before_release")
+        rigid_view = getattr(self._object, "_rigid_prim_view", None)
+        if rigid_view is None or not hasattr(rigid_view, "set_velocities"):
+            raise RuntimeError("navigation carry object follow requires rigid velocity API")
+        import torch
+
+        rigid_view.set_velocities(
+            torch.zeros(
+                (1, 6),
+                dtype=torch.float32,
+                device=getattr(self._runtime, "device", "cpu"),
+            )
+        )
+        wake_report = self._set_object_sleeping(enabled=False)
+        apply_count = int(self._metadata.get("navigation_object_follow_apply_count", 0))
+        self._navigation_object_follow_active = False
+        self._navigation_object_relative_pose = None
+        self._navigation_object_follow_root_target = None
+        self._navigation_object_follow_target_pose = None
+        self._metadata.update(
+            {
+                "navigation_object_follow_active": False,
+                "last_navigation_object_follow_report": {
+                    "transition": "disabled",
+                    "apply_count": apply_count,
+                    "wake_report": wake_report,
+                },
+            }
+        )
+
+    def _apply_active_navigation_object_follow(self, *, timing: str) -> None:
+        """把苹果写到当前 root 目标对应的夹持相对位姿。"""
+
+        if not self._navigation_object_follow_active:
+            return
+        target_pose = self._navigation_object_follow_target_pose
+        if target_pose is None or self._object is None:
+            raise RuntimeError("navigation carry object follow state is incomplete")
+        object_position = tuple(float(value) for value in target_pose[:3])
+        object_quaternion = tuple(float(value) for value in target_pose[3:7])
+        rigid_view = getattr(self._object, "_rigid_prim_view", None)
+        if (
+            rigid_view is None
+            or not hasattr(rigid_view, "set_world_poses")
+            or not hasattr(rigid_view, "set_velocities")
+        ):
+            raise RuntimeError("navigation carry object follow requires rigid pose APIs")
+        import torch
+
+        device = getattr(self._runtime, "device", "cpu")
+        rigid_view.set_world_poses(
+            positions=torch.tensor(
+                [object_position],
+                dtype=torch.float32,
+                device=device,
+            ),
+            orientations=torch.tensor(
+                [object_quaternion],
+                dtype=torch.float32,
+                device=device,
+            ),
+        )
+        rigid_view.set_velocities(
+            torch.zeros((1, 6), dtype=torch.float32, device=device)
+        )
+        apply_count = int(
+            self._metadata.get("navigation_object_follow_apply_count", 0)
+        ) + 1
+        self._metadata.update(
+            {
+                "navigation_object_follow_active": True,
+                "navigation_object_follow_apply_count": apply_count,
+                "last_navigation_object_follow_report": {
+                    "transition": "applied",
+                    "timing": timing,
+                    "apply_count": apply_count,
+                    "object_pose": [*object_position, *object_quaternion],
+                },
+            }
+        )
 
     def _apply_active_manipulation_base_lock(self, *, timing: str) -> None:
         if self._manipulation_base_lock_active:
@@ -635,6 +3289,7 @@ class IsaacLabNavigationRuntime:
                     },
                 }
             )
+        self._apply_active_navigation_object_follow(timing=timing)
         if self._manipulation_support_joint_lock_active:
             report = self._adapter.apply_support_joint_lock()
             if report.get("applied") is not True:
@@ -647,6 +3302,31 @@ class IsaacLabNavigationRuntime:
                     "manipulation_support_joint_lock_active": True,
                     "manipulation_support_joint_lock_apply_count": apply_count,
                     "last_manipulation_support_joint_lock_report": {
+                        **report,
+                        "timing": timing,
+                        "apply_count": apply_count,
+                    },
+                }
+            )
+        if self._navigation_joint_pose_lock_active:
+            if not hasattr(self._adapter, "apply_navigation_joint_pose_lock"):
+                raise RuntimeError("navigation joint pose lock adapter method is unavailable")
+            report = self._adapter.apply_navigation_joint_pose_lock()
+            if report.get("applied") is not True:
+                raise RuntimeError(f"navigation joint pose lock was not applied: {report}")
+            apply_count = int(
+                self._metadata.get("navigation_joint_pose_lock_apply_count", 0)
+            ) + 1
+            self._metadata.update(
+                {
+                    "used_navigation_joint_pose_lock": True,
+                    "used_direct_joint_state": (
+                        bool(self._metadata.get("used_direct_joint_state", False))
+                        or bool(report.get("uses_direct_joint_state", False))
+                    ),
+                    "navigation_joint_pose_lock_active": True,
+                    "navigation_joint_pose_lock_apply_count": apply_count,
+                    "last_navigation_joint_pose_lock_report": {
                         **report,
                         "timing": timing,
                         "apply_count": apply_count,
@@ -747,8 +3427,17 @@ class IsaacLabNavigationRuntime:
             raise RuntimeError("apply must be called before step")
 
         is_rendering = bool(render or self._runtime.sim.has_rtx_sensors())
+        profiler = self._performance_profiler
+        control_started_at = time.perf_counter()
+        started_at = time.perf_counter()
         self._runtime.recorder_manager.record_pre_step()
+        if profiler is not None:
+            profiler.record(
+                "runtime.recorder_pre_step",
+                time.perf_counter() - started_at,
+            )
         for _ in range(self._runtime.cfg.decimation):
+            prepare_started_at = time.perf_counter()
             self._runtime._sim_step_counter += 1
             self._apply_active_manipulation_base_lock(timing="before_physics_step")
             self._runtime.action_manager.apply_action()
@@ -757,24 +3446,69 @@ class IsaacLabNavigationRuntime:
             self._apply_active_manipulation_base_lock(timing="after_action_manager")
             self._apply_staged_joint_position_targets(timing="after_action_manager")
             self._runtime.scene.write_data_to_sim()
+            if profiler is not None:
+                profiler.record(
+                    "runtime.physics_prepare",
+                    time.perf_counter() - prepare_started_at,
+                )
             # 这里只有 runtime 执行底层 physics step，调用权来自 pipeline 唯一主循环。
+            physics_started_at = time.perf_counter()
             self._runtime.sim.step(render=False)
+            if profiler is not None:
+                profiler.record(
+                    "runtime.physics_step",
+                    time.perf_counter() - physics_started_at,
+                )
+            post_started_at = time.perf_counter()
             self._apply_active_manipulation_base_lock(timing="after_physics_step")
             self._runtime.recorder_manager.record_post_physics_decimation_step()
+            if profiler is not None:
+                profiler.record(
+                    "runtime.physics_post_step",
+                    time.perf_counter() - post_started_at,
+                )
             if (
                 is_rendering
                 and self._runtime._sim_step_counter % self._runtime.cfg.sim.render_interval == 0
             ):
+                render_started_at = time.perf_counter()
                 self._runtime.sim.render()
+                self._mark_camera_render(
+                    valid_state_step=self._step_calls + 1,
+                    reason="control_render_grid",
+                )
+                if profiler is not None:
+                    profiler.record(
+                        "runtime.rtx_render",
+                        time.perf_counter() - render_started_at,
+                    )
+            scene_update_started_at = time.perf_counter()
             self._runtime.scene.update(dt=self._runtime.physics_dt)
+            if profiler is not None:
+                profiler.record(
+                    "runtime.scene_update",
+                    time.perf_counter() - scene_update_started_at,
+                )
 
+        finish_started_at = time.perf_counter()
         self._finish_control_step()
+        if profiler is not None:
+            profiler.record(
+                "runtime.finish_control_step",
+                time.perf_counter() - finish_started_at,
+            )
+            profiler.record(
+                "runtime.control_step_total",
+                time.perf_counter() - control_started_at,
+            )
         self._step_calls += 1
         self._action_prepared = False
 
     def close(self) -> None:
         if self._closed:
             return
+        if getattr(self, "_grasp_fixed_joint_active", False):
+            self.release_grasp_constraint(reason="runtime_close")
         if self._env is not None:
             self._env.close()
         self._closed = True
@@ -803,6 +3537,9 @@ class IsaacLabNavigationRuntime:
             agent_cfg: RslRlBaseRunnerCfg,
         ) -> None:
             self._metadata["visual_scene_report"] = self._load_visual_scene(episode_spec)
+            self._metadata["d436_lens_distortion_schema_report"] = (
+                _enable_d436_lens_distortion_schema()
+            )
             self._configure_env(env_cfg, episode_spec, sim_utils)
             env_cfg.seed = int(agent_cfg.seed)
             env = gym.make(
@@ -813,9 +3550,13 @@ class IsaacLabNavigationRuntime:
                     if (
                         self._config.enable_front_camera
                         or self._config.enable_wrist_camera
+                        or self._config.enable_overview_camera
                     )
                     else None
                 ),
+            )
+            self._metadata["camera_runtime_intrinsics_report"] = (
+                self._apply_d436_runtime_intrinsics(env.unwrapped)
             )
             if self._config.patch_gripper_collision or self._config.patch_apple_collision:
                 from source.simulation.collision_patch import (
@@ -846,18 +3587,51 @@ class IsaacLabNavigationRuntime:
                             "patch_count": 0,
                         }
                     )
-            # collision patch 可能取消实例化并重新组合苹果 prim；reset 和相机采集前再隐藏一次。
+            # collision patch 可能取消实例化并重新组合苹果 prim；相机采集前重新显示任务物体。
             import omni.usd
 
             stage_after_collision_patch = omni.usd.get_context().get_stage()
+            gripper_physics_report = _inspect_gripper_physics_control(
+                stage_after_collision_patch
+            )
+            self._metadata["gripper_physics_control_report"] = (
+                gripper_physics_report
+            )
+            if not gripper_physics_report["verified"]:
+                raise RuntimeError(
+                    "X5 gripper physics control preflight failed: "
+                    f"{json.dumps(gripper_physics_report, ensure_ascii=False)}"
+                )
+            self._metadata["object_visibility_after_spawn_report"] = (
+                self._show_only_task_object(stage_after_collision_patch, episode_spec)
+                if stage_after_collision_patch is not None
+                else {"applied": False, "reason": "usd_stage_unavailable"}
+            )
             self._metadata["object_collision_visual_hide_after_spawn_report"] = (
                 self._hide_object_collision_visual(stage_after_collision_patch)
+                if stage_after_collision_patch is not None
+                else {"applied": False, "reason": "usd_stage_unavailable"}
+            )
+            self._metadata["scene_lighting_after_spawn_report"] = (
+                self._configure_scene_lighting(
+                    stage_after_collision_patch,
+                    reason="after_spawn",
+                )
                 if stage_after_collision_patch is not None
                 else {"applied": False, "reason": "usd_stage_unavailable"}
             )
             wrapped = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
             # wrapper 构造时会触发 env.reset；GUI viewport 只在 reset 完成后切相机。
             self.refresh_viewport(reason="environment_reset")
+            stage_after_reset = omni.usd.get_context().get_stage()
+            self._metadata["scene_lighting_after_reset_report"] = (
+                self._configure_scene_lighting(
+                    stage_after_reset,
+                    reason="after_environment_reset",
+                )
+                if stage_after_reset is not None
+                else {"applied": False, "reason": "usd_stage_unavailable"}
+            )
             checkpoint = retrieve_file_path(str(self._resolve_checkpoint()))
             if agent_cfg.class_name == "OnPolicyRunner":
                 runner = OnPolicyRunner(
@@ -877,7 +3651,13 @@ class IsaacLabNavigationRuntime:
                 raise ValueError(f"unsupported runner class: {agent_cfg.class_name}")
             runner.load(checkpoint)
             policy = runner.get_inference_policy(device=wrapped.unwrapped.device)
-            adapter = Go2LocomotionAdapter(wrapped, policy, wrapped.get_observations())
+            adapter = Go2LocomotionAdapter(
+                wrapped,
+                policy,
+                wrapped.get_observations(),
+                standing_command_threshold=self._config.standing_command_threshold,
+                policy_action_warmup_steps=self._config.policy_action_warmup_steps,
+            )
             build_result.update({"env": wrapped, "runtime": wrapped.unwrapped, "adapter": adapter})
 
         original_argv = sys.argv
@@ -893,12 +3673,72 @@ class IsaacLabNavigationRuntime:
         self._runtime = build_result["runtime"]
         self._adapter = build_result["adapter"]
         self._initialize_object_reader(episode_spec)
+        self._initialize_episode_support_readers(episode_spec)
         self._metadata["object_pose_debug_after_physics_reader"] = (
             self._object_initial_pose_diagnostic(
                 episode_spec,
                 label="after_object_reader_initialize",
             )
         )
+
+    def _apply_d436_runtime_intrinsics(self, runtime: Any) -> dict[str, Any]:
+        """让 IsaacLab 对外暴露的 K 与 OpenCV schema 的实际渲染内参一致。"""
+
+        camera_sensors = []
+        if self._config.enable_front_camera:
+            camera_sensors.append(("front", "head_camera"))
+        if self._config.enable_wrist_camera:
+            camera_sensors.append(("wrist", "arm_camera"))
+        report: dict[str, Any] = {
+            "applied": True,
+            "intrinsics": _d436_camera_intrinsics_metadata(),
+            "cameras": {},
+        }
+        for camera_name, sensor_name in camera_sensors:
+            try:
+                sensor = runtime.scene[sensor_name]
+                matrices = sensor._data.intrinsic_matrices
+                sensor_prims = sensor._sensor_prims
+                camera_prim = sensor_prims[0].GetPrim()
+                model_attribute = camera_prim.GetAttribute("omni:lensdistortion:model")
+                renderer_schema_applied = bool(
+                    model_attribute.IsValid()
+                    and model_attribute.Get() == "opencvPinhole"
+                )
+                if renderer_schema_applied:
+                    matrix_count = _overwrite_d436_intrinsic_matrices(matrices)
+                    effective_intrinsics = {
+                        "fx": D436_CAMERA_FX_PX,
+                        "fy": D436_CAMERA_FY_PX,
+                        "cx": D436_CAMERA_CX_PX,
+                        "cy": D436_CAMERA_CY_PX,
+                    }
+                else:
+                    matrix_count = _overwrite_d436_fallback_intrinsic_matrices(
+                        matrices
+                    )
+                    effective_intrinsics = {
+                        "fx": D436_CAMERA_FALLBACK_FX_FY_PX,
+                        "fy": D436_CAMERA_FALLBACK_FX_FY_PX,
+                        "cx": D436_CAMERA_FALLBACK_CX_PX,
+                        "cy": D436_CAMERA_FALLBACK_CY_PX,
+                    }
+            except (KeyError, AttributeError, TypeError, ValueError) as exc:
+                report["applied"] = False
+                report["cameras"][camera_name] = {
+                    "applied": False,
+                    "sensor_name": sensor_name,
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+                continue
+            report["cameras"][camera_name] = {
+                "applied": True,
+                "sensor_name": sensor_name,
+                "matrix_count": matrix_count,
+                "renderer_schema_applied": renderer_schema_applied,
+                "effective_intrinsics": effective_intrinsics,
+            }
+        return report
 
     def _robot_prim_path(self) -> str:
         """兼容不同 Isaac Lab 版本的 Articulation 路径字段。"""
@@ -916,35 +3756,116 @@ class IsaacLabNavigationRuntime:
         from isaaclab.terrains import TerrainImporterCfg
         from source.navigation.adapters.terrain_utils import write_collision_terrain_wrapper
 
+        if self._config.render_antialiasing_mode is not None:
+            mode = str(self._config.render_antialiasing_mode)
+            if mode not in {"Off", "FXAA", "DLSS", "TAA", "DLAA"}:
+                raise ValueError(f"不支持的渲染抗锯齿模式：{mode}")
+            env_cfg.sim.render.antialiasing_mode = mode
+            self._metadata["render_antialiasing_report"] = {
+                "configured": True,
+                "mode": mode,
+                "source": "scene_profile",
+            }
+
         scene_usd = self._resolve_path(episode_spec.scene_usd)
-        stage_report = self._validate_scene_collision(scene_usd, self._config.terrain_prim_path)
+        scene_runtime = resolve_scene_runtime_settings(
+            episode_spec.raw_task,
+            default_collision_prim_path=self._config.terrain_prim_path,
+            default_visual_prim_path=self._config.visual_prim_path,
+            default_collision_floor_proxy_profile=(
+                self._config.collision_floor_proxy_profile
+            ),
+        )
+        collision_prim_path = str(scene_runtime["collision_prim_path"])
+        floor_proxy_profile = scene_runtime["collision_floor_proxy_profile"]
+        self._metadata["scene_runtime_settings"] = scene_runtime
+        from source.simulation.task_scene_pose import resolve_task_receptacle_pose
+
+        receptacle_pose_settings = resolve_task_receptacle_pose(
+            episode_spec.raw_task
+        )
+        if receptacle_pose_settings["configured"]:
+            # 源 USDA 只保存模板位姿；episode 覆盖必须在组合 stage 中验证，
+            # 否则会把预期的随机位移误报为资产漂移。
+            self._metadata["task_receptacle_support_source_report"] = {
+                "source": "isaaclab_source_scene_usd",
+                "geometry_verified": None,
+                "skipped": True,
+                "reason": "episode_receptacle_pose_requires_composed_stage",
+                "receptacle_pose": receptacle_pose_settings,
+            }
+        else:
+            self._metadata["task_receptacle_support_source_report"] = (
+                inspect_task_receptacle_support_usd(
+                    scene_usd,
+                    episode_spec.raw_task,
+                    source="isaaclab_source_scene_usd",
+                )
+            )
+        stage_report = self._validate_scene_collision(
+            scene_usd,
+            collision_prim_path,
+        )
         self._metadata["stage_report"] = stage_report
         terrain_usd = write_collision_terrain_wrapper(
             scene_usd,
-            self._config.terrain_prim_path,
+            collision_prim_path,
+            floor_proxy_profile=floor_proxy_profile,
+            source_prim_is_mesh=bool(stage_report["collision_root_is_mesh"]),
         )
+        wrapper_stage_report = self._validate_scene_collision(
+            terrain_usd,
+            "/scene_collision",
+        )
+        self._metadata["collision_terrain_wrapper_report"] = wrapper_stage_report
+        self._metadata["collision_floor_proxy_report"] = {
+            "profile": floor_proxy_profile,
+            "source_collision_prim_path": collision_prim_path,
+            "terrain_wrapper": str(terrain_usd),
+        }
         env_cfg.scene.num_envs = 1
+        env_cfg.scene.env_spacing = 0.0
         env_cfg.sim.device = self._config.device
+        env_cfg.sim.render_interval = int(env_cfg.decimation) * int(
+            self._config.camera_render_interval_control_steps
+        )
+        self._metadata["camera_render_schedule"] = {
+            "control_interval_steps": int(
+                self._config.camera_render_interval_control_steps
+            ),
+            "physics_interval_steps": int(env_cfg.sim.render_interval),
+            "control_dt": float(env_cfg.sim.dt) * int(env_cfg.decimation),
+            "render_hz": 1.0
+            / (float(env_cfg.sim.dt) * float(env_cfg.sim.render_interval)),
+            "physics_dt_unchanged": float(env_cfg.sim.dt),
+            "decimation_unchanged": int(env_cfg.decimation),
+        }
         env_cfg.scene.terrain = TerrainImporterCfg(
             prim_path="/World/nav_collision",
             terrain_type="usd",
             usd_path=str(terrain_usd),
             debug_vis=False,
         )
-        env_cfg.events.randomize_reset_base.params = {
-            "pose_range": {
-                "x": (episode_spec.start.x, episode_spec.start.x),
-                "y": (episode_spec.start.y, episode_spec.start.y),
-                "z": (0.0, 0.0),
-                "roll": (0.0, 0.0),
-                "pitch": (0.0, 0.0),
-                "yaw": (episode_spec.start.yaw, episode_spec.start.yaw),
-            },
-            "velocity_range": {
-                key: (0.0, 0.0)
-                for key in ("x", "y", "z", "roll", "pitch", "yaw")
-            },
+        # TerrainImporter 会把 USD default prim 生成在 ``<prim_path>/terrain``；
+        # RayCaster 只接受 Mesh prim，不能绑定外层 ``/World/nav_collision`` 容器。
+        terrain_mesh_prim_path = f"{env_cfg.scene.terrain.prim_path}/terrain"
+        updated_height_scanners = _retarget_height_scanners(
+            env_cfg.scene,
+            terrain_mesh_prim_path,
+        )
+        self._metadata["height_scanner_terrain_report"] = {
+            "terrain_prim_path": env_cfg.scene.terrain.prim_path,
+            "terrain_mesh_prim_path": terrain_mesh_prim_path,
+            "updated_sensors": updated_height_scanners,
         }
+        default_root_pos = tuple(float(value) for value in env_cfg.scene.robot.init_state.pos)
+        self._default_robot_root_pos = default_root_pos
+        reset_params, reset_report = _episode_reset_pose_configuration(
+            episode_spec,
+            default_root_pos=default_root_pos,
+        )
+        env_cfg.events.randomize_reset_base.params = reset_params
+        self._metadata["episode_reset_pose_request"] = reset_report
         env_cfg.observations.policy.enable_corruption = False
         for event_name in (
             "randomize_rigid_body_material",
@@ -995,23 +3916,38 @@ class IsaacLabNavigationRuntime:
                 keyword_contact_offset=self._config.apple_collision_contact_offset,
                 keyword_rest_offset=self._config.apple_collision_rest_offset,
             )
+        self._metadata["camera_sensor_selection_report"] = (
+            _disable_unrequested_camera_sensors(
+                env_cfg.scene,
+                front=self._config.enable_front_camera,
+                wrist=self._config.enable_wrist_camera,
+                overview=self._config.enable_overview_camera,
+            )
+        )
         if self._config.enable_front_camera:
-            # 与 DWA/play_nav_cs.py 使用同一相机内参、外参和 ROS optical frame 约定。
+            _validate_d436_camera_calibration_resolution(
+                "front",
+                self._config.front_camera_width,
+                self._config.front_camera_height,
+            )
+            # 保留 DWA/play_nav_cs.py 的安装外参；内参改用 D436 640x480 标定值。
             env_cfg.scene.head_camera = CameraCfg(
-                prim_path="{ENV_REGEX_NS}/Robot/base/head_cam",
+                prim_path=FRONT_CAMERA_PRIM_PATH,
                 update_period=0.0,
                 height=self._config.front_camera_height,
                 width=self._config.front_camera_width,
                 data_types=["rgb"],
                 spawn=sim_utils.PinholeCameraCfg(
-                    focal_length=24.0,
+                    func=_make_d436_camera_spawn_function(),
+                    focal_length=D436_CAMERA_FALLBACK_FOCAL_LENGTH_MM,
                     focus_distance=400.0,
-                    horizontal_aperture=20.955,
+                    horizontal_aperture=D436_CAMERA_FALLBACK_HORIZONTAL_APERTURE_MM,
+                    vertical_aperture=D436_CAMERA_FALLBACK_VERTICAL_APERTURE_MM,
                     clipping_range=(0.1, 1.0e5),
                 ),
                 offset=CameraCfg.OffsetCfg(
-                    pos=(0.28, 0.0, 0.07),
-                    rot=(0.5, -0.5, 0.5, -0.5),
+                    pos=FRONT_CAMERA_MOUNT_POS_XYZ_M,
+                    rot=FRONT_CAMERA_MOUNT_ROT_WXYZ,
                     convention="ros",
                 ),
             )
@@ -1024,25 +3960,32 @@ class IsaacLabNavigationRuntime:
                 ],
                 "data_types": ["rgb"],
                 "source": "dwa_play_nav_cs",
+                "calibration": _front_camera_calibration_metadata(),
             }
         if self._config.enable_wrist_camera:
-            # 对齐 DWA ground-pick 的 arm_camera：挂在稳定存在的 arm_link6，
-            # 相机原点于夹爪中心略微偏移，沿末端局部 +X 方向观察。
+            _validate_d436_camera_calibration_resolution(
+                "wrist",
+                self._config.wrist_camera_width,
+                self._config.wrist_camera_height,
+            )
+            # 使用 arm_link6_T_camera_color_optical 手眼标定结果。
             env_cfg.scene.arm_camera = CameraCfg(
-                prim_path="{ENV_REGEX_NS}/Robot/arm_link6/arm_vla_camera",
+                prim_path=WRIST_CAMERA_PRIM_PATH,
                 update_period=0.0,
                 height=self._config.wrist_camera_height,
                 width=self._config.wrist_camera_width,
                 data_types=["rgb"],
                 spawn=sim_utils.PinholeCameraCfg(
-                    focal_length=18.0,
+                    func=_make_d436_camera_spawn_function(),
+                    focal_length=D436_CAMERA_FALLBACK_FOCAL_LENGTH_MM,
                     focus_distance=400.0,
-                    horizontal_aperture=20.955,
-                    clipping_range=(0.03, 5.0),
+                    horizontal_aperture=D436_CAMERA_FALLBACK_HORIZONTAL_APERTURE_MM,
+                    vertical_aperture=D436_CAMERA_FALLBACK_VERTICAL_APERTURE_MM,
+                    clipping_range=(WRIST_CAMERA_NEAR_CLIPPING_M, 5.0),
                 ),
                 offset=CameraCfg.OffsetCfg(
-                    pos=(0.0, 0.0, 0.10),
-                    rot=(0.353553, -0.612372, 0.612372, -0.353553),
+                    pos=WRIST_CAMERA_MOUNT_POS_XYZ_M,
+                    rot=WRIST_CAMERA_MOUNT_ROT_WXYZ,
                     convention="ros",
                 ),
             )
@@ -1055,21 +3998,75 @@ class IsaacLabNavigationRuntime:
                     self._config.wrist_camera_width,
                 ],
                 "data_types": ["rgb"],
-                "source": "dwa_ground_pick_arm_camera",
+                "source": "hand_eye_calibration_with_visual_alignment_v3",
+                "calibration": _wrist_camera_calibration_metadata(),
             }
+        if self._config.enable_overview_camera:
+            import omni.usd
+            from pxr import UsdGeom
+
+            stage = omni.usd.get_context().get_stage()
+            overview_prim = (
+                None
+                if stage is None
+                else stage.GetPrimAtPath(self._config.overview_camera_prim_path)
+            )
+            if (
+                overview_prim is not None
+                and overview_prim.IsValid()
+                and overview_prim.IsA(UsdGeom.Camera)
+            ):
+                env_cfg.scene.overview_camera = CameraCfg(
+                    prim_path=self._config.overview_camera_prim_path,
+                    update_period=0.0,
+                    height=self._config.overview_camera_height,
+                    width=self._config.overview_camera_width,
+                    data_types=["rgb"],
+                    spawn=None,
+                )
+                self._metadata["overview_camera_report"] = {
+                    "enabled": True,
+                    "bound_existing_stage_camera": True,
+                    "name": "overview_camera",
+                    "prim_path": self._config.overview_camera_prim_path,
+                    "resolution_hw": [
+                        self._config.overview_camera_height,
+                        self._config.overview_camera_width,
+                    ],
+                    "data_types": ["rgb"],
+                    "source": "authored_stage_camera",
+                }
+            else:
+                self._metadata["overview_camera_report"] = {
+                    "enabled": False,
+                    "bound_existing_stage_camera": False,
+                    "prim_path": self._config.overview_camera_prim_path,
+                    "reason": "overview_camera_prim_unavailable",
+                }
 
     def _load_visual_scene(self, episode_spec: EpisodeSpec) -> dict[str, Any]:
         import omni.usd
         from source.navigation.adapters.terrain_utils import write_visual_sublayer_wrapper
 
+        scene_runtime = resolve_scene_runtime_settings(
+            episode_spec.raw_task,
+            default_collision_prim_path=self._config.terrain_prim_path,
+            default_visual_prim_path=self._config.visual_prim_path,
+            default_collision_floor_proxy_profile=(
+                self._config.collision_floor_proxy_profile
+            ),
+        )
+        collision_prim_path = str(scene_runtime["collision_prim_path"])
+        visual_prim_path = str(scene_runtime["visual_prim_path"])
         wrapper = write_visual_sublayer_wrapper(
             self._resolve_path(episode_spec.scene_usd),
-            self._config.visual_prim_path,
+            visual_prim_path,
             excluded_prim_paths=(
-                self._config.terrain_prim_path,
+                collision_prim_path,
                 "/World/go2_x5",
                 "/World/mec_arm_6dof",
             ),
+            include_visual_prim=self._config.enable_scene_visual,
         )
         context = omni.usd.get_context()
         stage = context.get_stage()
@@ -1082,6 +4079,39 @@ class IsaacLabNavigationRuntime:
         root_layer = stage.GetRootLayer()
         if str(wrapper) not in root_layer.subLayerPaths:
             root_layer.subLayerPaths.append(str(wrapper))
+        from source.simulation.task_scene_pose import apply_task_receptacle_pose
+
+        receptacle_pose_report = apply_task_receptacle_pose(
+            stage,
+            episode_spec.raw_task,
+        )
+        self._metadata["task_receptacle_pose_report"] = receptacle_pose_report
+        if self._config.enable_relocatable_episode_supports:
+            from source.simulation.task_scene_pose import (
+                configure_task_supports_for_stage_reuse,
+            )
+
+            relocatable_support_report = configure_task_supports_for_stage_reuse(
+                stage,
+                episode_spec.raw_task,
+            )
+        else:
+            relocatable_support_report = {
+                "enabled": False,
+                "configured_count": 0,
+                "reason": "single_episode_or_stage_reuse_disabled",
+            }
+        self._metadata["relocatable_episode_support_report"] = (
+            relocatable_support_report
+        )
+        receptacle_support_report = inspect_task_receptacle_support_stage(
+            stage,
+            episode_spec.raw_task,
+            source="isaaclab_visual_sublayer_stage",
+        )
+        self._metadata["task_receptacle_support_runtime_stage_report"] = (
+            receptacle_support_report
+        )
         self._metadata["object_pose_setup_report"] = self._apply_object_pose(episode_spec)
         object_visibility = self._show_only_task_object(stage, episode_spec)
         self._metadata["object_visibility_report"] = object_visibility
@@ -1089,20 +4119,56 @@ class IsaacLabNavigationRuntime:
         self._metadata["object_collision_visual_hide_report"] = (
             object_collision_visual_hide
         )
+        scene_lighting = self._configure_scene_lighting(stage, reason="visual_scene_loaded")
+        self._metadata["scene_lighting_report"] = scene_lighting
         return {
             "loaded": True,
             "load_mode": "sublayer",
             "wrapper_path": str(wrapper),
             "scene_usd": str(self._resolve_path(episode_spec.scene_usd)),
-            "visual_prim_path": self._config.visual_prim_path,
+            "visual_prim_path": visual_prim_path,
+            "collision_prim_path": collision_prim_path,
+            "scene_runtime_settings": scene_runtime,
+            "task_receptacle_support_report": receptacle_support_report,
+            "task_receptacle_pose_report": receptacle_pose_report,
+            "relocatable_episode_support_report": relocatable_support_report,
+            "scene_visual_enabled": self._config.enable_scene_visual,
             "excluded_prim_paths": (
-                self._config.terrain_prim_path,
+                collision_prim_path,
                 "/World/go2_x5",
                 "/World/mec_arm_6dof",
             ),
             "object_visibility": object_visibility,
             "object_collision_visual_hide": object_collision_visual_hide,
+            "scene_lighting": scene_lighting,
         }
+
+    def _configure_scene_lighting(self, stage: Any, *, reason: str) -> dict[str, Any]:
+        """根据 runtime 配置切换 stage light / camera light。"""
+
+        from source.simulation.lighting import (
+            configure_scene_lighting,
+            resolve_scene_light_mode,
+        )
+
+        requested_mode = str(self._config.scene_light_mode).lower()
+        resolved_mode = resolve_scene_light_mode(
+            requested_mode,
+            scene_visual_enabled=bool(self._config.enable_scene_visual),
+        )
+
+        report = configure_scene_lighting(
+            stage=stage,
+            mode=resolved_mode,
+            camera_light_name=self._config.camera_light_name,
+            camera_light_intensity=self._config.camera_light_intensity,
+            camera_light_radius=self._config.camera_light_radius,
+        )
+        report["reason"] = reason
+        report["requested_mode"] = requested_mode
+        report["resolved_mode"] = resolved_mode
+        report["scene_visual_enabled"] = bool(self._config.enable_scene_visual)
+        return report
 
     def _hide_object_collision_visual(self, stage: Any) -> dict[str, Any]:
         """隐藏 Apple_M_Apple 碰撞视觉层，避免相机采集到占位碰撞网格。"""
@@ -1119,7 +4185,7 @@ class IsaacLabNavigationRuntime:
         )
 
     def _show_only_task_object(self, stage: Any, episode_spec: EpisodeSpec) -> dict[str, Any]:
-        """复用 baseline 语义：隐藏 apple/orange/bottle 中的非任务物体。"""
+        """只保留任务物体，并停用非任务物体的渲染与物理。"""
 
         from pxr import Usd, UsdGeom
 
@@ -1128,13 +4194,20 @@ class IsaacLabNavigationRuntime:
             self._hidden_distractor_root_paths = ()
             return {"applied": False, "reason": "object_prim_path_missing"}
 
+        object_prim = stage.GetPrimAtPath(object_prim_path)
+        if object_prim.IsValid() and not object_prim.IsActive():
+            object_prim.SetActive(True)
+
         object_prefix = object_prim_path.rstrip("/") + "/"
         keywords = ("apple", "orange", "bottle")
         candidate_roots: list[str] = []
         hidden_paths: list[str] = []
         shown_paths: list[str] = []
+        deactivated_roots: list[str] = []
 
-        for prim in stage.Traverse():
+        # 第二次调用发生在 collision patch 之后；TraverseAll 才能重新发现
+        # 首次调用中已经停用的干扰物，并持续保留规划排除根路径。
+        for prim in stage.TraverseAll():
             prim_path = str(prim.GetPath())
             if prim_path == object_prim_path or prim_path.startswith(object_prefix):
                 continue
@@ -1153,8 +4226,12 @@ class IsaacLabNavigationRuntime:
                 if child.IsA(UsdGeom.Imageable):
                     UsdGeom.Imageable(child).MakeInvisible()
                     hidden_paths.append(child_path)
+            if root_prim.IsActive():
+                root_prim.SetActive(False)
+            if not root_prim.IsActive():
+                deactivated_roots.append(root_path)
 
-        for prim in stage.Traverse():
+        for prim in stage.TraverseAll():
             prim_path = str(prim.GetPath())
             if prim_path == object_prim_path or prim_path.startswith(object_prefix):
                 if prim.IsA(UsdGeom.Imageable):
@@ -1169,6 +4246,8 @@ class IsaacLabNavigationRuntime:
             "shown_paths": shown_paths,
             "hidden_root_paths": hidden_root_paths,
             "hidden_paths": hidden_paths,
+            "deactivated_root_paths": deactivated_roots,
+            "distractor_physics_disabled": len(deactivated_roots) == len(hidden_root_paths),
             "planner_collision_exclusion_enabled": True,
         }
 
@@ -1177,9 +4256,83 @@ class IsaacLabNavigationRuntime:
 
         return self._configure_viewport(reason=reason)
 
+    def _camera_sensors_enabled(self) -> bool:
+        return bool(
+            self._config.enable_front_camera
+            or self._config.enable_wrist_camera
+            or self._config.enable_overview_camera
+        )
+
+    def _mark_camera_render(
+        self,
+        *,
+        valid_state_step: int | None,
+        reason: str,
+    ) -> None:
+        """Bind the latest RTX render to the exact state step it represents."""
+
+        self._camera_render_generation += 1
+        self._last_camera_render_step = (
+            None if valid_state_step is None else int(valid_state_step)
+        )
+        self._last_camera_render_reason = str(reason)
+
+    def _render_without_physics(
+        self,
+        *,
+        valid_state_step: int | None,
+        reason: str,
+        force: bool = False,
+    ) -> dict[str, Any]:
+        """Run one Kit/RTX update while physics stepping is disabled.
+
+        IsaacLab's ``SimulationContext.render`` temporarily sets
+        ``/app/player/playSimulations`` to false around ``app.update()``.  The
+        before/after counters below make that no-task-physics contract auditable.
+        """
+
+        if self._runtime is None:
+            return {"applied": False, "reason": "runtime_unavailable"}
+        if not force and not self._camera_sensors_enabled():
+            self._last_camera_render_step = None
+            self._last_camera_render_reason = None
+            return {"applied": False, "reason": "camera_sensors_disabled"}
+        step_calls_before = int(self._step_calls)
+        sim_step_before = int(self._runtime._sim_step_counter)
+        started_at = time.perf_counter()
+        self._runtime.sim.render()
+        wall_seconds = time.perf_counter() - started_at
+        step_calls_after = int(self._step_calls)
+        sim_step_after = int(self._runtime._sim_step_counter)
+        if step_calls_after != step_calls_before or sim_step_after != sim_step_before:
+            raise RuntimeError(
+                "no-physics render advanced simulation counters: "
+                f"control={step_calls_before}->{step_calls_after}, "
+                f"physics={sim_step_before}->{sim_step_after}"
+            )
+        self._mark_camera_render(
+            valid_state_step=valid_state_step,
+            reason=reason,
+        )
+        profiler = self._performance_profiler
+        if profiler is not None:
+            profiler.record("runtime.rtx_render_nonphysics_sync", wall_seconds)
+        return {
+            "applied": True,
+            "reason": str(reason),
+            "render_generation": int(self._camera_render_generation),
+            "valid_state_step": valid_state_step,
+            "control_step_before_after": [step_calls_before, step_calls_after],
+            "physics_step_before_after": [sim_step_before, sim_step_after],
+            "physics_time_advanced": False,
+            "wall_seconds": wall_seconds,
+        }
+
     def _retry_viewport_after_stage_updates(self) -> None:
         """IsaacLab 创建窗口和 sublayer 解析可能滞后，前几帧允许轻量重试。"""
 
+        if not self._config.auto_manage_viewport_camera:
+            return
         if self._config.viewport_camera_prim_path in {"", "none", "None"}:
             return
         report = self._metadata.get("viewport_report")
@@ -1200,12 +4353,13 @@ class IsaacLabNavigationRuntime:
         report = configure_navigation_viewport(
             camera_prim_path=self._config.viewport_camera_prim_path,
             hide_collision_visual=self._config.hide_navigation_collision_visual,
+            apply_camera=self._config.auto_manage_viewport_camera,
         )
         report["configure_reason"] = reason
         report["configure_attempt"] = self._viewport_config_attempts
         self._metadata["viewport_report"] = report
         selected_camera = report.get("selected_camera_prim_path")
-        if selected_camera:
+        if selected_camera and report.get("camera_applied") is True:
             self._metadata["camera_prim_path"] = selected_camera
         return report
 
@@ -1221,10 +4375,12 @@ class IsaacLabNavigationRuntime:
         if not prim.IsValid():
             raise RuntimeError(f"scene collision prim does not exist: {prim_path} in {scene_usd}")
         mesh_count = 0
+        mesh_prim_paths: list[str] = []
         collision_api_count = 0
         for child in Usd.PrimRange(prim):
             if child.IsA(UsdGeom.Mesh):
                 mesh_count += 1
+                mesh_prim_paths.append(str(child.GetPath()))
             if child.HasAPI(UsdPhysics.CollisionAPI):
                 collision_api_count += 1
         if mesh_count == 0:
@@ -1235,6 +4391,9 @@ class IsaacLabNavigationRuntime:
         return {
             "scene_usd": str(scene_usd),
             "collision_prim_path": prim_path,
+            "collision_root_type": prim.GetTypeName(),
+            "collision_root_is_mesh": bool(prim.IsA(UsdGeom.Mesh)),
+            "mesh_prim_paths": mesh_prim_paths,
             "mesh_count": mesh_count,
             "collision_api_count": collision_api_count,
         }
@@ -1304,16 +4463,22 @@ class IsaacLabNavigationRuntime:
             return {"available": False, "label": label, "reason": "object_initial_pose_missing"}
         if self._object is None:
             return {"available": False, "label": label, "reason": "object_reader_unavailable"}
-        x, y, z, roll, pitch, yaw = episode_spec.object_initial_pose
-        expected_position = (float(x), float(y), float(z))
-        pose_report = self._metadata.get("object_pose_setup_report") or {}
-        expected_quat = tuple(
-            float(value)
-            for value in (
-                pose_report.get("authored_world_quaternion_wxyz")
-                or _quat_wxyz_from_rpy(float(roll), float(pitch), float(yaw))
+        if self._settled_object_pose is not None:
+            expected_position = tuple(float(value) for value in self._settled_object_pose[:3])
+            expected_quat = tuple(float(value) for value in self._settled_object_pose[3:7])
+            baseline_source = "settled_physx_pose"
+        else:
+            x, y, z, roll, pitch, yaw = episode_spec.object_initial_pose
+            expected_position = (float(x), float(y), float(z))
+            pose_report = self._metadata.get("object_pose_setup_report") or {}
+            expected_quat = tuple(
+                float(value)
+                for value in (
+                    pose_report.get("authored_world_quaternion_wxyz")
+                    or _quat_wxyz_from_rpy(float(roll), float(pitch), float(yaw))
+                )
             )
-        )
+            baseline_source = "task_pose"
         try:
             actual_position_raw, actual_quat_raw = self._object.get_world_pose()
             actual_position = _as_tuple(actual_position_raw)
@@ -1340,19 +4505,474 @@ class IsaacLabNavigationRuntime:
             "orientation_error_rad": orientation_error,
             "within_tolerance": position_error <= 0.02 and orientation_error <= 0.10,
             "read_only": True,
+            "baseline_source": baseline_source,
+        }
+
+    def _episode_support_pose_settings(
+        self,
+        episode_spec: EpisodeSpec,
+    ) -> dict[str, dict[str, Any]]:
+        from source.simulation.task_scene_pose import (
+            resolve_task_pick_support_pose,
+            resolve_task_receptacle_pose,
+        )
+
+        return {
+            "pick": resolve_task_pick_support_pose(episode_spec.raw_task),
+            "place": resolve_task_receptacle_pose(episode_spec.raw_task),
+        }
+
+    def _initialize_episode_support_readers(
+        self,
+        episode_spec: EpisodeSpec,
+    ) -> None:
+        """Bind tensor views for support roots made kinematic before PhysX start."""
+
+        self._episode_support_bodies = {}
+        if not self._config.enable_relocatable_episode_supports:
+            self._metadata["episode_support_reader_report"] = {
+                "enabled": False,
+                "reader_count": 0,
+                "reason": "relocatable_episode_supports_disabled",
+            }
+            return
+
+        import omni.usd
+        from isaacsim.core.prims import SingleRigidPrim
+        from source.simulation.task_scene_pose import (
+            inspect_episode_static_support_body_mode,
+        )
+
+        stage = omni.usd.get_context().get_stage()
+        if stage is None:
+            raise RuntimeError(
+                "Isaac stage is unavailable while initializing support readers"
+            )
+        reports: dict[str, Any] = {}
+        for role, settings in self._episode_support_pose_settings(
+            episode_spec
+        ).items():
+            if settings.get("configured") is not True:
+                reports[role] = {
+                    "configured": False,
+                    "reason": settings.get("reason"),
+                }
+                continue
+            prim_path = str(settings["prim_path"])
+            prim = stage.GetPrimAtPath(prim_path)
+            if not prim.IsValid() or not prim.IsActive():
+                raise RuntimeError(
+                    f"episode support prim is unavailable: {prim_path}"
+                )
+            body_mode_report = inspect_episode_static_support_body_mode(prim)
+            if body_mode_report["support_body_mode"] != "kinematic_episode_static":
+                raise RuntimeError(
+                    "relocatable episode support is not kinematic before PhysX "
+                    f"initialization: role={role} report={body_mode_report}"
+                )
+            reader = SingleRigidPrim(
+                prim_path=prim_path,
+                name=f"full_physics_{role}_episode_support",
+                reset_xform_properties=False,
+            )
+            reader.initialize()
+            initial_position_raw, initial_quaternion_raw = reader.get_world_pose()
+            initial_position = tuple(
+                float(value) for value in _as_tuple(initial_position_raw)
+            )
+            initial_quaternion = tuple(
+                float(value) for value in _as_tuple(initial_quaternion_raw)
+            )
+            self._episode_support_bodies[role] = {
+                "reader": reader,
+                "prim_path": prim_path,
+                "target_position_xyz": initial_position,
+                "target_quaternion_wxyz": initial_quaternion,
+            }
+            reports[role] = {
+                "configured": True,
+                "prim_path": prim_path,
+                "initial_pose_xyz_wxyz": [
+                    *initial_position,
+                    *initial_quaternion,
+                ],
+                **body_mode_report,
+            }
+        self._metadata["episode_support_reader_report"] = {
+            "enabled": True,
+            "reader_count": len(self._episode_support_bodies),
+            "supports": reports,
+        }
+
+    def _write_episode_support_physics_poses(
+        self,
+        episode_spec: EpisodeSpec,
+        *,
+        reason: str,
+    ) -> dict[str, Any]:
+        """Move kinematic supports through PhysX tensors without advancing time."""
+
+        if not self._config.enable_relocatable_episode_supports:
+            return {
+                "applied": False,
+                "verified": True,
+                "reason": "relocatable_episode_supports_disabled",
+            }
+        if not self._episode_support_bodies:
+            raise RuntimeError(
+                "relocatable episode supports are enabled but no tensor readers exist"
+            )
+
+        import torch
+
+        device = getattr(self._runtime, "device", "cpu")
+        reports: dict[str, Any] = {}
+        for role, settings in self._episode_support_pose_settings(
+            episode_spec
+        ).items():
+            if settings.get("configured") is not True:
+                continue
+            body = self._episode_support_bodies.get(role)
+            if body is None:
+                raise RuntimeError(
+                    f"missing live support tensor reader for role={role}"
+                )
+            reader = body["reader"]
+            current_position_raw, current_quaternion_raw = reader.get_world_pose()
+            current_position = tuple(
+                float(value) for value in _as_tuple(current_position_raw)
+            )
+            current_quaternion = tuple(
+                float(value) for value in _as_tuple(current_quaternion_raw)
+            )
+            pose = settings["pose_world"]
+            target_position = (
+                float(pose["x"]),
+                float(pose["y"]),
+                float(pose["z"]),
+            )
+            target_quaternion = (
+                current_quaternion
+                if settings.get("translation_only")
+                else _quat_wxyz_from_rpy(
+                    float(pose["roll"]),
+                    float(pose["pitch"]),
+                    float(pose["yaw"]),
+                )
+            )
+            rigid_view = getattr(reader, "_rigid_prim_view", None)
+            if rigid_view is None or not hasattr(rigid_view, "set_world_poses"):
+                raise RuntimeError(
+                    f"support reader lacks tensor pose API: role={role}"
+                )
+            rigid_view.set_world_poses(
+                positions=torch.tensor(
+                    [target_position],
+                    dtype=torch.float32,
+                    device=device,
+                ),
+                orientations=torch.tensor(
+                    [target_quaternion],
+                    dtype=torch.float32,
+                    device=device,
+                ),
+            )
+            body["target_position_xyz"] = target_position
+            body["target_quaternion_wxyz"] = target_quaternion
+            actual_position_raw, actual_quaternion_raw = reader.get_world_pose()
+            actual_position = tuple(
+                float(value) for value in _as_tuple(actual_position_raw)
+            )
+            actual_quaternion = tuple(
+                float(value) for value in _as_tuple(actual_quaternion_raw)
+            )
+            position_error = math.sqrt(
+                sum(
+                    (actual - expected) ** 2
+                    for actual, expected in zip(actual_position, target_position)
+                )
+            )
+            orientation_error = _quat_angle_error_rad(
+                actual_quaternion,
+                target_quaternion,
+            )
+            reports[role] = {
+                "prim_path": body["prim_path"],
+                "previous_pose_xyz_wxyz": [
+                    *current_position,
+                    *current_quaternion,
+                ],
+                "target_pose_xyz_wxyz": [
+                    *target_position,
+                    *target_quaternion,
+                ],
+                "actual_pose_xyz_wxyz": [
+                    *actual_position,
+                    *actual_quaternion,
+                ],
+                "position_error_m": position_error,
+                "orientation_error_rad": orientation_error,
+                "verified": bool(
+                    position_error <= 1.0e-4
+                    and orientation_error <= 1.0e-4
+                ),
+            }
+        verified = bool(reports) and all(
+            report["verified"] is True for report in reports.values()
+        )
+        result = {
+            "applied": True,
+            "verified": verified,
+            "reason": reason,
+            "physics_time_advanced": False,
+            "supports": reports,
+        }
+        if not verified:
+            raise RuntimeError(f"episode support tensor pose write failed: {result}")
+        return result
+
+    def _episode_support_pose_diagnostic(self, *, label: str) -> dict[str, Any]:
+        if not self._config.enable_relocatable_episode_supports:
+            return {
+                "available": False,
+                "verified": True,
+                "label": label,
+                "reason": "relocatable_episode_supports_disabled",
+            }
+        reports: dict[str, Any] = {}
+        for role, body in self._episode_support_bodies.items():
+            position_raw, quaternion_raw = body["reader"].get_world_pose()
+            position = tuple(float(value) for value in _as_tuple(position_raw))
+            quaternion = tuple(float(value) for value in _as_tuple(quaternion_raw))
+            target_position = tuple(body["target_position_xyz"])
+            target_quaternion = tuple(body["target_quaternion_wxyz"])
+            position_error = math.sqrt(
+                sum(
+                    (actual - expected) ** 2
+                    for actual, expected in zip(position, target_position)
+                )
+            )
+            orientation_error = _quat_angle_error_rad(
+                quaternion,
+                target_quaternion,
+            )
+            reports[role] = {
+                "prim_path": body["prim_path"],
+                "target_pose_xyz_wxyz": [
+                    *target_position,
+                    *target_quaternion,
+                ],
+                "actual_pose_xyz_wxyz": [*position, *quaternion],
+                "position_error_m": position_error,
+                "orientation_error_rad": orientation_error,
+                "verified": bool(
+                    position_error <= 1.0e-4
+                    and orientation_error <= 1.0e-4
+                ),
+            }
+        verified = bool(reports) and all(
+            report["verified"] is True for report in reports.values()
+        )
+        return {
+            "available": bool(reports),
+            "verified": verified,
+            "label": label,
+            "supports": reports,
         }
 
     def _initialize_object_reader(self, episode_spec: EpisodeSpec) -> None:
         if not episode_spec.object_prim_path:
             return
+        import omni.usd
         from isaacsim.core.prims import SingleRigidPrim
 
+        stage = omni.usd.get_context().get_stage()
+        if stage is None:
+            raise RuntimeError("Isaac stage is unavailable while initializing object reader")
+        rigid_body_prim_path = _resolve_rigid_body_prim_path(
+            stage,
+            episode_spec.object_prim_path,
+        )
         self._object = SingleRigidPrim(
-            prim_path=episode_spec.object_prim_path,
+            prim_path=rigid_body_prim_path,
             name="full_physics_navigation_object",
             reset_xform_properties=False,
         )
         self._object.initialize()
+        self._metadata["object_reader_report"] = {
+            "object_root_prim_path": episode_spec.object_prim_path,
+            "rigid_body_prim_path": rigid_body_prim_path,
+        }
+
+    def _object_initialization_target_world_pose(
+        self,
+        episode_spec: EpisodeSpec,
+        *,
+        pose_report: dict[str, Any] | None = None,
+    ) -> tuple[
+        tuple[float, float, float],
+        tuple[float, float, float, float],
+    ]:
+        if episode_spec.object_initial_pose is None:
+            raise RuntimeError("object initialization target pose is unavailable")
+        x, y, z, roll, pitch, yaw = episode_spec.object_initial_pose
+        report = pose_report or self._metadata.get("object_pose_setup_report") or {}
+        authored_quaternion = report.get("authored_world_quaternion_wxyz")
+        if isinstance(authored_quaternion, (list, tuple)) and len(
+            authored_quaternion
+        ) >= 4:
+            world_quaternion = tuple(
+                float(authored_quaternion[index]) for index in range(4)
+            )
+        else:
+            world_quaternion = _quat_wxyz_from_rpy(roll, pitch, yaw)
+        return (
+            (float(x), float(y), float(z)),
+            world_quaternion,
+        )
+
+    def _write_object_physics_state(
+        self,
+        *,
+        position_xyz: tuple[float, float, float],
+        quaternion_wxyz: tuple[float, float, float, float],
+        velocity_xyz_rpy: tuple[float, float, float, float, float, float],
+    ) -> dict[str, Any]:
+        """Write the live PhysX state without rewriting authored USD xform ops."""
+
+        if self._object is None:
+            return {"applied": False, "reason": "object_reader_unavailable"}
+        rigid_view = getattr(self._object, "_rigid_prim_view", None)
+        if rigid_view is None or not hasattr(rigid_view, "set_world_poses"):
+            raise RuntimeError("SingleRigidPrim 缺少 GPU world pose 写入接口。")
+        if not hasattr(rigid_view, "set_velocities"):
+            raise RuntimeError("SingleRigidPrim 缺少 GPU 合并速度写入接口。")
+        import torch
+
+        device = getattr(self._runtime, "device", "cpu")
+        rigid_view.set_world_poses(
+            positions=torch.tensor(
+                [position_xyz],
+                dtype=torch.float32,
+                device=device,
+            ),
+            orientations=torch.tensor(
+                [quaternion_wxyz],
+                dtype=torch.float32,
+                device=device,
+            ),
+        )
+        rigid_view.set_velocities(
+            torch.tensor(
+                [velocity_xyz_rpy],
+                dtype=torch.float32,
+                device=device,
+            )
+        )
+        return {
+            "applied": True,
+            "position_xyz": list(position_xyz),
+            "quaternion_wxyz": list(quaternion_wxyz),
+            "velocity_xyz_rpy": list(velocity_xyz_rpy),
+            "pose_write_api": "RigidPrim.set_world_poses_physics_tensor",
+            "usd_xform_ops_modified": False,
+        }
+
+    def _stabilize_object_initialization_pose(
+        self,
+        episode_spec: EpisodeSpec,
+        *,
+        timing: str,
+        preserve_vertical_velocity: bool,
+    ) -> dict[str, Any]:
+        if self._object is None:
+            return {"applied": False, "reason": "object_reader_unavailable"}
+        requested_position, requested_quaternion = (
+            self._object_initialization_target_world_pose(episode_spec)
+        )
+        current_position_raw, current_quaternion_raw = self._object.get_world_pose()
+        current_position = tuple(float(value) for value in _as_tuple(current_position_raw))
+        current_quaternion = tuple(
+            float(value) for value in _as_tuple(current_quaternion_raw)
+        )
+        current_linear_velocity = tuple(
+            float(value) for value in _as_tuple(self._object.get_linear_velocity())
+        )
+        target_position = (
+            requested_position[0],
+            requested_position[1],
+            current_position[2],
+        )
+        target_velocity = (
+            0.0,
+            0.0,
+            current_linear_velocity[2] if preserve_vertical_velocity else 0.0,
+            0.0,
+            0.0,
+            0.0,
+        )
+        write_report = self._write_object_physics_state(
+            position_xyz=target_position,
+            quaternion_wxyz=requested_quaternion,
+            velocity_xyz_rpy=target_velocity,
+        )
+        apply_count = int(
+            self._metadata.get(
+                "object_initialization_pose_stabilization_apply_count",
+                0,
+            )
+        ) + 1
+        report = {
+            **write_report,
+            "timing": timing,
+            "apply_count": apply_count,
+            "requested_position_xyz": list(requested_position),
+            "pose_before": [*current_position, *current_quaternion],
+            "preserved_current_z": True,
+            "preserved_vertical_velocity": bool(preserve_vertical_velocity),
+            "initialization_only": True,
+        }
+        self._metadata.update(
+            {
+                "used_object_initialization_pose_stabilization": True,
+                "object_initialization_pose_stabilization_apply_count": apply_count,
+                "last_object_initialization_pose_stabilization_report": report,
+            }
+        )
+        return report
+
+    def _apply_object_initialization_pose_stabilization(
+        self,
+        action: RobotAction,
+    ) -> None:
+        if action.metadata.get("object_settle_active") is not True:
+            return
+        if self._episode_spec is None:
+            return
+        policy = resolve_object_initialization_policy(self._episode_spec.raw_task)
+        if not policy.get("enabled") or not policy.get(
+            "stabilize_xy_and_orientation_during_settle"
+        ):
+            return
+        stabilization_report = self._stabilize_object_initialization_pose(
+            self._episode_spec,
+            timing="before_object_settle_physics_step",
+            preserve_vertical_velocity=True,
+        )
+        dynamic_steps = int(policy["dynamic_settle_steps_before_sleep"])
+        if int(stabilization_report.get("apply_count", 0)) < dynamic_steps:
+            return
+        sleep_report = self._set_object_sleeping(enabled=True)
+        stabilization_report.update(
+            {
+                "dynamic_settle_steps_before_sleep": dynamic_steps,
+                "sleep_after_dynamic_settle": sleep_report,
+                "supported_pose_frozen_until_contact": True,
+            }
+        )
+        self._metadata[
+            "last_object_initialization_pose_stabilization_report"
+        ] = stabilization_report
 
     def prepare_object_for_pick(self, episode_spec: EpisodeSpec) -> dict[str, Any]:
         """对齐 baseline：规划前恢复 task 姿态并清零速度。
@@ -1369,6 +4989,101 @@ class IsaacLabNavigationRuntime:
         self._metadata["object_prepare_for_pick_report"] = report
         return report
 
+    def begin_object_settle(self, episode_spec: EpisodeSpec) -> dict[str, Any]:
+        """唤醒任务物体，让其在导航前自然沉降到稳定接触姿态。"""
+
+        del episode_spec
+        if self._object is None:
+            return {"applied": False, "reason": "object_reader_unavailable"}
+        position, orientation = self._object.get_world_pose()
+        report = {
+            "applied": True,
+            "initial_pose": [
+                *list(_as_tuple(position)),
+                *list(_as_tuple(orientation)),
+            ],
+            "wake_report": self._set_object_sleeping(enabled=False),
+            "baseline_source": "physx_free_settle",
+        }
+        self._metadata["object_settle_begin_report"] = report
+        return report
+
+    def finalize_object_settle(self, episode_spec: EpisodeSpec) -> dict[str, Any]:
+        """记录稳定 PhysX 位姿并冻结物体，供后续导航和 pick 共用。"""
+
+        if self._object is None:
+            return {"applied": False, "reason": "object_reader_unavailable"}
+        initialization_policy = resolve_object_initialization_policy(
+            episode_spec.raw_task
+        )
+        stabilization_report: dict[str, Any] | None = None
+        if initialization_policy.get("enabled") and initialization_policy.get(
+            "stabilize_xy_and_orientation_during_settle"
+        ):
+            stabilization_report = self._stabilize_object_initialization_pose(
+                episode_spec,
+                timing="finalize_object_settle",
+                preserve_vertical_velocity=False,
+            )
+        import torch
+
+        position, orientation = self._object.get_world_pose()
+        settled_pose = (
+            *tuple(float(value) for value in _as_tuple(position)),
+            *tuple(float(value) for value in _as_tuple(orientation)),
+        )
+        rigid_view = getattr(self._object, "_rigid_prim_view", None)
+        if rigid_view is None or not hasattr(rigid_view, "set_velocities"):
+            raise RuntimeError("SingleRigidPrim 缺少 GPU 合并速度写入接口。")
+        device = getattr(self._runtime, "device", "cpu")
+        rigid_view.set_velocities(
+            torch.zeros((1, 6), dtype=torch.float32, device=device)
+        )
+        sleep_report = self._set_object_sleeping(enabled=True)
+        self._settled_object_pose = settled_pose
+
+        requested_position = tuple(
+            float(value) for value in episode_spec.object_initial_pose[:3]
+        )
+        pose_report = self._metadata.get("object_pose_setup_report") or {}
+        requested_quaternion = tuple(
+            float(value)
+            for value in (
+                pose_report.get("authored_world_quaternion_wxyz")
+                or _quat_wxyz_from_rpy(*episode_spec.object_initial_pose[3:])
+            )
+        )
+        requested_position_error = math.sqrt(
+            sum(
+                (float(actual) - expected) ** 2
+                for actual, expected in zip(settled_pose[:3], requested_position)
+            )
+        )
+        requested_orientation_error = _quat_angle_error_rad(
+            settled_pose[3:7],
+            requested_quaternion,
+        )
+        report = {
+            "applied": True,
+            "settled_pose": settled_pose,
+            "requested_position_xyz": requested_position,
+            "requested_quaternion_wxyz": requested_quaternion,
+            "requested_position_error_m": requested_position_error,
+            "requested_orientation_error_rad": requested_orientation_error,
+            "object_initialization_policy": initialization_policy,
+            "initialization_pose_stabilization_report": stabilization_report,
+            "sleep_report": sleep_report,
+            "baseline_source": "settled_physx_pose",
+        }
+        self._metadata["object_settle_final_report"] = report
+        self._metadata["object_pose_debug_after_reset"] = (
+            self._object_initial_pose_diagnostic(
+                episode_spec,
+                label="after_object_physics_settle",
+            )
+        )
+        return report
+
     def _reset_object_pose_and_motion(
         self,
         episode_spec: EpisodeSpec,
@@ -1382,28 +5097,45 @@ class IsaacLabNavigationRuntime:
                 "reason": "object_reader_or_initial_pose_missing",
             }
 
-        import torch
-
         x, y, z, roll, pitch, yaw = episode_spec.object_initial_pose
-        pose_report = self._apply_object_pose(episode_spec)
-        world_quaternion = tuple(
-            float(value)
-            for value in pose_report.get(
-                "authored_world_quaternion_wxyz",
-                _quat_wxyz_from_rpy(roll, pitch, yaw),
+        if self._settled_object_pose is None:
+            pose_report = self._apply_object_pose(episode_spec)
+            target_position = (float(x), float(y), float(z))
+            world_quaternion = tuple(
+                float(value)
+                for value in pose_report.get(
+                    "authored_world_quaternion_wxyz",
+                    _quat_wxyz_from_rpy(roll, pitch, yaw),
+                )
             )
+        else:
+            target_position = tuple(float(value) for value in self._settled_object_pose[:3])
+            world_quaternion = tuple(
+                float(value) for value in self._settled_object_pose[3:7]
+            )
+            pose_report = {
+                "applied": False,
+                "reason": "reuse_settled_physx_pose",
+                "settled_pose": self._settled_object_pose,
+            }
+        initialization_policy = resolve_object_initialization_policy(
+            episode_spec.raw_task
         )
-        device = getattr(self._runtime, "device", "cpu")
-        # 不能调用 SingleRigidPrim.set_world_pose：该 API 会把传入的世界四元数
-        # 直接写回根 Orient，破坏任务 RPY 与 unitsResolve 的局部组合语义。
-        # 物体位姿已在 stage/PhysX 初始化前写入；这里仅清速度并让其休眠。
-        # SingleRigidPrim 没有公开 set_velocities，但内部 RigidPrim view 提供
-        # GPU tensor pipeline 所需的合并速度 API。
-        rigid_view = getattr(self._object, "_rigid_prim_view", None)
-        if rigid_view is None or not hasattr(rigid_view, "set_velocities"):
-            raise RuntimeError("SingleRigidPrim 缺少 GPU 合并速度写入接口。")
-        rigid_view.set_velocities(
-            torch.zeros((1, 6), dtype=torch.float32, device=device)
+        # ManagerBasedEnv.reset() only resets bodies owned by the IsaacLab scene.
+        # Task objects referenced directly from the stage (for example the
+        # multi-floor apple) keep the live PhysX pose reached during simulation
+        # startup.  Re-authoring USD xform ops above is therefore insufficient:
+        # Fabric can publish that stale live pose again on the first render.
+        #
+        # Restoring the episode pose is a reset contract for every task object,
+        # independent of the optional supported-upright stabilization policy.
+        # The physics-tensor write preserves the authored unitsResolve xform
+        # stack and is still classified as episode setup, not navigation-time
+        # object teleportation.
+        live_pose_write_report = self._write_object_physics_state(
+            position_xyz=target_position,
+            quaternion_wxyz=world_quaternion,
+            velocity_xyz_rpy=(0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
         )
         sleep_report = self._set_object_sleeping(enabled=sleep_until_contact)
         actual_position, actual_orientation = self._object.get_world_pose()
@@ -1411,7 +5143,7 @@ class IsaacLabNavigationRuntime:
             "applied": True,
             "reason": reason,
             "object_prim_path": episode_spec.object_prim_path,
-            "target_position_xyz": [float(x), float(y), float(z)],
+            "target_position_xyz": list(target_position),
             "target_root_orient_quaternion_wxyz": list(
                 _quat_wxyz_from_rpy(roll, pitch, yaw)
             ),
@@ -1419,8 +5151,19 @@ class IsaacLabNavigationRuntime:
             "actual_position_xyz": list(_as_tuple(actual_position)),
             "actual_quaternion_wxyz": list(_as_tuple(actual_orientation)),
             "object_pose_apply_report": pose_report,
-            "live_pose_write_skipped": True,
-            "live_pose_write_skip_reason": "preserve_root_orient_and_units_resolve",
+            "object_initialization_policy": initialization_policy,
+            "live_pose_write_applied": bool(
+                live_pose_write_report
+                and live_pose_write_report.get("applied") is True
+            ),
+            "live_pose_write_report": live_pose_write_report,
+            "live_pose_write_skipped": False,
+            "live_pose_write_skip_reason": None,
+            "live_pose_write_contract": "episode_reset_all_task_objects_v1",
+            "policy_restore_pose_after_runtime_reset": bool(
+                initialization_policy.get("enabled")
+                and initialization_policy.get("restore_pose_after_runtime_reset")
+            ),
             "linear_velocity_zeroed": True,
             "angular_velocity_zeroed": True,
             "velocity_write_api": "set_velocities",
@@ -1504,7 +5247,7 @@ class IsaacLabNavigationRuntime:
 
         from source.manipulation.current_state_curobo import (
             build_curobo_state_payload,
-            build_side_grasp_target_payload,
+            build_grasp_target_payload,
             pose_dict_from_matrix,
             pose_to_matrix,
             write_json,
@@ -1524,8 +5267,21 @@ class IsaacLabNavigationRuntime:
             self._config.gripper_joint_names
         )
         bbox = self._compute_object_bbox(stage, object_prim_path)
+        mesh_truth_contract = _resolve_mesh_truth_manipulation_contract(
+            episode_spec.raw_task or {}
+        )
+        grasp_mode = _resolve_pick_grasp_mode(episode_spec.raw_task or {})
+        if (
+            mesh_truth_contract["required"]
+            and bbox.get("center_source") != "live_physx_object_pose"
+        ):
+            raise RuntimeError(
+                "required Mesh-truth pick target 缺少 live PhysX object pose"
+            )
         collision_cuboids = self._export_current_world_collision_cuboids(
             stage=stage,
+            episode_spec=episode_spec,
+            phase="pick",
             robot_root_path=self._robot_prim_path(),
             object_prim_path=object_prim_path,
             T_world_base=T_world_base,
@@ -1556,14 +5312,52 @@ class IsaacLabNavigationRuntime:
             world_collision_metadata=world_collision_metadata,
             source="IsaacLabNavigationRuntime.current_state_pick_replan",
         )
-        target_payload = build_side_grasp_target_payload(
+        target_payload = build_grasp_target_payload(
+            grasp_mode=grasp_mode["resolved"],
             object_prim_path=object_prim_path,
             T_world_base=T_world_base,
             bbox_min=bbox["min_xyz"],
             bbox_max=bbox["max_xyz"],
             bbox_center=bbox["center_xyz"],
             bbox_size=bbox["size_xyz"],
+            object_long_axis_world=(
+                (bbox.get("live_bbox_transform") or {}).get(
+                    "long_axis_world_xyz"
+                )
+            ),
         )
+        pick_target_source = target_payload.get("source")
+        pick_target_source = (
+            pick_target_source if isinstance(pick_target_source, dict) else {}
+        )
+        expected_target_source_type = f"sim_object_bbox_{grasp_mode['resolved']}"
+        mesh_truth_pick_target_report = {
+            "configured": bool(mesh_truth_contract["configured"]),
+            "required": bool(mesh_truth_contract["required"]),
+            "verified": bool(
+                pick_target_source.get("type") == expected_target_source_type
+                and pick_target_source.get("grasp_mode") == grasp_mode["resolved"]
+                and (
+                    not mesh_truth_contract["required"]
+                    or bbox.get("center_source") == "live_physx_object_pose"
+                )
+            ),
+            "visual_localization_required": False,
+            "visual_localization_used": False,
+            "pick_tcp_source": "runtime_live_object_bbox",
+            "requested_grasp_mode": grasp_mode["requested"],
+            "resolved_grasp_mode": grasp_mode["resolved"],
+            "expected_target_source_type": expected_target_source_type,
+            "target_source_type": pick_target_source.get("type"),
+            "object_prim_path": object_prim_path,
+            "bbox_center_source": bbox.get("center_source"),
+            "bbox_world": bbox,
+        }
+        if (
+            mesh_truth_contract["required"]
+            and mesh_truth_pick_target_report["verified"] is not True
+        ):
+            raise RuntimeError("required Mesh-truth pick target 未验证")
 
         state_json = write_json(output_path / "pick_state.json", state_payload)
         target_json = write_json(output_path / "pick_target.json", target_payload)
@@ -1587,6 +5381,7 @@ class IsaacLabNavigationRuntime:
                 "source": target_payload.get("source", {}),
                 "diagnostics": target_payload.get("diagnostics", {}),
             },
+            "mesh_truth_pick_target_report": mesh_truth_pick_target_report,
             "target_grasp_position_base": (
                 target_payload.get("poses", {})
                 .get("grasp", {})
@@ -1603,6 +5398,9 @@ class IsaacLabNavigationRuntime:
             "state_json": str(state_json),
             "target_json": str(target_json),
         }
+        self._metadata["last_mesh_truth_pick_target_report"] = (
+            mesh_truth_pick_target_report
+        )
         return report
 
     def read_object_bbox_world(self) -> dict[str, Any]:
@@ -1643,13 +5441,39 @@ class IsaacLabNavigationRuntime:
             write_json,
         )
 
-        place_pose_world = self._place_pose_world_from_episode(episode_spec)
         output_path = Path(output_dir)
         output_path.mkdir(parents=True, exist_ok=True)
 
         stage = omni.usd.get_context().get_stage()
         if stage is None:
             raise RuntimeError("当前没有 USD stage，无法导出 cuRobo place 输入。")
+
+        mesh_truth_contract = _resolve_mesh_truth_manipulation_contract(
+            episode_spec.raw_task or {}
+        )
+        receptacle_support_report = inspect_task_receptacle_support_stage(
+            stage,
+            episode_spec.raw_task or {},
+            source="curobo_place_target_runtime_stage",
+        )
+        pick_export = self._metadata.get("last_current_state_curobo_pick_export")
+        pick_export = pick_export if isinstance(pick_export, dict) else {}
+        pick_object_bbox = pick_export.get("bbox_world")
+        pick_target_report = pick_export.get("mesh_truth_pick_target_report")
+        if mesh_truth_contract["required"] and (
+            not isinstance(pick_target_report, dict)
+            or pick_target_report.get("verified") is not True
+        ):
+            raise RuntimeError(
+                "required Mesh-truth place target 缺少已验证的 pick target 报告"
+            )
+        place_pose_world = self._place_pose_world_from_episode(
+            episode_spec,
+            receptacle_support_report=receptacle_support_report,
+            pick_object_bbox=(
+                pick_object_bbox if isinstance(pick_object_bbox, dict) else None
+            ),
+        )
 
         T_world_base, base_source = self._read_body_matrix("arm_base_link")
         T_world_tcp, tcp_source, tcp_mode = self._read_tcp_export_matrix()
@@ -1658,8 +5482,58 @@ class IsaacLabNavigationRuntime:
             self._config.gripper_joint_names
         )
         bbox = self._compute_object_bbox(stage, object_prim_path)
+        if (
+            mesh_truth_contract["required"]
+            and bbox.get("center_source") != "live_physx_object_pose"
+        ):
+            raise RuntimeError(
+                "required Mesh-truth place target 缺少当前 live PhysX object pose"
+            )
+        mesh_truth_place_target_report = self._metadata.get(
+            "last_mesh_truth_place_target_report"
+        )
+        if isinstance(mesh_truth_place_target_report, dict):
+            mesh_truth_place_target_report = {
+                **mesh_truth_place_target_report,
+                "required": bool(mesh_truth_contract["required"]),
+                "place_tcp_source": (
+                    "runtime_receptacle_bbox_plus_pick_object_bbox_plus_current_tcp_offset"
+                ),
+                "current_object_bbox_center_source": bbox.get("center_source"),
+                "current_object_center_live_verified": (
+                    bbox.get("center_source") == "live_physx_object_pose"
+                ),
+                "current_tcp_offset_source": (
+                    "runtime_current_tcp_and_live_object_center"
+                ),
+            }
+            mesh_truth_place_target_report["verified"] = bool(
+                mesh_truth_place_target_report.get("verified") is True
+                and (
+                    not mesh_truth_contract["required"]
+                    or mesh_truth_place_target_report[
+                        "current_object_center_live_verified"
+                    ]
+                )
+            )
+            self._metadata["last_mesh_truth_place_target_report"] = (
+                mesh_truth_place_target_report
+            )
+        else:
+            mesh_truth_place_target_report = {
+                "configured": False,
+                "required": bool(mesh_truth_contract["required"]),
+                "verified": not bool(mesh_truth_contract["required"]),
+            }
+        if (
+            mesh_truth_contract["required"]
+            and mesh_truth_place_target_report.get("verified") is not True
+        ):
+            raise RuntimeError("required Mesh-truth place target 未验证")
         collision_cuboids = self._export_current_world_collision_cuboids(
             stage=stage,
+            episode_spec=episode_spec,
+            phase="place",
             robot_root_path=self._robot_prim_path(),
             object_prim_path=object_prim_path,
             T_world_base=T_world_base,
@@ -1721,6 +5595,8 @@ class IsaacLabNavigationRuntime:
             "world_collision_export": world_collision_metadata,
             **_collision_cuboid_diagnostics(collision_cuboids),
             "hidden_distractor_root_paths": list(self._hidden_distractor_root_paths),
+            "receptacle_support_report": receptacle_support_report,
+            "mesh_truth_place_target_report": mesh_truth_place_target_report,
             "desired_final_object_center_world": (
                 target_payload.get("source", {}).get("desired_final_object_center_world")
             ),
@@ -1740,25 +5616,45 @@ class IsaacLabNavigationRuntime:
         }
         return report
 
-    def _place_pose_world_from_episode(self, episode_spec: EpisodeSpec) -> dict[str, Any]:
-        """优先使用 task JSON 的 place_pose_world，并保留 baseline 支持的 clearance 字段。"""
+    def _place_pose_world_from_episode(
+        self,
+        episode_spec: EpisodeSpec,
+        *,
+        receptacle_support_report: dict[str, Any] | None = None,
+        pick_object_bbox: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """解析 place pose；可选由运行时 Mesh 真值覆盖静态 XYZ。"""
 
         raw_place = dict((episode_spec.raw_task or {}).get("place") or {})
-        raw_pose = raw_place.get("place_pose_world")
-        if isinstance(raw_pose, dict):
-            payload = dict(raw_pose)
-        elif episode_spec.place_target_pose is not None:
-            x, y, z, roll, pitch, yaw = episode_spec.place_target_pose
-            payload = {
-                "x": x,
-                "y": y,
-                "z": z,
-                "roll": roll,
-                "pitch": pitch,
-                "yaw": yaw,
-            }
+        mesh_truth_result = _derive_mesh_truth_place_pose(
+            raw_place=raw_place,
+            receptacle_support_report=receptacle_support_report,
+            pick_object_bbox=pick_object_bbox,
+        )
+        if mesh_truth_result is not None:
+            payload, mesh_truth_report = mesh_truth_result
+            if hasattr(self, "_metadata"):
+                self._metadata["last_mesh_truth_place_target_report"] = (
+                    mesh_truth_report
+                )
         else:
-            raise RuntimeError("当前 task 缺少 place.place_pose_world，无法生成 arm-place target。")
+            raw_pose = raw_place.get("place_pose_world")
+            if isinstance(raw_pose, dict):
+                payload = dict(raw_pose)
+            elif episode_spec.place_target_pose is not None:
+                x, y, z, roll, pitch, yaw = episode_spec.place_target_pose
+                payload = {
+                    "x": x,
+                    "y": y,
+                    "z": z,
+                    "roll": roll,
+                    "pitch": pitch,
+                    "yaw": yaw,
+                }
+            else:
+                raise RuntimeError(
+                    "当前 task 缺少 place.place_pose_world，无法生成 arm-place target。"
+                )
         # baseline arm-place 只读取 clearance 字段。release_height/retreat_height
         # 属于旧 put 流程，映射后会把苹果抬高到 4~5 cm 再松爪，造成明显自由落体。
         for target_key in (
@@ -1919,17 +5815,40 @@ class IsaacLabNavigationRuntime:
         size = bbox_max - bbox_min
         center = 0.5 * (bbox_min + bbox_max)
         center_source = "usd_bbox"
+        live_transform_report: dict[str, Any] | None = None
         if self._object is not None:
-            # 动态刚体运动后，UsdGeom.BBoxCache 可能仍返回 authored 初始位置。
-            # 这里只读取 SingleRigidPrim 的实时 PhysX pose 修正中心，不修改物体状态。
-            live_position, _live_orientation = self._object.get_world_pose()
-            live_center = np.asarray(_as_tuple(live_position), dtype=float)
-            if live_center.shape == (3,) and np.all(np.isfinite(live_center)):
-                center = live_center
-                bbox_min = center - 0.5 * size
-                bbox_max = center + 0.5 * size
-                center_source = "live_physx_object_pose"
-        return {
+            # Fabric/PhysX 运动后，UsdGeom.BBoxCache 可能仍返回 authored 位姿。
+            # 先把 authored world AABB 还原到刚体局部系，再用 live pose 映射，
+            # 避免默认刚体原点恰好等于 Mesh bbox 中心。
+            reader_report = self._metadata.get("object_reader_report")
+            reader_report = reader_report if isinstance(reader_report, dict) else {}
+            rigid_body_prim_path = str(
+                reader_report.get("rigid_body_prim_path")
+                or _resolve_rigid_body_prim_path(stage, object_prim_path)
+            )
+            rigid_body_prim = stage.GetPrimAtPath(rigid_body_prim_path)
+            if not rigid_body_prim.IsValid() or not rigid_body_prim.IsA(UsdGeom.Xformable):
+                raise RuntimeError(
+                    f"object rigid body prim 不是有效 Xformable: {rigid_body_prim_path}"
+                )
+            authored_rigid_position, authored_rigid_quaternion = (
+                _xformable_world_pose(UsdGeom.Xformable(rigid_body_prim))
+            )
+            live_position, live_orientation = self._object.get_world_pose()
+            live_transform_report = _transform_authored_aabb_to_live_rigid_pose(
+                authored_bbox_min=bbox_min,
+                authored_bbox_max=bbox_max,
+                authored_rigid_position=authored_rigid_position,
+                authored_rigid_quaternion_wxyz=authored_rigid_quaternion,
+                live_rigid_position=_as_tuple(live_position),
+                live_rigid_quaternion_wxyz=_as_tuple(live_orientation),
+            )
+            bbox_min = np.asarray(live_transform_report["min_xyz"], dtype=float)
+            bbox_max = np.asarray(live_transform_report["max_xyz"], dtype=float)
+            center = np.asarray(live_transform_report["center_xyz"], dtype=float)
+            size = np.asarray(live_transform_report["size_xyz"], dtype=float)
+            center_source = "live_physx_object_pose"
+        report = {
             "min_xyz": bbox_min.tolist(),
             "max_xyz": bbox_max.tolist(),
             "center_xyz": center.tolist(),
@@ -1937,11 +5856,16 @@ class IsaacLabNavigationRuntime:
             "center_source": center_source,
             "read_only": True,
         }
+        if live_transform_report is not None:
+            report["live_bbox_transform"] = live_transform_report
+        return report
 
     def _export_current_world_collision_cuboids(
         self,
         *,
         stage: Any,
+        episode_spec: EpisodeSpec,
+        phase: str,
         robot_root_path: str,
         object_prim_path: str,
         T_world_base: Any,
@@ -1981,9 +5905,16 @@ class IsaacLabNavigationRuntime:
         )
         T_world_base = np.asarray(T_world_base, dtype=float)
         T_base_world = np.linalg.inv(T_world_base)
-        candidates: list[dict[str, Any]] = []
         reference_point = np.asarray(object_bbox_center, dtype=float)
         base_position = T_world_base[:3, 3].copy()
+        candidates = _task_world_collision_cuboids(
+            raw_task=episode_spec.raw_task,
+            phase=phase,
+            T_world_base=T_world_base,
+            reference_point=reference_point,
+            padding_xy_m=padding_xy_m,
+            padding_z_m=padding_z_m,
+        )
 
         for prim in stage.TraverseAll():
             if not prim.IsValid() or not prim.IsActive():
@@ -2106,9 +6037,25 @@ class IsaacLabNavigationRuntime:
         # 再按苹果距离截断，否则前 16 个 terrain prim 会让 cuRobo 看不到桌面。
         candidates.sort(key=_collision_candidate_sort_key)
         obstacles = candidates[:max_obstacles]
+        required_ids = {
+            str(candidate["task_collision_id"])
+            for candidate in candidates
+            if candidate.get("task_collision_required")
+        }
+        selected_required_ids = {
+            str(candidate["task_collision_id"])
+            for candidate in obstacles
+            if candidate.get("task_collision_required")
+        }
+        if required_ids != selected_required_ids:
+            missing = sorted(required_ids - selected_required_ids)
+            raise RuntimeError(
+                "任务要求的 CuRobo world collision 被 max_obstacles 截断: "
+                f"{missing}"
+            )
         for index, obstacle in enumerate(obstacles):
             obstacle["name"] = _sanitize_obstacle_name(
-                str(obstacle["prim_path"]),
+                str(obstacle.get("task_collision_name") or obstacle["prim_path"]),
                 index,
             )
         return obstacles
@@ -2121,7 +6068,17 @@ class IsaacLabNavigationRuntime:
 
         padding_xy_m = float(self._config.world_collision_padding_m)
         padding_z_m = float(self._config.world_collision_vertical_padding_m)
+        task_configured_count = sum(
+            1 for cuboid in cuboids if cuboid.get("task_configured")
+        )
         return {
+            "representation": (
+                "IsaacLab CollisionAPI world AABB plus task-configured world cuboids "
+                "in arm_base_link frame"
+                if task_configured_count
+                else "IsaacLab current CollisionAPI world AABB exported as cuRobo "
+                "cuboids in arm_base_link frame"
+            ),
             "padding_m": padding_xy_m,
             "padding_xy_m": padding_xy_m,
             "padding_z_m": padding_z_m,
@@ -2136,6 +6093,20 @@ class IsaacLabNavigationRuntime:
                 self._config.world_collision_large_obstacle_clip_half_extent_m
             ),
             "obstacle_count": len(cuboids),
+            "task_configured_obstacle_count": task_configured_count,
+            "required_task_collision_count": sum(
+                1 for cuboid in cuboids if cuboid.get("task_collision_required")
+            ),
+            "task_collision_ids": [
+                str(cuboid.get("task_collision_id"))
+                for cuboid in cuboids
+                if cuboid.get("task_configured")
+            ],
+            "preserve_top_padding_count": sum(
+                1
+                for cuboid in cuboids
+                if cuboid.get("padding_mode") == "preserve_top"
+            ),
             "clipped_large_obstacle_count": sum(
                 1 for cuboid in cuboids if cuboid.get("clipped_from_large_obstacle")
             ),
@@ -2145,8 +6116,8 @@ class IsaacLabNavigationRuntime:
                 else float(cuboids[0].get("distance_to_reference_xy_m", 0.0))
             ),
             "note": (
-                "padding_xy/clearance_margin 只水平膨胀传给 cuRobo 的规划障碍；"
-                "padding_z 保持较小，避免把桌面虚拟抬高到抓取目标。"
+                "任务支撑代理可使用 preserve_top，使 padding_z 仅向局部 -Z 膨胀；"
+                "USD AABB 仍沿用旧场景的对称膨胀语义。"
             ),
         }
 
@@ -2198,7 +6169,12 @@ class IsaacLabNavigationRuntime:
                     "IsaacLabNavigationRuntime only supports fixed gripper joint order: "
                     f"{self._config.gripper_joint_names}, got {joint_names}"
                 )
-            target = tuple(float(value) for value in metadata["gripper_joint_positions"])
+            requested_target = tuple(
+                float(value) for value in metadata["gripper_joint_positions"]
+            )
+            if not requested_target:
+                raise RuntimeError("gripper_joint_positions must not be empty")
+            target = tuple(requested_target[0] for _ in requested_target)
             source = "metadata"
         elif action.gripper_command == "open":
             joint_names = tuple(self._config.gripper_joint_names)
@@ -2235,7 +6211,7 @@ class IsaacLabNavigationRuntime:
         }
 
     def _stage_arm_target(self, action: RobotAction) -> dict[str, Any]:
-        """把 arm position target 写入 policy action 槽，不直接改写关节状态。"""
+        """把 arm position target 写入当前 task 支持的机械臂控制通道。"""
 
         if action.arm_joint_positions is None:
             return {
@@ -2263,15 +6239,28 @@ class IsaacLabNavigationRuntime:
 
         override_report = self._adapter.set_direct_arm_action_override(True)
         action_indices = tuple(int(index) for index in override_report.get("arm_action_indices") or ())
-        if (
-            not override_report.get("action_term_available")
-            or len(action_indices) != len(expected_names)
-        ):
-            raise RuntimeError(
-                "Isaac Lab policy action does not expose all arm joints for direct target override: "
-                f"{override_report}"
-            )
-        self._adapter.set_arm_joint_target(target)
+        direct_override_available = (
+            bool(override_report.get("action_term_available"))
+            and len(action_indices) == len(expected_names)
+        )
+        if direct_override_available:
+            arm_control_mode = "policy_action_override"
+            direct_override_enabled = True
+        else:
+            if not hasattr(self._adapter, "apply_arm_joint_target"):
+                raise RuntimeError(
+                    "Isaac Lab arm target control is unavailable: policy action does not expose "
+                    f"all arm joints and adapter has no independent arm target path: {override_report}"
+                )
+            disable_report = self._adapter.set_direct_arm_action_override(False)
+            self._metadata["last_direct_arm_action_override_disable_report"] = disable_report
+            arm_control_mode = "independent_position_target"
+            direct_override_enabled = False
+        arm_velocity_hold = bool(metadata.get("segment_type") == "post_motion_hold")
+        self._adapter.set_arm_joint_target(
+            target,
+            hold_velocity=arm_velocity_hold,
+        )
         self._pending_arm_tracking_target = {
             "source": action.source,
             "pipeline_state": metadata.get("carry_arm_home_phase"),
@@ -2283,8 +6272,10 @@ class IsaacLabNavigationRuntime:
             "target_staged": True,
             "arm_joint_names": joint_names,
             "arm_joint_positions": target,
-            "direct_arm_action_override": True,
+            "arm_control_mode": arm_control_mode,
+            "direct_arm_action_override": direct_override_enabled,
             "arm_action_indices": action_indices,
+            "arm_velocity_hold": arm_velocity_hold,
             # 这里只替换 policy action 槽，禁止通过 direct joint state 制造执行结果。
             "uses_direct_joint_state": False,
             "world_step_owned_by_pipeline": True,
@@ -2399,10 +6390,150 @@ class IsaacLabNavigationRuntime:
         position, quaternion = matrix_to_pose(matrix)
         return (*_as_tuple(position), *_as_tuple(quaternion))
 
-    def _read_camera_images(self) -> dict[str, Any]:
-        """只暴露当前渲染完成的 tensor；JPEG 编码由 5 Hz recorder 负责。"""
+    def _wrist_camera_object_clearance_config(self) -> dict[str, Any] | None:
+        """解析任务级 wrist 近裁剪安全门禁。"""
 
+        if self._episode_spec is None:
+            return None
+        raw_task = self._episode_spec.raw_task
+        recording = raw_task.get("recording") if isinstance(raw_task, dict) else None
+        recording = recording if isinstance(recording, dict) else {}
+        raw = recording.get("wrist_camera_object_clearance")
+        if not isinstance(raw, dict) or not raw.get("enabled", False):
+            return None
+        shape = str(raw.get("shape") or "").strip().lower()
+        if shape != "cylinder_local_z":
+            raise RuntimeError(
+                "recording.wrist_camera_object_clearance.shape "
+                "当前只支持 cylinder_local_z"
+            )
+        try:
+            config = {
+                "enabled": True,
+                "required_for_training": bool(
+                    raw.get("required_for_training", False)
+                ),
+                "shape": shape,
+                "object_radius_m": float(raw["object_radius_m"]),
+                "object_half_length_m": float(raw["object_half_length_m"]),
+                "near_clipping_m": float(
+                    raw.get("near_clipping_m", WRIST_CAMERA_NEAR_CLIPPING_M)
+                ),
+                "minimum_surface_margin_m": float(
+                    raw.get("minimum_surface_margin_m", 0.01)
+                ),
+            }
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError(
+                "recording.wrist_camera_object_clearance 尺寸配置无效"
+            ) from exc
+        return config
+
+    def _update_wrist_camera_object_clearance(
+        self,
+        *,
+        tcp_pose_world: Any,
+        object_pose_world: Any,
+    ) -> None:
+        """聚合整条 episode 中 wrist 近裁剪面与目标物体的最小间距。"""
+
+        config = self._wrist_camera_object_clearance_config()
+        if config is None:
+            return
+        previous = self._metadata.get("wrist_camera_object_clearance_report")
+        previous = previous if isinstance(previous, dict) else {}
+        sample_count = int(previous.get("sample_count", 0)) + 1
+        unavailable_count = int(previous.get("unavailable_sample_count", 0))
+        considered_count = int(previous.get("considered_sample_count", 0))
+        violation_count = int(previous.get("violation_count", 0))
+        worst_sample = previous.get("worst_sample")
+        latest_sample = None
+        if tcp_pose_world is None or object_pose_world is None:
+            unavailable_count += 1
+        else:
+            latest_sample = _compute_wrist_camera_object_clearance_sample(
+                tcp_pose_world=tcp_pose_world,
+                object_pose_world=object_pose_world,
+                object_radius_m=config["object_radius_m"],
+                object_half_length_m=config["object_half_length_m"],
+                near_clipping_m=config["near_clipping_m"],
+                minimum_surface_margin_m=config["minimum_surface_margin_m"],
+            )
+            latest_sample.update(
+                {
+                    "step_index": self._step_calls,
+                    "timestamp": (
+                        float(self._step_calls) * float(self._runtime.step_dt)
+                        if self._runtime is not None
+                        else None
+                    ),
+                    "action_source": self._last_action.source,
+                }
+            )
+            if latest_sample["potentially_visible"]:
+                considered_count += 1
+                if not latest_sample["verified"]:
+                    violation_count += 1
+                if (
+                    not isinstance(worst_sample, dict)
+                    or float(latest_sample["surface_clearance_m"])
+                    < float(worst_sample.get("surface_clearance_m", math.inf))
+                ):
+                    worst_sample = dict(latest_sample)
+        self._metadata["wrist_camera_object_clearance_report"] = {
+            **config,
+            "camera_extrinsics_source": (
+                "hand_eye_calibration_with_visual_alignment_v3"
+            ),
+            "sample_count": sample_count,
+            "unavailable_sample_count": unavailable_count,
+            "considered_sample_count": considered_count,
+            "violation_count": violation_count,
+            "verified": bool(considered_count > 0 and violation_count == 0),
+            "worst_sample": worst_sample,
+            "latest_sample": latest_sample,
+        }
+
+    def _read_camera_images(self) -> dict[str, Any]:
+        """Expose one camera set per render-grid step and cache duplicate reads."""
+
+        started_at = time.perf_counter()
         if self._runtime is None:
+            return {}
+        interval = int(self._config.camera_render_interval_control_steps)
+        step_calls = int(getattr(self, "_step_calls", 0))
+        if step_calls % interval != 0:
+            return {}
+        if getattr(self, "_cached_camera_step", None) == step_calls:
+            return dict(getattr(self, "_cached_camera_images", {}))
+        render_step = self._last_camera_render_step
+        if render_step != step_calls:
+            # Never relabel a pre-reset or older render as the current state.  The
+            # recorder may simply skip this control step; it must not receive a
+            # visually stale packet with a fresh logical timestamp.
+            self._metadata["camera_capture_report"] = {
+                "requested_camera_keys": [
+                    key
+                    for key, enabled in (
+                        ("front", self._config.enable_front_camera),
+                        ("wrist", self._config.enable_wrist_camera),
+                        ("overview", self._config.enable_overview_camera),
+                    )
+                    if enabled
+                ],
+                "available_camera_keys": [],
+                "missing_camera_keys": [],
+                "camera_poses_world": {},
+                "capture_step_index": step_calls,
+                "render_step_index": render_step,
+                "render_generation": int(self._camera_render_generation),
+                "render_reason": self._last_camera_render_reason,
+                "accepted": False,
+                "reason": "stale_or_unrendered_state_rejected",
+                "synchronization_source": "explicit_render_state_step_contract",
+            }
+            self._cached_camera_step = step_calls
+            self._cached_camera_images = {}
             return {}
         images: dict[str, Any] = {}
         sensor_names = []
@@ -2410,12 +6541,22 @@ class IsaacLabNavigationRuntime:
             sensor_names.append(("front", "head_camera"))
         if self._config.enable_wrist_camera:
             sensor_names.append(("wrist", "arm_camera"))
+        if self._config.enable_overview_camera:
+            sensor_names.append(("overview", "overview_camera"))
+        camera_poses: dict[str, Any] = {}
         for camera_key, sensor_name in sensor_names:
             try:
                 sensor = self._runtime.scene[sensor_name]
                 rgb = sensor.data.output["rgb"]
             except (KeyError, TypeError, AttributeError):
                 continue
+            pose = _read_camera_sensor_pose(
+                sensor,
+                camera_key=camera_key,
+                sensor_name=sensor_name,
+            )
+            if pose is not None and camera_key in {"front", "wrist"}:
+                camera_poses[camera_key] = pose
             if rgb is None or getattr(rgb, "shape", (0,))[0] < 1:
                 continue
             images[camera_key] = rgb[0, :, :, :3]
@@ -2430,7 +6571,26 @@ class IsaacLabNavigationRuntime:
                     key: [int(value) for value in getattr(image, "shape", ())]
                     for key, image in images.items()
                 },
+                "camera_poses_world": camera_poses,
+                "capture_step_index": step_calls,
+                "render_step_index": render_step,
+                "render_generation": int(self._camera_render_generation),
+                "render_reason": self._last_camera_render_reason,
+                "capture_timestamp": (
+                    float(step_calls) * float(getattr(self._runtime, "step_dt", 0.02))
+                ),
+                "render_interval_control_steps": interval,
+                "accepted": bool(images),
+                "synchronization_source": "explicit_render_state_step_contract",
             }
+        self._cached_camera_step = step_calls
+        self._cached_camera_images = dict(images)
+        if getattr(self, "_performance_profiler", None) is not None:
+            self._performance_profiler.record(
+                "runtime.camera_tensor_read",
+                time.perf_counter() - started_at,
+                work_units=len(images),
+            )
         return images
 
     def _resolve_checkpoint(self) -> Path:
@@ -2440,10 +6600,17 @@ class IsaacLabNavigationRuntime:
         candidates.extend(
             [
                 self._project_root / "checkpoints/go2_x5/flat/model_8500.pt",
-                Path("/home/light/workspace/arm_vla/checkpoints/go2_x5/flat/model_8500.pt"),
-                Path("/home/light/workspace/DWA/flat/model_8500.pt"),
             ]
         )
+        external_checkpoint = os.environ.get("GO2_X5_FLAT_CHECKPOINT")
+        if external_checkpoint:
+            external_path = Path(external_checkpoint).expanduser()
+            candidates.insert(
+                1,
+                external_path
+                if external_path.is_absolute()
+                else self._project_root / external_path,
+            )
         for candidate in candidates:
             path = Path(candidate).expanduser().resolve()
             if path.is_file():

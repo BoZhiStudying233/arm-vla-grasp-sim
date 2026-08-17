@@ -1,4 +1,5 @@
 project_status.json
+project.json
 object_pose_debug_report.json
 CLEANUP_INVENTORY.md
 CLEANUP_REPORT.md
@@ -9,14 +10,42 @@ CLEANUP_REPORT.md
 AGENTS.md
 tutorial/**/README.md
 episodes/
+cmd/
 # Ignore generated outputs, except Rerun recordings.
 # outputs/**
 # !outputs/
 # !outputs/**/
 # !outputs/**/*.rrd
+
 outputs/
 tests/
+!tests/
+!tests/navigation/
+!tests/navigation/test_locomotion_policy_config.py
 json/
+Yinluyuan/
+external/
+checkpoints/go2_x5/pct_multifloor/training/
 *.pt
+*.onnx
+*.usd
+*.usda
+*.usdz
+*.nurec
+*.ply
+*.pickle
+*.npy
+*.mp4
+*.rrd
+!checkpoints/go2_x5/pct_multifloor/*.pt
+events.out.tfevents*
+# 场景与物体资产统一通过网盘分发，不进入 Git。
+source/scene/liangzhu/
+source/scene/multifloor/
+source/scene/objects/
+
+
+# 随仓库发布的模型权重。
+!checkpoints/go2_x5/pct_multifloor/model_26000.pt
 __pycache__/
 *.py[cod]

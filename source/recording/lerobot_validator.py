@@ -10,6 +10,22 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .subtask_export import validate_subtask_directory_export
+from .subtask_segmentation import (
+    INSTRUCTION_ANNOTATION_SCHEMA,
+    RELATIVE_DIRECTION_LABELS,
+    SUBTASK_DIRECTORY_LAYOUT,
+    SUBTASK_LABELS,
+    SUBTASK_SCHEMA_VERSION,
+    TASK_STAGES,
+)
+from .training_action import (
+    VLA_TRAINING_ACTION_ALIGNMENT,
+    VLA_TRAINING_ACTION_DIMENSION,
+    VLA_TRAINING_ACTION_NAMES,
+    VLA_TRAINING_ACTION_SCHEMA,
+)
+
 
 REQUIRED_PARQUET_COLUMNS = (
     "index",
@@ -217,8 +233,10 @@ def _validate_info(
     metadata_names = {
         "observation.state": "observation_state_names",
         "observation.base_velocity": "base_velocity_names",
+        "observation.base_pose": "base_pose_names",
         "observation.object_state": "object_state_names",
         "observation.tcp_pose": "tcp_pose_names",
+        "control.action": "control_action_names",
         "action": "action_names",
     }
     for feature_name, metadata_name in metadata_names.items():
@@ -227,8 +245,13 @@ def _validate_info(
             continue
         feature_names = feature.get("names")
         metadata_value = info.get(metadata_name)
-        if feature_name in {"observation.object_state", "observation.tcp_pose"}:
-            # 这两个扩展 feature 在旧数据中可缺失；出现时才要求顶层 names metadata。
+        if feature_name in {
+            "observation.base_pose",
+            "observation.object_state",
+            "observation.tcp_pose",
+            "control.action",
+        }:
+            # 扩展 feature 在旧数据中可缺失；出现时才要求顶层 names metadata。
             if metadata_value is None:
                 context.error(
                     "missing_dimension_names_metadata",
@@ -248,12 +271,120 @@ def _validate_info(
                 f"{metadata_name} 与 feature {feature_name}.names 不一致。",
                 feature=feature_name,
             )
-        elif dimension is not None and len(names) != dimension:
+        dimension = _feature_dimension(feature)
+        if (
+            isinstance(feature_names, list)
+            and dimension is not None
+            and len(feature_names) != dimension
+        ):
             context.error(
                 "feature_names_count_mismatch",
-                f"feature {name} 的 names 数量 {len(names)} 与维度 {dimension} 不一致。",
-                feature=name,
+                f"feature {feature_name} 的 names 数量 {len(feature_names)} 与维度 {dimension} 不一致。",
+                feature=feature_name,
             )
+
+    if info.get("vla_training_action_available") is True:
+        vla_requirements = {
+            "vla_training_action_schema": VLA_TRAINING_ACTION_SCHEMA,
+            "training_action_alignment": VLA_TRAINING_ACTION_ALIGNMENT,
+            "training_action_horizon_frames": 1,
+            "base_pose_frame": "world",
+            "tcp_pose_frame": "world",
+            "training_action_base_pose_frame": "world",
+            "training_action_tcp_pose_frame": "base_frame",
+            "training_action_tcp_euler_order": "roll_pitch_yaw",
+            "training_action_position_unit": "m",
+            "training_action_angle_unit": "rad",
+        }
+        for key, expected in vla_requirements.items():
+            if info.get(key) != expected:
+                context.error(
+                    "invalid_vla_training_metadata",
+                    f"info.json 的 {key} 必须是 {expected!r}。",
+                    feature="action",
+                )
+        if info.get("training_action_gripper_range") != [0.0, 1.0]:
+            context.error(
+                "invalid_vla_training_metadata",
+                "info.json 的 training_action_gripper_range 必须是 [0.0, 1.0]。",
+                feature="action",
+            )
+        action_feature = features.get("action")
+        if (
+            action_feature is None
+            or _feature_dimension(action_feature) != VLA_TRAINING_ACTION_DIMENSION
+            or action_feature.get("names") != list(VLA_TRAINING_ACTION_NAMES)
+        ):
+            context.error(
+                "invalid_vla_training_action_feature",
+                "VLA 数据集的 action 必须是已命名的标准 10 维向量。",
+                feature="action",
+            )
+        for required_feature in ("observation.base_pose", "control.action"):
+            if required_feature not in features:
+                context.error(
+                    "missing_vla_support_feature",
+                    f"VLA 数据集缺少 {required_feature}。",
+                    feature=required_feature,
+                )
+
+    if info.get("subtask_segmentation_available") is True:
+        expected_subtask_metadata = {
+            "subtask_schema_version": SUBTASK_SCHEMA_VERSION,
+            "subtask_directory_layout": SUBTASK_DIRECTORY_LAYOUT,
+            "subtask_directory_root": "episodes",
+            "subtask_metadata_path": "meta/subtasks.jsonl",
+            "subtask_duplicate_episode_id_policy": (
+                "renumber_per_task_from_1_in_dataset_order"
+            ),
+            "task_stages": list(TASK_STAGES),
+            "subtask_labels": list(SUBTASK_LABELS),
+            "instruction_annotation_available": True,
+            "instruction_annotation_schema": INSTRUCTION_ANNOTATION_SCHEMA,
+            "instruction_annotation_feature": "instruction",
+            "instruction_direction_labels": list(RELATIVE_DIRECTION_LABELS),
+            "instruction_direction_frame": "robot_base_at_segment_first_frame",
+            "instruction_relative_bearing_unit": "rad",
+            "task_index_semantics": "episode_level_instruction",
+        }
+        for key, expected in expected_subtask_metadata.items():
+            if info.get(key) != expected:
+                context.error(
+                    "invalid_subtask_metadata",
+                    f"info.json 的 {key} 必须是 {expected!r}。",
+                )
+        instruction_languages = info.get("instruction_annotation_languages")
+        if not isinstance(instruction_languages, list) or any(
+            not isinstance(value, str) or not value.strip()
+            for value in instruction_languages
+        ):
+            context.error(
+                "invalid_instruction_annotation_languages",
+                "info.json 的 instruction_annotation_languages 必须是字符串数组。",
+            )
+        if info.get("subtask_directory_export_available") is not True:
+            context.error(
+                "subtask_directory_export_unavailable",
+                "启用 subtask 切分时必须完成独立目录导出。",
+            )
+        for feature_name in (
+            "task_stage",
+            "subtask",
+            "subtask_segment_index",
+            "instruction",
+            "instruction_id",
+            "instruction_target_id",
+            "instruction_direction",
+            "instruction_relative_bearing_rad",
+            "instruction_pose_source",
+            "instruction_annotation_schema",
+        ):
+            if feature_name not in features:
+                context.error(
+                    "missing_subtask_feature",
+                    f"info.json 缺少 subtask feature：{feature_name}",
+                    feature=feature_name,
+                )
 
     image_features = sorted(
         name for name in features if name.startswith("observation.images.")
@@ -392,6 +523,19 @@ def _check_vector_column(
                 feature=feature,
             )
             return None
+        if any(
+            isinstance(item, bool)
+            or not isinstance(item, (int, float))
+            or not math.isfinite(float(item))
+            for item in value
+        ):
+            context.error(
+                "non_finite_vector_value",
+                f"{feature} 包含非有限数值。",
+                episode_index=episode_index,
+                feature=feature,
+            )
+            return None
         dimensions.add(len(value))
     if len(dimensions) != 1:
         context.error(
@@ -498,6 +642,8 @@ def _validate_episode_table(
     fps: float | None,
     features: dict[str, dict[str, Any]],
     image_features: list[str],
+    vla_training_action_available: bool,
+    subtask_segmentation_available: bool,
     context: _ValidationContext,
 ) -> dict[str, Any]:
     row_count = int(table.num_rows)
@@ -655,11 +801,191 @@ def _validate_episode_table(
             episode_index=episode_index,
         )
 
+    if subtask_segmentation_available:
+        missing_subtask_columns = [
+            name
+            for name in (
+                "task_stage",
+                "subtask",
+                "subtask_segment_index",
+                "instruction",
+                "instruction_id",
+                "instruction_target_id",
+                "instruction_direction",
+                "instruction_relative_bearing_rad",
+                "instruction_pose_source",
+                "instruction_annotation_schema",
+            )
+            if name not in column_names
+        ]
+        for name in missing_subtask_columns:
+            context.error(
+                "missing_subtask_parquet_column",
+                f"启用 subtask 切分时 Parquet 缺少列：{name}",
+                path=parquet_path,
+                episode_index=episode_index,
+                feature=name,
+            )
+        if not missing_subtask_columns:
+            task_stages = _column_values(table, "task_stage")
+            subtasks = _column_values(table, "subtask")
+            segment_indices = _column_values(table, "subtask_segment_index")
+            instructions = _column_values(table, "instruction")
+            instruction_ids = _column_values(table, "instruction_id")
+            instruction_target_ids = _column_values(
+                table, "instruction_target_id"
+            )
+            instruction_directions = _column_values(
+                table, "instruction_direction"
+            )
+            instruction_bearings = _column_values(
+                table, "instruction_relative_bearing_rad"
+            )
+            instruction_pose_sources = _column_values(
+                table, "instruction_pose_source"
+            )
+            instruction_schemas = _column_values(
+                table, "instruction_annotation_schema"
+            )
+            if any(value not in TASK_STAGES for value in task_stages):
+                context.error(
+                    "invalid_task_stage",
+                    "task_stage 包含 schema 之外的标签。",
+                    path=parquet_path,
+                    episode_index=episode_index,
+                    feature="task_stage",
+                )
+            if any(value not in SUBTASK_LABELS for value in subtasks):
+                context.error(
+                    "invalid_subtask",
+                    "subtask 包含 schema 之外的标签。",
+                    path=parquet_path,
+                    episode_index=episode_index,
+                    feature="subtask",
+                )
+            if any(
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or value <= 0
+                for value in segment_indices
+            ):
+                context.error(
+                    "invalid_subtask_segment_index",
+                    "subtask_segment_index 必须是正整数。",
+                    path=parquet_path,
+                    episode_index=episode_index,
+                    feature="subtask_segment_index",
+                )
+            if any(
+                not isinstance(value, str) or not value.strip()
+                for value in instructions
+            ):
+                context.error(
+                    "invalid_segment_instruction",
+                    "instruction 必须是逐帧非空字符串。",
+                    path=parquet_path,
+                    episode_index=episode_index,
+                    feature="instruction",
+                )
+            if any(
+                not isinstance(value, str) or not value.strip()
+                for value in instruction_ids
+            ):
+                context.error(
+                    "invalid_segment_instruction_id",
+                    "instruction_id 必须是逐帧非空字符串。",
+                    path=parquet_path,
+                    episode_index=episode_index,
+                    feature="instruction_id",
+                )
+            if any(
+                not isinstance(value, str) for value in instruction_target_ids
+            ):
+                context.error(
+                    "invalid_segment_instruction_target",
+                    "instruction_target_id 必须是字符串。",
+                    path=parquet_path,
+                    episode_index=episode_index,
+                    feature="instruction_target_id",
+                )
+            if any(
+                value not in {*RELATIVE_DIRECTION_LABELS, ""}
+                for value in instruction_directions
+            ):
+                context.error(
+                    "invalid_segment_instruction_direction",
+                    "instruction_direction 必须为空或八方向标签之一。",
+                    path=parquet_path,
+                    episode_index=episode_index,
+                    feature="instruction_direction",
+                )
+            invalid_bearing = any(
+                (
+                    direction != ""
+                    and (
+                        isinstance(bearing, bool)
+                        or not isinstance(bearing, (int, float))
+                        or not math.isfinite(float(bearing))
+                    )
+                )
+                or (direction == "" and bearing is not None)
+                for direction, bearing in zip(
+                    instruction_directions,
+                    instruction_bearings,
+                )
+            )
+            if invalid_bearing:
+                context.error(
+                    "invalid_segment_instruction_bearing",
+                    "八方向 instruction 必须具有有限相对方位，其余片段必须为 null。",
+                    path=parquet_path,
+                    episode_index=episode_index,
+                    feature="instruction_relative_bearing_rad",
+                )
+            if any(
+                not isinstance(value, str) or not value.strip()
+                for value in instruction_pose_sources
+            ):
+                context.error(
+                    "invalid_segment_instruction_pose_source",
+                    "instruction_pose_source 必须是非空字符串。",
+                    path=parquet_path,
+                    episode_index=episode_index,
+                    feature="instruction_pose_source",
+                )
+            valid_instruction_schemas = {
+                INSTRUCTION_ANNOTATION_SCHEMA,
+                "episode_instruction_fallback",
+            }
+            if any(
+                value not in valid_instruction_schemas
+                for value in instruction_schemas
+            ):
+                context.error(
+                    "invalid_segment_instruction_schema",
+                    "instruction_annotation_schema 不受支持。",
+                    path=parquet_path,
+                    episode_index=episode_index,
+                    feature="instruction_annotation_schema",
+                )
+            episode_report["task_stages"] = task_stages
+            episode_report["subtasks"] = subtasks
+            episode_report["subtask_segment_indices"] = segment_indices
+            episode_report["instructions"] = instructions
+            episode_report["instruction_ids"] = instruction_ids
+            episode_report["instruction_directions"] = instruction_directions
+
     for feature_name in (
         "observation.state",
         "observation.base_velocity",
+        "observation.base_pose",
+        "observation.object_state",
+        "observation.tcp_pose",
+        "control.action",
         "action",
     ):
+        if feature_name not in features or feature_name not in column_names:
+            continue
         feature = features.get(feature_name, {})
         _check_vector_column(
             _column_values(table, feature_name),
@@ -668,6 +994,23 @@ def _validate_episode_table(
             episode_index=episode_index,
             context=context,
         )
+
+    if vla_training_action_available:
+        action_values = _column_values(table, "action")
+        if any(
+            len(value) != VLA_TRAINING_ACTION_DIMENSION
+            or float(value[-1]) < 0.0
+            or float(value[-1]) > 1.0
+            for value in action_values
+            if isinstance(value, (list, tuple))
+        ):
+            context.error(
+                "invalid_vla_gripper_action",
+                "VLA action 的 gripper_normalized 必须位于 [0, 1]。",
+                path=parquet_path,
+                episode_index=episode_index,
+                feature="action",
+            )
 
     episode_report["global_indices"] = _column_values(table, "index")
     return episode_report
@@ -792,6 +1135,7 @@ def _validate_dataset(dataset_root: Path, context: _ValidationContext) -> dict[s
     data_template = info.get("data_path")
     video_template = info.get("video_path")
     all_global_indices: list[Any] = []
+    parquet_global_indices_by_episode: dict[int, list[Any]] = {}
     all_task_indices: set[int] = set()
     validated_episode_indices: list[int] = []
 
@@ -863,11 +1207,19 @@ def _validate_dataset(dataset_root: Path, context: _ValidationContext) -> dict[s
             fps=fps,
             features=features,
             image_features=image_features,
+            vla_training_action_available=(
+                info.get("vla_training_action_available") is True
+            ),
+            subtask_segmentation_available=(
+                info.get("subtask_segmentation_available") is True
+            ),
             context=context,
         )
+        episode_global_indices = episode_report.pop("global_indices", [])
+        parquet_global_indices_by_episode[episode_index] = episode_global_indices
         context.episodes.append(episode_report)
         validated_episode_indices.append(episode_index)
-        all_global_indices.extend(episode_report.pop("global_indices", []))
+        all_global_indices.extend(episode_global_indices)
         all_task_indices.update(episode_report.get("task_indices", []))
 
         meta = episodes_meta.get(episode_index)
@@ -999,6 +1351,86 @@ def _validate_dataset(dataset_root: Path, context: _ValidationContext) -> dict[s
                 path=tasks_path,
             )
 
+    subtask_validation: dict[str, Any] | None = None
+    if info.get("subtask_segmentation_available") is True:
+        subtask_validation = validate_subtask_directory_export(dataset_root)
+        for error in subtask_validation.get("errors", []):
+            context.error(
+                str(error.get("code") or "subtask_validation_failed"),
+                str(error.get("message") or "子任务目录校验失败。"),
+                path=(Path(str(error["path"])) if error.get("path") else None),
+                episode_index=(
+                    int(error["episode_index"])
+                    if isinstance(error.get("episode_index"), int)
+                    else None
+                ),
+            )
+        for warning in subtask_validation.get("warnings", []):
+            context.warning(
+                str(warning.get("code") or "subtask_validation_warning"),
+                str(warning.get("message") or "子任务目录校验警告。"),
+                path=(
+                    Path(str(warning["path"]))
+                    if warning.get("path")
+                    else None
+                ),
+            )
+        custom_by_episode = {
+            int(report["episode_index"]): report
+            for report in subtask_validation.get("episodes", [])
+            if isinstance(report, dict)
+            and isinstance(report.get("episode_index"), int)
+        }
+        for episode_report in context.episodes:
+            episode_index = int(episode_report["episode_index"])
+            custom = custom_by_episode.get(episode_index)
+            if custom is None:
+                context.error(
+                    "missing_subtask_episode_export",
+                    f"episode {episode_index} 缺少独立 subtask 目录。",
+                    episode_index=episode_index,
+                )
+                continue
+            if custom.get("dataset_global_indices") != (
+                parquet_global_indices_by_episode.get(episode_index)
+            ):
+                context.error(
+                    "subtask_parquet_frame_mismatch",
+                    "独立 subtask 目录的 dataset_global_index 与 Parquet 不一致。",
+                    episode_index=episode_index,
+                )
+            if custom.get("task_stages") != episode_report.get("task_stages"):
+                context.error(
+                    "subtask_parquet_stage_mismatch",
+                    "独立 subtask 目录与 Parquet 的 task_stage 不一致。",
+                    episode_index=episode_index,
+                )
+            if custom.get("subtasks") != episode_report.get("subtasks"):
+                context.error(
+                    "subtask_parquet_label_mismatch",
+                    "独立 subtask 目录与 Parquet 的 subtask 标签不一致。",
+                    episode_index=episode_index,
+                )
+            if custom.get("segment_indices") != episode_report.get(
+                "subtask_segment_indices"
+            ):
+                context.error(
+                    "subtask_parquet_segment_index_mismatch",
+                    "独立 subtask 目录与 Parquet 的片段编号不一致。",
+                    episode_index=episode_index,
+                )
+        for custom in subtask_validation.get("episodes", []):
+            if not isinstance(custom, dict):
+                continue
+            for verbose_key in (
+                "global_indices",
+                "dataset_global_indices",
+                "task_stages",
+                "subtasks",
+                "segment_indices",
+            ):
+                custom.pop(verbose_key, None)
+
     return {
         "info": info,
         "fps": fps,
@@ -1006,6 +1438,7 @@ def _validate_dataset(dataset_root: Path, context: _ValidationContext) -> dict[s
         "image_features": image_features,
         "validated_episode_indices": validated_episode_indices,
         "total_rows": len(all_global_indices),
+        "subtask_validation": subtask_validation,
     }
 
 

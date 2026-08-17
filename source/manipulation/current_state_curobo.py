@@ -40,6 +40,8 @@ SIDE_GRASP_SUPPORT_CLEARANCE_M = 0.0
 # 但持续保持零目标能在 carry 阶段提供夹紧力，避免苹果在导航起步时滑落。
 SIDE_GRASP_SAFE_CLOSE_M = 0.0
 SIDE_PREGRASP_OFFSET_M = 0.10
+TOP_GRASP_DEPTH_BELOW_TOP_M = 0.035
+TOP_PREGRASP_OFFSET_M = 0.10
 LIFT_OFFSET_M = 0.10
 ARM_PLACE_RELEASE_CLEARANCE_M = 0.013
 ARM_PLACE_PRE_PLACE_CLEARANCE_M = 0.06
@@ -49,6 +51,85 @@ WORKSPACE_WARN_XY_RADIUS_M = 0.55
 WORKSPACE_WARN_GRASP_Z_M = 0.35
 WORKSPACE_WARN_PREGRASP_Z_M = 0.45
 WORKSPACE_WARN_RADIUS_3D_M = 0.65
+
+# grasp_tcp_link 局部 +X 是夹爪伸出方向；该姿态把 +X 对齐到 base -Z。
+TCP_TOP_DOWN_QUAT_BASE_WXYZ = np.array(
+    [np.sqrt(0.5), 0.0, np.sqrt(0.5), 0.0],
+    dtype=float,
+)
+
+# A nearly upright can has no stable horizontal long-axis direction.  Small
+# simulation tilts would otherwise amplify into an arbitrary wrist-yaw change.
+# Only align to the projected long axis once the object is tilted by about
+# 14.5 degrees or more; upright cans retain the known-good fixed top-down pose.
+TOP_DOWN_LONG_AXIS_MIN_HORIZONTAL_PROJECTION = 0.25
+
+
+def _top_down_quaternion_for_object_long_axis(
+    *,
+    T_world_base: Any,
+    object_long_axis_world: Any | None,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """保持 TCP +X 竖直向下，并让夹爪闭合轴垂直于物体水平长轴。"""
+
+    if object_long_axis_world is None:
+        return TCP_TOP_DOWN_QUAT_BASE_WXYZ.copy(), {
+            "mode": "base_fixed",
+            "reason": "object_long_axis_unavailable",
+        }
+    T_world_base = np.asarray(T_world_base, dtype=float)
+    axis_world = np.asarray(object_long_axis_world, dtype=float)
+    if T_world_base.shape != (4, 4) or axis_world.shape != (3,):
+        raise ValueError("top-down 长轴对齐要求 4x4 T_world_base 和 3D object long axis")
+    if not bool(np.all(np.isfinite(T_world_base))) or not bool(
+        np.all(np.isfinite(axis_world))
+    ):
+        raise ValueError("top-down 长轴对齐输入必须为有限数值")
+    axis_norm = float(np.linalg.norm(axis_world))
+    if axis_norm < 1.0e-9:
+        raise ValueError("object long axis 不能为零向量")
+    axis_world = axis_world / axis_norm
+    axis_base = T_world_base[:3, :3].T @ axis_world
+    horizontal_norm = float(np.linalg.norm(axis_base[:2]))
+    if horizontal_norm < TOP_DOWN_LONG_AXIS_MIN_HORIZONTAL_PROJECTION:
+        return TCP_TOP_DOWN_QUAT_BASE_WXYZ.copy(), {
+            "mode": "base_fixed",
+            "reason": "object_long_axis_nearly_vertical",
+            "object_long_axis_world_xyz": axis_world.tolist(),
+            "object_long_axis_base_xyz": axis_base.tolist(),
+            "horizontal_projection_norm": horizontal_norm,
+            "minimum_horizontal_projection_for_alignment": (
+                TOP_DOWN_LONG_AXIS_MIN_HORIZONTAL_PROJECTION
+            ),
+        }
+
+    tcp_z_base = np.array(
+        [axis_base[0] / horizontal_norm, axis_base[1] / horizontal_norm, 0.0],
+        dtype=float,
+    )
+    # 平行夹爪绕下探轴旋转 180°等价；选择更接近原姿态的符号，避免无谓腕部翻转。
+    if tcp_z_base[0] < 0.0:
+        tcp_z_base *= -1.0
+    tcp_x_base = np.array([0.0, 0.0, -1.0], dtype=float)
+    tcp_y_base = np.cross(tcp_z_base, tcp_x_base)
+    rotation_base_tcp = np.column_stack(
+        (tcp_x_base, tcp_y_base, tcp_z_base)
+    )
+    quaternion = rotmat_to_quat_wxyz(rotation_base_tcp)
+    closing_axis_dot_long_axis = float(np.dot(tcp_y_base, axis_base))
+    return quaternion, {
+        "mode": "object_long_axis_aligned",
+        "object_long_axis_world_xyz": axis_world.tolist(),
+        "object_long_axis_base_xyz": axis_base.tolist(),
+        "horizontal_projection_norm": horizontal_norm,
+        "minimum_horizontal_projection_for_alignment": (
+            TOP_DOWN_LONG_AXIS_MIN_HORIZONTAL_PROJECTION
+        ),
+        "tcp_x_down_base_xyz": tcp_x_base.tolist(),
+        "tcp_y_closing_axis_base_xyz": tcp_y_base.tolist(),
+        "tcp_z_long_axis_base_xyz": tcp_z_base.tolist(),
+        "closing_axis_dot_object_long_axis": closing_axis_dot_long_axis,
+    }
 
 
 def normalize_quat_wxyz(quaternion: Any) -> np.ndarray:
@@ -381,6 +462,152 @@ def build_side_grasp_target_payload(
             "target_workspace_base": diagnostics,
         },
     }
+
+
+def build_top_down_grasp_target_payload(
+    *,
+    object_prim_path: str,
+    T_world_base: Any,
+    bbox_min: Any,
+    bbox_max: Any,
+    bbox_center: Any,
+    bbox_size: Any,
+    object_long_axis_world: Any | None = None,
+) -> dict[str, Any]:
+    """从物体上方竖直下探，生成当前物体的 pick target JSON。"""
+
+    T_world_base = np.asarray(T_world_base, dtype=float)
+    bbox_min = np.asarray(bbox_min, dtype=float)
+    bbox_max = np.asarray(bbox_max, dtype=float)
+    bbox_center = np.asarray(bbox_center, dtype=float)
+    bbox_size = np.asarray(bbox_size, dtype=float)
+
+    grasp_position_world = bbox_center.copy()
+    grasp_position_world[2] = bbox_max[2] - TOP_GRASP_DEPTH_BELOW_TOP_M
+    grasp_position_base = _world_point_to_base_position(
+        T_world_base,
+        grasp_position_world,
+    )
+    grasp_quaternion_base, yaw_alignment = (
+        _top_down_quaternion_for_object_long_axis(
+            T_world_base=T_world_base,
+            object_long_axis_world=object_long_axis_world,
+        )
+    )
+    T_base_grasp = pose_to_matrix(
+        grasp_position_base,
+        grasp_quaternion_base,
+    )
+    T_base_pregrasp = _offset_pose_along_base_z(
+        T_base_grasp,
+        TOP_PREGRASP_OFFSET_M,
+    )
+    T_base_lift = _offset_pose_along_base_z(T_base_grasp, LIFT_OFFSET_M)
+
+    T_world_pregrasp = T_world_base @ T_base_pregrasp
+    T_world_grasp = T_world_base @ T_base_grasp
+    T_world_lift = T_world_base @ T_base_lift
+    diagnostics = _make_target_workspace_diagnostics(
+        T_base_pregrasp,
+        T_base_grasp,
+        T_base_lift,
+    )
+    grasp_pos_base, grasp_quat_base = matrix_to_pose(T_base_grasp)
+    grasp_pos_world, grasp_quat_world = matrix_to_pose(T_world_grasp)
+    pregrasp_pos_world, pregrasp_quat_world = matrix_to_pose(T_world_pregrasp)
+    lift_pos_world, lift_quat_world = matrix_to_pose(T_world_lift)
+
+    return {
+        "schema_version": 1,
+        "frame": "arm_base_link",
+        "default_target_name": "grasp",
+        "position_xyz": grasp_pos_base.tolist(),
+        "quaternion_wxyz": grasp_quat_base.tolist(),
+        "sequence": ["pregrasp", "grasp", "close_gripper", "lift"],
+        "poses": {
+            "pregrasp": _make_named_pose_entry(T_base_pregrasp, T_world_pregrasp),
+            "grasp": _make_named_pose_entry(T_base_grasp, T_world_grasp),
+            "lift": _make_named_pose_entry(T_base_lift, T_world_lift),
+        },
+        "gripper": {
+            "open_m": 0.043,
+            "close_m": SIDE_GRASP_SAFE_CLOSE_M,
+            "joint_names": list(GRIPPER_JOINT_NAMES),
+        },
+        "source": {
+            "type": "sim_object_bbox_top_down",
+            "grasp_mode": "top_down",
+            "object_prim_path": object_prim_path,
+            "world_grasp_pose": {
+                "position_xyz": grasp_pos_world.tolist(),
+                "quaternion_wxyz": grasp_quat_world.tolist(),
+            },
+            "world_pregrasp_pose": {
+                "position_xyz": pregrasp_pos_world.tolist(),
+                "quaternion_wxyz": pregrasp_quat_world.tolist(),
+            },
+            "world_lift_pose": {
+                "position_xyz": lift_pos_world.tolist(),
+                "quaternion_wxyz": lift_quat_world.tolist(),
+            },
+            "bbox_world": {
+                "min_xyz": bbox_min.tolist(),
+                "max_xyz": bbox_max.tolist(),
+                "center_xyz": bbox_center.tolist(),
+                "size_xyz": bbox_size.tolist(),
+            },
+            "grasp_depth_below_top_m": TOP_GRASP_DEPTH_BELOW_TOP_M,
+            "pregrasp_offset_m": TOP_PREGRASP_OFFSET_M,
+            "lift_offset_m": LIFT_OFFSET_M,
+            "tcp_orientation_rule": (
+                "top_down_long_axis_aligned: grasp_tcp_link local +X points to "
+                "arm_base_link -Z; local +Y closes across the object short axis"
+            ),
+            "top_down_yaw_alignment": yaw_alignment,
+        },
+        "diagnostics": {
+            "target_workspace_base": diagnostics,
+        },
+    }
+
+
+def build_grasp_target_payload(
+    *,
+    grasp_mode: str,
+    object_prim_path: str,
+    T_world_base: Any,
+    bbox_min: Any,
+    bbox_max: Any,
+    bbox_center: Any,
+    bbox_size: Any,
+    object_long_axis_world: Any | None = None,
+) -> dict[str, Any]:
+    """按显式抓取模式分派目标生成；auto 保持旧 side 行为。"""
+
+    normalized_mode = str(grasp_mode).strip().lower().replace("-", "_")
+    if normalized_mode == "auto":
+        normalized_mode = "side"
+    builders = {
+        "side": build_side_grasp_target_payload,
+        "top_down": build_top_down_grasp_target_payload,
+    }
+    builder = builders.get(normalized_mode)
+    if builder is None:
+        raise ValueError(
+            "grasp_mode 必须是 auto、side 或 top_down，"
+            f"当前为 {grasp_mode!r}"
+        )
+    builder_kwargs = dict(
+        object_prim_path=object_prim_path,
+        T_world_base=T_world_base,
+        bbox_min=bbox_min,
+        bbox_max=bbox_max,
+        bbox_center=bbox_center,
+        bbox_size=bbox_size,
+    )
+    if normalized_mode == "top_down":
+        builder_kwargs["object_long_axis_world"] = object_long_axis_world
+    return builder(**builder_kwargs)
 
 
 def build_arm_place_target_payload(
@@ -757,7 +984,15 @@ class CurrentStateCuroboPlanner:
         if not isinstance(payload, dict):
             payload = load_curobo_plan_json(plan_json)
         segment_names = _motion_segment_names(payload)
-        expected_side_retreat = not self._config.side_grasp_plan_vertical_lift
+        pick_target = export_report.get("pick_target")
+        pick_target = pick_target if isinstance(pick_target, dict) else {}
+        pick_source = pick_target.get("source")
+        pick_source = pick_source if isinstance(pick_source, dict) else {}
+        grasp_mode = str(pick_source.get("grasp_mode") or "side")
+        expected_side_retreat = bool(
+            grasp_mode == "side"
+            and not self._config.side_grasp_plan_vertical_lift
+        )
         if expected_side_retreat and (
             "lift_object" in segment_names or "retreat_object" not in segment_names
         ):
@@ -766,6 +1001,11 @@ class CurrentStateCuroboPlanner:
                 "需要 retreat_object，且禁止 lift_object。"
                 f"当前 cuRobo 返回 motion segments={segment_names}。"
                 "如果正在复用 planner server，请重启 server 后再试。"
+            )
+        if grasp_mode == "top_down" and "lift_object" not in segment_names:
+            raise RuntimeError(
+                "top-down pick 必须在闭合夹爪后执行 lift_object；"
+                f"当前 cuRobo 返回 motion segments={segment_names}。"
             )
         plan = arm_plan_from_curobo_payload(
             payload,
@@ -785,8 +1025,13 @@ class CurrentStateCuroboPlanner:
             "expected": (
                 "baseline_side_retreat"
                 if expected_side_retreat
-                else "vertical_lift_after_side_grasp"
+                else (
+                    "vertical_lift_after_top_down_grasp"
+                    if grasp_mode == "top_down"
+                    else "vertical_lift_after_side_grasp"
+                )
             ),
+            "grasp_mode": grasp_mode,
             "motion_segment_names": segment_names,
             "side_grasp_plan_vertical_lift": self._config.side_grasp_plan_vertical_lift,
             "side_grasp_fallback_retreat": self._config.side_grasp_fallback_retreat,
@@ -952,7 +1197,9 @@ __all__ = [
     "CurrentStateCuroboPickPlannerConfig",
     "build_arm_place_target_payload",
     "build_curobo_state_payload",
+    "build_grasp_target_payload",
     "build_side_grasp_target_payload",
+    "build_top_down_grasp_target_payload",
     "matrix_to_pose",
     "pose_dict_from_matrix",
     "pose_to_matrix",

@@ -75,6 +75,8 @@ class NamedJointActionApplier:
             return report
 
         dof_names = self._dof_names()
+        for gripper_joint_name in report.get("gripper_joint_names", ()):
+            _index_for_joint(dof_names, str(gripper_joint_name))
         joint_names = tuple(target_by_name)
         joint_indices = tuple(_index_for_joint(dof_names, name) for name in joint_names)
         target_positions = tuple(target_by_name[name] for name in joint_names)
@@ -151,13 +153,20 @@ class NamedJointActionApplier:
                 "gripper_joint_positions length does not match gripper_joint_names: "
                 f"{len(positions)} != {len(joint_names)}"
             )
-        for name, value in zip(joint_names, positions):
-            target_by_name[name] = float(value)
+        if not joint_names:
+            raise RuntimeError("gripper_joint_names must not be empty")
+        # 对外保留双指字段；物理 target 只下发 master，follower 由 mimic 驱动。
+        symmetric_positions = tuple(float(positions[0]) for _ in joint_names)
+        target_by_name[joint_names[0]] = symmetric_positions[0]
         return {
             "gripper_targeted": True,
             "gripper_command": action.gripper_command,
             "gripper_joint_names": joint_names,
-            "gripper_joint_positions": positions,
+            "gripper_joint_positions": symmetric_positions,
+            "gripper_control_joint_names": (joint_names[0],),
+            "gripper_follower_joint_names": joint_names[1:],
+            "gripper_follower_control_mode": "hard_physx_mimic_only",
+            "gripper_physical_control_mode": "single_master_hard_physx_mimic",
         }
 
     def _make_articulation_action(

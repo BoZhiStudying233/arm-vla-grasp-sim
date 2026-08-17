@@ -40,7 +40,10 @@ import traceback
 from pathlib import Path
 
 
-WORKSPACE = Path(os.environ.get("GO2_X5_WORKSPACE", "/home/light/workspace/arm_vla"))
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+WORKSPACE = Path(
+    os.environ.get("GO2_X5_WORKSPACE", str(PROJECT_ROOT))
+).expanduser().resolve()
 PLAN_MODULE_PATH = WORKSPACE / "scripts/curobo/03_plan_grasp_trajectory.py"
 
 DEFAULT_STATE_JSON = Path("/tmp/go2_x5_isaac_state.json")
@@ -234,6 +237,7 @@ class CuroboPlannerServer:
                     "side_grasp_retreat_to_pregrasp": True,
                     "split_pregrasp_motion": True,
                     "single_retime_split_pregrasp": True,
+                    "top_down_reverse_lift": True,
                 },
                 "workspace": str(WORKSPACE),
             }

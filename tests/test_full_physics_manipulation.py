@@ -6,6 +6,7 @@ import json
 import math
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 from source.interfaces import ArmPlan, EpisodeSpec, NavGoal, SimulationState
@@ -13,11 +14,14 @@ from source.manipulation.arm_executor import SegmentedArmExecutor, SegmentedArmE
 from source.manipulation.current_state_curobo import (
     CurrentStateCuroboPlanner,
     CurrentStateCuroboPlannerConfig,
+    TCP_TOP_DOWN_QUAT_BASE_WXYZ,
     build_curobo_state_payload,
     build_arm_place_target_payload,
     build_side_grasp_target_payload,
+    build_top_down_grasp_target_payload,
     pose_to_matrix,
 )
+from source.manipulation.curobo_robot_config import load_workspace_robot_config
 from source.manipulation.curobo_adapter import (
     CuroboJsonManipulationPlanner,
     CuroboPlanFormatError,
@@ -28,6 +32,73 @@ from source.manipulation.grasp_pipeline import GraspPipeline, GraspPipelineConfi
 
 
 class FullPhysicsManipulationTest(unittest.TestCase):
+    def test_curobo_robot_config_resolves_assets_from_current_workspace(self) -> None:
+        workspace = Path(__file__).resolve().parents[1]
+        yaml_path = workspace / "source/robot/go2_x5/curobo/go2_x5_arm.yml"
+
+        config = load_workspace_robot_config(workspace, robot_yaml=yaml_path)
+        kinematics = config["kinematics"]
+
+        self.assertEqual(
+            Path(kinematics["asset_root_path"]),
+            workspace / "source/robot/go2_x5",
+        )
+        self.assertEqual(
+            Path(kinematics["urdf_path"]),
+            workspace / "source/robot/go2_x5/curobo/go2_x5_arm.urdf",
+        )
+        self.assertNotIn(
+            "/home/light/workspace/arm_vla/",
+            yaml_path.read_text(encoding="utf-8"),
+        )
+
+    def test_top_down_uses_one_shot_when_shared_server_lacks_reverse_lift(self) -> None:
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            target_path = root / "target.json"
+            target_path.write_text(
+                json.dumps(
+                    {
+                        "source": {"grasp_mode": "top_down"},
+                        "diagnostics": {
+                            "target_workspace_base": {
+                                "grasp": {"xy_radius_m": 0.4},
+                                "pregrasp": {"radius_3d_m": 0.5},
+                            }
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            task = GraspTask(
+                object_prim_path="/World/cola",
+                state_json=str(root / "state.json"),
+                target_json=str(target_path),
+                plan_json=str(root / "plan.json"),
+            )
+            pipeline = GraspPipeline(GraspPipelineConfig(workspace=root))
+            expected = {"summary": {"all_motion_segments_success": True}}
+            with (
+                patch.object(
+                    pipeline,
+                    "_server_supports_top_down_reverse_lift",
+                    return_value=False,
+                ),
+                patch.object(pipeline, "_try_server", return_value=True) as server,
+                patch.object(
+                    pipeline,
+                    "_run_one_shot_planner",
+                    return_value=expected,
+                ) as one_shot,
+            ):
+                result = pipeline.plan(task)
+
+        self.assertEqual(result, expected)
+        server.assert_not_called()
+        one_shot.assert_called_once()
+
     def test_curobo_state_payload_records_world_collision_metadata(self) -> None:
         payload = build_curobo_state_payload(
             q_arm=[0.0] * 6,
@@ -69,6 +140,15 @@ class FullPhysicsManipulationTest(unittest.TestCase):
         )
 
         world_collision = payload["world_collision"]
+        self.assertEqual(
+            payload["planner_convention"]["active_joint_names"],
+            [f"arm_joint{index}" for index in range(1, 7)],
+        )
+        self.assertEqual(
+            payload["isaac_state"]["gripper_joint_names"],
+            ["arm_joint7", "arm_joint8"],
+        )
+        self.assertEqual(payload["isaac_state"]["q_gripper"], [0.043, 0.043])
         self.assertTrue(world_collision["enabled"])
         self.assertEqual(world_collision["padding_m"], 0.05)
         self.assertEqual(world_collision["clearance_margin_m"], 0.05)
@@ -294,7 +374,7 @@ class FullPhysicsManipulationTest(unittest.TestCase):
             executor.compute_action(_state())
 
         contact_state = _state_with_all_joints(
-            (0.2, 0.21, 0.22, 0.23, 0.24, 0.25, 0.04, 0.04)
+            (0.2, 0.21, 0.22, 0.23, 0.24, 0.25, 0.04, 0.02)
         )
         close_actions = [executor.compute_action(contact_state) for _ in range(3)]
         close_targets = [
@@ -487,6 +567,13 @@ class FullPhysicsManipulationTest(unittest.TestCase):
                 ],
             ),
             *payload["segments"],
+            _motion_segment(
+                "return_home_after_place",
+                [
+                    (0.1, 0.11, 0.12, 0.13, 0.14, 0.15),
+                    (0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+                ],
+            ),
         ]
         plan = arm_plan_from_curobo_payload(payload)
         executor = SegmentedArmExecutor(
@@ -516,6 +603,7 @@ class FullPhysicsManipulationTest(unittest.TestCase):
         self.assertEqual(scale_by_segment["move_to_pre_place"], 1.0)
         self.assertEqual(scale_by_segment["approach_to_place"], 1.0)
         self.assertEqual(scale_by_segment["retreat_place"], 1.0)
+        self.assertEqual(scale_by_segment["return_home_after_place"], 1.0)
 
     def test_place_pre_open_segments_hold_gripper_closed_without_close_segment(self) -> None:
         payload = _place_payload()
@@ -566,6 +654,194 @@ class FullPhysicsManipulationTest(unittest.TestCase):
         )
         self.assertTrue(
             all(action.metadata.get("gripper_hold_after_close") for action in pre_open_motion_actions)
+        )
+
+    def test_place_pre_open_segments_use_verified_carry_preload(self) -> None:
+        plan = arm_plan_from_curobo_payload(_place_payload())
+        plan.metadata["place_closed_gripper_hold"] = {
+            "gripper_joint_names": ("arm_joint7", "arm_joint8"),
+            "gripper_joint_positions": (0.021, 0.023),
+            "source": "verified_contact_preload",
+        }
+        executor = SegmentedArmExecutor(
+            BinaryGripperController(),
+            config=SegmentedArmExecutorConfig(
+                sim_dt=0.02,
+                arm_command_dt=0.02,
+                settle_to_segment_start_duration=0.0,
+                post_motion_hold_duration=0.0,
+                gripper_move_duration=0.02,
+                gripper_hold_duration=0.0,
+            ),
+        )
+        executor.reset(plan)
+
+        actions = _drain_executor(executor)
+        first_open_index = next(
+            index
+            for index, action in enumerate(actions)
+            if action.metadata.get("segment_name") == "open_gripper"
+        )
+        pre_open_actions = [
+            action
+            for action in actions[:first_open_index]
+            if action.metadata.get("segment_name") == "approach_to_place"
+        ]
+
+        self.assertTrue(pre_open_actions)
+        self.assertTrue(all(action.gripper_command == "close" for action in pre_open_actions))
+        self.assertTrue(
+            all(
+                tuple(action.metadata.get("gripper_joint_positions", ()))
+                == (0.021, 0.021)
+                for action in pre_open_actions
+            )
+        )
+
+    def test_place_release_wait_is_unskippable_and_rejects_moving_arm(self) -> None:
+        plan = arm_plan_from_curobo_payload(_place_payload())
+        executor = SegmentedArmExecutor(
+            BinaryGripperController(),
+            config=SegmentedArmExecutorConfig(
+                sim_dt=0.05,
+                arm_command_dt=0.05,
+                settle_to_segment_start_duration=0.0,
+                post_motion_hold_duration=0.10,
+                place_release_stability_window_duration=0.10,
+                gripper_move_duration=0.05,
+                gripper_hold_duration=0.0,
+                final_motion_hold_duration=0.0,
+            ),
+        )
+        executor.reset(plan)
+        target = (0.4, 0.41, 0.42, 0.43, 0.44, 0.45)
+        state = _state_with_all_joints((*target, 0.02, 0.02))
+        while executor.status()["current_segment"] != {
+            "name": "approach_to_place",
+            "type": "post_motion_hold",
+        }:
+            executor.compute_action(state)
+
+        first_hold = executor.compute_action(state)
+        second_hold = executor.compute_action(state)
+        moving_state = replace(
+            state,
+            joint_positions=tuple(value + 0.004 for value in target) + (0.02, 0.02),
+            joint_velocities=(0.0,) * 8,
+        )
+        failed_action = executor.compute_action(moving_state)
+
+        self.assertEqual(first_hold.metadata["segment_type"], "post_motion_hold")
+        self.assertEqual(second_hold.metadata["segment_type"], "post_motion_hold")
+        self.assertEqual(failed_action.source, "arm_place_failed")
+        self.assertTrue(executor.status()["failed"])
+        self.assertEqual(executor.status()["failure_reason"], "arm_place_release_not_stable")
+        failure = executor.status()["failure_metadata"]
+        self.assertEqual(
+            failure["post_motion_hold_velocity_source"],
+            "joint_position_window_peak_delta",
+        )
+        self.assertGreater(failure["final_velocity"], failure["velocity_tolerance"])
+
+    def test_place_release_ignores_inconsistent_contact_velocity_when_position_is_stable(self) -> None:
+        plan = arm_plan_from_curobo_payload(_place_payload())
+        executor = SegmentedArmExecutor(
+            BinaryGripperController(),
+            config=SegmentedArmExecutorConfig(
+                sim_dt=0.05,
+                arm_command_dt=0.05,
+                settle_to_segment_start_duration=0.0,
+                post_motion_hold_duration=0.10,
+                place_release_stability_window_duration=0.10,
+                gripper_move_duration=0.05,
+                gripper_hold_duration=0.0,
+                final_motion_hold_duration=0.0,
+            ),
+        )
+        executor.reset(plan)
+        target = (0.4, 0.41, 0.42, 0.43, 0.44, 0.45)
+        state = _state_with_all_joints((*target, 0.02, 0.02))
+        while executor.status()["current_segment"] != {
+            "name": "approach_to_place",
+            "type": "post_motion_hold",
+        }:
+            executor.compute_action(state)
+
+        executor.compute_action(state)
+        executor.compute_action(state)
+        noisy_velocity_state = replace(
+            state,
+            joint_velocities=(0.2,) * 6 + (0.0, 0.0),
+        )
+        next_action = executor.compute_action(noisy_velocity_state)
+
+        self.assertFalse(executor.status()["failed"])
+        self.assertEqual(next_action.metadata["segment_name"], "open_gripper")
+        report = executor.status()["strict_post_motion_wait_reports"][-1]
+        self.assertTrue(report["post_motion_hold_converged"])
+        self.assertEqual(
+            report["post_motion_hold_velocity_source"],
+            "joint_position_window_peak_delta",
+        )
+        self.assertEqual(report["post_motion_hold_position_derived_velocity"], 0.0)
+        self.assertEqual(report["post_motion_hold_reported_state_velocity"], 0.2)
+
+    def test_place_release_rejects_incomplete_stability_window(self) -> None:
+        plan = arm_plan_from_curobo_payload(_place_payload())
+        executor = SegmentedArmExecutor(
+            BinaryGripperController(),
+            config=SegmentedArmExecutorConfig(
+                sim_dt=0.05,
+                arm_command_dt=0.05,
+                settle_to_segment_start_duration=0.0,
+                post_motion_hold_duration=0.10,
+                place_release_stability_window_duration=0.30,
+                fail_on_strict_post_motion_state_unavailable=True,
+                gripper_move_duration=0.05,
+                gripper_hold_duration=0.0,
+                final_motion_hold_duration=0.0,
+            ),
+        )
+        executor.reset(plan)
+        target = (0.4, 0.41, 0.42, 0.43, 0.44, 0.45)
+        state = _state_with_all_joints((*target, 0.02, 0.02))
+
+        while not executor.is_done(state):
+            executor.compute_action(state)
+
+        status = executor.status()
+        self.assertTrue(status["failed"])
+        self.assertEqual(status["failure_reason"], "arm_place_release_not_stable")
+        self.assertFalse(
+            status["failure_metadata"]["post_motion_hold_stability_window_complete"]
+        )
+
+    def test_place_release_uses_task_settle_steps(self) -> None:
+        plan = arm_plan_from_curobo_payload(_place_payload())
+        plan.metadata["place_release_settle_steps"] = 7
+        executor = SegmentedArmExecutor(
+            BinaryGripperController(),
+            config=SegmentedArmExecutorConfig(
+                sim_dt=0.02,
+                settle_to_segment_start_duration=0.0,
+                post_motion_hold_duration=0.0,
+                gripper_move_duration=0.02,
+                gripper_hold_duration=0.0,
+                post_open_release_settle_duration=0.04,
+            ),
+        )
+        executor.reset(plan)
+
+        actions = _drain_executor(executor)
+        release_settle_actions = [
+            action
+            for action in actions
+            if action.metadata.get("segment_type") == "post_open_release_settle"
+        ]
+
+        self.assertEqual(len(release_settle_actions), 7)
+        self.assertTrue(
+            all(action.metadata["task_release_settle_steps"] == 7 for action in release_settle_actions)
         )
 
     def test_place_plan_emits_gripper_open_event_without_internal_world_step(self) -> None:
@@ -731,6 +1007,94 @@ class FullPhysicsManipulationTest(unittest.TestCase):
         self.assertAlmostEqual(source["applied_grasp_center_z_offset_m"], 0.0075)
         self.assertLess(grasp_z, source["bbox_world"]["max_xyz"][2])
         self.assertAlmostEqual(payload["gripper"]["close_m"], 0.0)
+
+    def test_top_down_grasp_descends_from_above_with_tcp_x_axis_down(self) -> None:
+        payload = build_top_down_grasp_target_payload(
+            object_prim_path="/World/cola",
+            T_world_base=pose_to_matrix(
+                (0.0, 0.0, 0.35),
+                (1.0, 0.0, 0.0, 0.0),
+            ),
+            bbox_min=(-0.03, -0.48, 0.0),
+            bbox_max=(0.03, -0.42, 0.107),
+            bbox_center=(0.0, -0.45, 0.0535),
+            bbox_size=(0.06, 0.06, 0.107),
+        )
+
+        source = payload["source"]
+        grasp = payload["poses"]["grasp"]
+        pregrasp = payload["poses"]["pregrasp"]
+        lift = payload["poses"]["lift"]
+        grasp_matrix = pose_to_matrix(
+            grasp["position_xyz"],
+            grasp["quaternion_wxyz"],
+        )
+        self.assertEqual(source["type"], "sim_object_bbox_top_down")
+        self.assertEqual(source["grasp_mode"], "top_down")
+        self.assertAlmostEqual(source["world_grasp_pose"]["position_xyz"][2], 0.072)
+        self.assertAlmostEqual(pregrasp["position_xyz"][2] - grasp["position_xyz"][2], 0.10)
+        self.assertAlmostEqual(lift["position_xyz"][2] - grasp["position_xyz"][2], 0.10)
+        self.assertAlmostEqual(grasp_matrix[0, 0], 0.0, places=7)
+        self.assertAlmostEqual(grasp_matrix[1, 0], 0.0, places=7)
+        self.assertAlmostEqual(grasp_matrix[2, 0], -1.0, places=7)
+
+    def test_top_down_grasp_aligns_closing_axis_across_object_short_axis(self) -> None:
+        payload = build_top_down_grasp_target_payload(
+            object_prim_path="/World/cola",
+            T_world_base=pose_to_matrix(
+                (0.0, 0.0, 0.35),
+                (1.0, 0.0, 0.0, 0.0),
+            ),
+            bbox_min=(-0.06, -0.06, 0.0),
+            bbox_max=(0.06, 0.06, 0.10),
+            bbox_center=(0.0, 0.0, 0.05),
+            bbox_size=(0.12, 0.12, 0.10),
+            object_long_axis_world=(0.0, 1.0, 0.0),
+        )
+
+        grasp = payload["poses"]["grasp"]
+        grasp_matrix = pose_to_matrix(
+            grasp["position_xyz"],
+            grasp["quaternion_wxyz"],
+        )
+        for actual, expected in zip(grasp_matrix[:3, 0], [0.0, 0.0, -1.0]):
+            self.assertAlmostEqual(actual, expected, places=7)
+        self.assertAlmostEqual(abs(grasp_matrix[1, 2]), 1.0, places=7)
+        self.assertAlmostEqual(grasp_matrix[1, 1], 0.0, places=7)
+        alignment = payload["source"]["top_down_yaw_alignment"]
+        self.assertEqual(alignment["mode"], "object_long_axis_aligned")
+        self.assertAlmostEqual(
+            alignment["closing_axis_dot_object_long_axis"],
+            0.0,
+            places=7,
+        )
+
+    def test_top_down_grasp_keeps_fixed_yaw_for_nearly_upright_object(self) -> None:
+        payload = build_top_down_grasp_target_payload(
+            object_prim_path="/World/cola",
+            T_world_base=pose_to_matrix(
+                (0.0, 0.0, 0.35),
+                (1.0, 0.0, 0.0, 0.0),
+            ),
+            bbox_min=(-0.03, -0.03, 0.0),
+            bbox_max=(0.03, 0.03, 0.11),
+            bbox_center=(0.0, 0.0, 0.055),
+            bbox_size=(0.06, 0.06, 0.11),
+            object_long_axis_world=(0.05, 0.0, 0.9987492178),
+        )
+
+        alignment = payload["source"]["top_down_yaw_alignment"]
+        self.assertEqual(alignment["mode"], "base_fixed")
+        self.assertEqual(alignment["reason"], "object_long_axis_nearly_vertical")
+        self.assertLess(
+            alignment["horizontal_projection_norm"],
+            alignment["minimum_horizontal_projection_for_alignment"],
+        )
+        for actual, expected in zip(
+            payload["poses"]["grasp"]["quaternion_wxyz"],
+            TCP_TOP_DOWN_QUAT_BASE_WXYZ,
+        ):
+            self.assertAlmostEqual(actual, float(expected), places=14)
 
     def test_arm_place_target_aligns_object_center_not_tcp_to_task_xyz(self) -> None:
         payload = build_arm_place_target_payload(
@@ -1000,6 +1364,62 @@ class FullPhysicsManipulationTest(unittest.TestCase):
 
             with self.assertRaisesRegex(RuntimeError, "禁止 lift_object"):
                 planner.plan_pick(_state(), None)  # type: ignore[arg-type]
+
+    def test_current_state_planner_accepts_vertical_lift_for_top_down_pick(self) -> None:
+        class FakeCurrentStateSimulation:
+            def export_current_curobo_pick_inputs(self, *, output_dir, episode_spec, state):
+                del episode_spec, state
+                output_path = Path(output_dir)
+                output_path.mkdir(parents=True, exist_ok=True)
+                state_json = output_path / "pick_state.json"
+                target_json = output_path / "pick_target.json"
+                state_json.write_text("{}", encoding="utf-8")
+                target_json.write_text("{}", encoding="utf-8")
+                return {
+                    "state_json": state_json,
+                    "target_json": target_json,
+                    "object_prim_path": "/World/cola",
+                    "pick_target": {
+                        "source": {"grasp_mode": "top_down"},
+                    },
+                }
+
+        def lift_runner(task):
+            payload = _pick_payload()
+            payload["grasp_mode"] = "top_down"
+            payload["segments"][-2] = _motion_segment(
+                "lift_object",
+                [
+                    (0.2, 0.21, 0.22, 0.23, 0.24, 0.25),
+                    (0.3, 0.31, 0.32, 0.33, 0.34, 0.35),
+                ],
+            )
+            Path(task.plan_json).write_text(json.dumps(payload), encoding="utf-8")
+            return payload
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            planner = CurrentStateCuroboPlanner(
+                simulation=FakeCurrentStateSimulation(),
+                config=CurrentStateCuroboPlannerConfig(
+                    output_dir=root / "online",
+                    project_root=root,
+                    place_plan_json=None,
+                    use_planner_server=False,
+                ),
+                plan_runner=lift_runner,
+            )
+
+            plan = planner.plan_pick(_state(), None)  # type: ignore[arg-type]
+
+        self.assertEqual(
+            plan.metadata["current_state_pick_strategy"]["expected"],
+            "vertical_lift_after_top_down_grasp",
+        )
+        self.assertEqual(
+            plan.metadata["current_state_pick_strategy"]["grasp_mode"],
+            "top_down",
+        )
 
 
 def _drain_executor(executor: SegmentedArmExecutor):

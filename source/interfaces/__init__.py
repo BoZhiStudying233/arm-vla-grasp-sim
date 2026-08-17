@@ -3,6 +3,7 @@
 from .manipulation import ArmExecutor, ArmPlan, GripperController, ManipulationPlanner
 from .navigation import NavExecutor, NavGoal, NavPlan, NavPlanner
 from .recording import EpisodeRecorder, StepRecord
+from .evaluation import SemanticRoutePolicy
 from .simulation import RobotAction, SimulationRuntime, SimulationState
 from .task import EpisodeSpec, TaskProvider
 from .verification import EpisodeVerifier, VerificationResult
@@ -20,6 +21,7 @@ __all__ = [
     "NavPlan",
     "NavPlanner",
     "RobotAction",
+    "SemanticRoutePolicy",
     "SimulationRuntime",
     "SimulationState",
     "StepRecord",

@@ -1,179 +1,113 @@
-# Go2-X5 Script Layout
+# PCT Scene 脚本入口
 
-This repository now keeps only the full-physics nav-pick-place pipeline and its
-supporting tools.  The old Script Editor/video-baseline handoff scripts have
-been removed from this branch.
+日常部署、完整 CLI 表、数据 schema 和资产清单以根目录
+[`README.md`](../README.md) 为准。当前只维护以下入口：
 
-Current maintained entrypoints:
+1. `pipeline/run_full_physics_pipeline.py`：单 episode、GUI 和各类 smoke。
+2. `pipeline/run_full_physics_batch.py`：独立 Isaac 子进程的 headless batch 与统一 LeRobot 物化。
+3. `pipeline/preflight_full_physics.py`：不启动仿真的资产/runtime 检查。
+4. `pipeline/validate_lerobot_episode.py`：单 episode 或统一 LeRobot v2.2 数据集检查。
+5. `pipeline/validate_full_pipeline_acceptance.py`：状态机、物理来源、数据与视频联合验收。
+6. `navigation/probe_pct_plan.py`：不启动 Isaac 的 PCT 路径检查。
+7. `curobo/03_plan_grasp_trajectory.py` 与 `curobo/grasp_planner_server.py`：CuRobo one-shot 和常驻规划服务。
 
-1. `pipeline/run_full_physics_pipeline.py` for one episode.
-2. `pipeline/run_full_physics_batch.py` for automation.
-3. `pipeline/validate_lerobot_episode.py` for exported data checks.
-4. `curobo/03_plan_grasp_trajectory.py` for cuRobo one-shot planning fallback.
-5. `curobo/grasp_planner_server.py` for persistent online planning.
-
-Setup, inspection, FK checks, and single-purpose diagnostics live under
-`dev_tools/` so they do not look like required demo steps.
-
-## Full-physics refactor
-
-The experimental single-process pipeline starts at:
+## 场景选择
 
 ```bash
-/data/conda_envs/isaacsim51_3dgs_grasp/bin/python \
-  scripts/pipeline/run_full_physics_pipeline.py \
-  --task-json tasks/nav_pick_place_apple_contact.json \
-  --output-dir outputs/full_physics_dry_run \
-  --num-episodes 1 \
+export ISAAC_PYTHON=/data/conda_envs/isaacsim51_3dgs_grasp/bin/python
+
+$ISAAC_PYTHON -B scripts/pipeline/run_full_physics_pipeline.py \
+  --list-scene-profiles
+
+$ISAAC_PYTHON -B scripts/pipeline/run_full_physics_pipeline.py \
+  --scene-profile liangzhu --check-scene-assets
+
+$ISAAC_PYTHON -B scripts/pipeline/run_full_physics_pipeline.py \
+  --scene-profile multi_floor --check-scene-assets
+```
+
+- `liangzhu`：从 box1 拿起可乐并放到 box2；PCT identity 坐标，默认联合随机化。
+- `multi_floor`：别墅 F1 到 F2 苹果搬运；保留楼梯锚点、阶段相机和原 locomotion 逻辑。
+
+默认只采集 `front` 和 `wrist` 训练相机，不制作展示视频。需要 overview 训练视角
+和 `composite` 展示视频时显式传 `--overview`；composite 中 overview 位于左侧
+2/3，front 和 wrist 分别在右上/右下，三路来自同一 simulation step，默认
+1280×720、25 fps。
+
+## 良渚随机化
+
+`tasks/liangzhu_placement_target.json` 是 box1 → box2 标注和随机化的单一来源。
+`liangzhu_box_pair_xy_v1` 使用 seed 同步采样：
+
+- box1/box2 authored XY 各加 `±0.12m`，其他 transform 不变；
+- 机器人在两桌中间生成，yaw 为 `[-180°, 180°]`；
+- 可乐在 box1 中央安全区采样 XY/yaw，放置区跟随 box2；
+- pick standoff 为 `0.50..0.54m`，place standoff 为 `0.48..0.51m`；
+- robot/object/boxes、CuRobo proxy、PCT/DWA keepout、base goal 和 metadata 使用同一份样本。
+
+当前不随机光照、材质或相机。控制使用 live Mesh/PhysX 真值，RGB 为训练数据记录。
+
+## 常用命令
+
+良渚单条 headless：
+
+```bash
+$ISAAC_PYTHON -B scripts/pipeline/run_full_physics_pipeline.py \
+  --scene-profile liangzhu \
+  --output-dir /mnt/sage_data/outputs/pct_scene/liangzhu_single_seed0 \
   --seed 0 \
-  --dry-run
+  --headless
 ```
 
-The dependency-free control-flow dry run always sets
-`pure_physics_success=false`; legacy video-baseline paths are not maintained in this branch.
-
-Episode-level pick/place XY randomization is enabled by default. Use
-`--no-randomize-task` when reproducing the validated fixed task:
+良渚 20 条 batch：
 
 ```bash
-/data/conda_envs/isaacsim51_3dgs_grasp/bin/python \
-  scripts/pipeline/run_full_physics_pipeline.py \
-  --task-json tasks/nav_pick_place_apple_contact.json \
-  --output-dir outputs/full_physics_randomized_dry_run \
-  --num-episodes 3 \
-  --seed 100 \
-  --randomize-task \
-  --show-randomization-debug \
-  --dry-run
+$ISAAC_PYTHON -B scripts/pipeline/run_full_physics_batch.py \
+  --scene-profile liangzhu \
+  --output-dir /mnt/sage_data/outputs/pct_scene/liangzhu_batch_seed0_n20 \
+  --num-episodes 20 \
+  --seed 0
 ```
 
-`--show-randomization-debug` defaults to off. In a real GUI run it creates
-green pick and blue place region guides plus sampled-position markers; these
-display prims use the viewport-visible default USD purpose and have no
-collision or rigid-body API. Seeds advance as `seed + episode_index`.
-
-Real Isaac modes are intentionally one episode per process in
-`run_full_physics_pipeline.py`. Use the batch launcher below for automation; it
-starts one child process per episode so each run still owns exactly one Isaac
-World lifecycle:
+别墅单条 GUI：
 
 ```bash
-PYTHONDONTWRITEBYTECODE=1 /data/conda_envs/isaacsim51_3dgs_grasp/bin/python -B \
-  scripts/pipeline/run_full_physics_batch.py \
-  --task-json tasks/nav_pick_place_apple_contact.json \
-  --output-dir /tmp/full_physics_random_batch \
-  --num-episodes 3 \
-  --seed 100
-```
-
-The batch launcher writes per-run summaries under
-`episode_000000/episode_000000/summary.json` and a top-level
-`batch_summary.jsonl`.
-
-`--simulation-smoke` intentionally exits immediately after stage build and
-episode reset. Add `--keep-window-open --no-headless` when the purpose is to
-inspect the generated stage or randomization guides. The runtime pauses before
-the GUI hold loop, so this option does not introduce a second physics loop.
-
-The second-stage real scene/reset smoke check is:
-
-```bash
-/data/conda_envs/isaacsim51_3dgs_grasp/bin/python \
-  scripts/pipeline/run_full_physics_pipeline.py \
-  --task-json tasks/nav_pick_place_apple_contact.json \
-  --output-dir outputs/full_physics_simulation_smoke \
-  --simulation-smoke
-```
-
-`--simulation-smoke` launches Isaac Sim, opens one Stage, creates one World,
-checks the robot, collision scene, task object, and camera, then performs one
-episode reset. It does not invoke navigation, cuRobo, or arm control, and it
-never reports `pure_physics_success=true`.
-
-The third-stage physical navigation smoke check is:
-
-```bash
-/data/conda_envs/isaacsim51_3dgs_grasp/bin/python \
-  scripts/pipeline/run_full_physics_pipeline.py \
-  --task-json tasks/nav_smoke_example.json \
-  --output-dir outputs/full_physics_navigation_smoke \
-  --seed 31 \
-  --navigation-smoke
-```
-
-`--navigation-smoke` launches Isaac Lab, loads the locomotion policy, plans an
-A* route, and lets the pipeline drive DWA velocity commands one tick at a time.
-It exits after `nav_to_pick_success`, so it validates physical navigation
-without claiming full pick/place or `pure_physics_success`. Navigation handoff
-matches the latest video baseline: success requires base XY to enter the
-position tolerance; yaw and base velocity are recorded for diagnostics but do
-not reject the episode because the arm planner can absorb remaining yaw error.
-
-The full online nav-pick-place physics check is:
-
-```bash
-PYTHONDONTWRITEBYTECODE=1 /data/conda_envs/isaacsim51_3dgs_grasp/bin/python -B \
-  scripts/pipeline/run_full_physics_pipeline.py \
-  --task-json tasks/nav_pick_place_apple_contact.json \
-  --output-dir /tmp/full_physics_online_place_gui \
-  --seed 100 \
-  --show-randomization-debug \
+$ISAAC_PYTHON -B scripts/pipeline/run_full_physics_pipeline.py \
+  --scene-profile multi_floor \
+  --output-dir /mnt/sage_data/outputs/pct_scene/multi_floor_gui \
   --no-headless \
   --keep-window-open
 ```
 
-Full physics is the default mode. It uses one IsaacLab stage/runtime for nav-to-pick, online
-current-state cuRobo pick planning, physical pick execution, closed-gripper
-carry navigation, online current-state cuRobo place planning, physical place
-execution, and LeRobot export. It does not accept `--pick-plan-json` or
-`--place-plan-json`; those offline plan files are only for
-`--manipulation-apply-smoke`.
+batch 默认 headless，每条使用 `seed + episode_index`，失败条保留诊断；只有最终
+验证和训练质量门同时通过的 episode 会进入 `<output-dir>/lerobot_dataset`。
 
-Mechanical-arm execution locks the floating base root pose and support joints
-by default because the current locomotion policy was not trained for large
-arm-induced center of mass changes. These stable defaults are fixed in
-`FullPhysicsConfig` rather than exposed as production CLI switches. The lock
-applies only in manipulation and terminal hold phases; navigation remains physically driven.
-Any lock use is recorded as `used_manipulation_base_lock=true` and
-`used_manipulation_support_joint_lock=true`, so successful default runs report
-`stable_physics_success=true` and `pure_physics_success=false`.
-
-Full-physics data recording follows `/home/light/workspace/DWA`:
-
-- physics `dt=0.0025` (400 Hz in the current DWA source), control 50 Hz;
-- `RecordingSettings.dataset_fps` defaults to 5 Hz and samples on a fixed
-  dataset-time grid; it can be changed to 10/15 Hz without changing physics;
-- `480x640` RGB JPEG at quality 90, named `camera0_00000.jpg`;
-- raw files: `data.csv`, `samples.jsonl`, and optionally `images/<camera>/`;
-- LeRobot v2.1 files: `data/chunk-*/*.parquet`,
-  `videos/chunk-*/observation.images.<camera>/*.mp4`, and `meta/*`.
-
-The raw `data.csv` keeps DWA's 17-dimensional robot state and measured base
-velocity columns. `samples.jsonl` adds synchronized object state, TCP
-quaternion, pipeline phase, and the trainable 10-dimensional command vector:
-base command 3 + arm joint targets 6 + two gripper joint targets. The LeRobot
-`action` feature uses this 11-dimensional high-level command vector. Parquet
-also stores body-frame `observation.base_velocity=[vx,vy,wz]` and
-`pipeline_state`; image features remain video-backed and are declared in
-`meta/info.json`.
-
-Batch episode files are written directly under
-`<output-dir>/episode_000000/`, `<output-dir>/episode_000001/`, and so on.
-There is no second nested `episode_000000` directory. Batch runs merge all
-successful episodes into `<output-dir>/lerobot_dataset`.
-The merger only uses successful episodes from the current batch invocation, so
-an existing output directory cannot silently inject older episodes.
-Existing raw episodes can be converted again without rerunning simulation:
+校验统一数据集：
 
 ```bash
-/data/conda_envs/isaacsim51_3dgs_grasp/bin/python -m source.data.lerobot_converter \
-  --episodes-root outputs/full_physics_batch
+$ISAAC_PYTHON -B scripts/pipeline/validate_lerobot_episode.py \
+  --dataset-root /mnt/sage_data/outputs/pct_scene/liangzhu_batch_seed0_n20/lerobot_dataset
 ```
 
-Validate either a single episode or the unified dataset:
+## 视觉模式限制
+
+headless 三相机量产当前使用 `collision`。在已验证的 8 GB RTX 4060 Laptop、
+Isaac Sim 5.1 环境中，良渚 `full` Gaussian/NUREC 能加载并启动 PhysX，但首帧
+headless 三相机渲染会触发 `cudaErrorIllegalAddress (700)`。这是渲染路径问题，
+不是 CUDA 设备不可用。GUI 视觉调试可显式使用：
 
 ```bash
-/data/conda_envs/isaacsim51_3dgs_grasp/bin/python \
-  scripts/pipeline/validate_lerobot_episode.py \
-  --dataset-root outputs/full_physics_batch/lerobot_dataset
+$ISAAC_PYTHON -B scripts/pipeline/run_full_physics_pipeline.py \
+  --scene-profile liangzhu \
+  --navigation-visual-mode full \
+  --no-record-dataset \
+  --no-record-video \
+  --no-headless \
+  --keep-window-open
 ```
+
+`--scene-light-mode auto` 是默认值：`full` 会自动启用所选 scene profile 的 USDA
+stage lights，`collision` 会自动使用相机补光；通常无需额外传
+`--scene-light-mode stage`，但仍可显式指定 `camera` 或 `stage` 覆盖。
+
+不要在无标记的情况下混合 collision 与 full 视觉数据。

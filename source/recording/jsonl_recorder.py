@@ -10,16 +10,41 @@ from typing import Any
 
 from source.interfaces import EpisodeSpec, SimulationState, StepRecord
 
+from .subtask_export import update_subtask_task_gate, write_subtask_task_stub
+from .subtask_segmentation import (
+    SUBTASK_DIRECTORY_LAYOUT,
+    SUBTASK_LABELS,
+    SUBTASK_SCHEMA_VERSION,
+    TASK_STAGES,
+    task_requests_subtask_segmentation,
+)
 from .lerobot_dataset import (
     ACTION_NAMES,
+    BASE_POSE_NAMES,
     BASE_VELOCITY_NAMES,
+    CONTROL_ACTION_SCHEMA,
     DwaEpisodeWriter,
     LeRobotRecordingConfig,
     OBJECT_STATE_NAMES,
     SCHEMA_VERSION,
     STATE_NAMES,
     TCP_POSE_NAMES,
+    VLA_TRAINING_ACTION_DIMENSION,
+    VLA_TRAINING_ACTION_NAMES,
+    VLA_TRAINING_ACTION_SCHEMA,
     materialize_lerobot_dataset,
+)
+from .training_action import (
+    VLA_TRAINING_ACTION_ALIGNMENT,
+    VLA_TRAINING_TERMINAL_ACTION,
+    physical_execution_success_verified,
+    task_requests_vla_training_action,
+    training_mesh_truth_manipulation_targets_verified,
+    training_gripper_symmetry_verified,
+    training_quality_success_verified,
+    training_receptacle_support_verified,
+    training_visual_source_verified,
+    training_wrist_camera_object_clearance_verified,
 )
 
 
@@ -59,34 +84,71 @@ class JsonlEpisodeRecorder:
         self._task_payload: dict[str, Any] = {}
         self._training_eligible = True
         self._training_eligibility_reason: str | None = None
+        self._performance_profiler: Any | None = None
         self.event_count = 0
         self.frame_count = 0
+        self.control_step_count = 0
+        self._last_logged_pipeline_state: str | None = None
 
     @property
     def output_dir(self) -> Path:
         return self._output_dir
 
+    def set_performance_profiler(self, profiler: Any | None) -> None:
+        self._performance_profiler = profiler
+        self._dataset_writer.set_performance_profiler(profiler)
+
     def save_task(self, episode_spec: EpisodeSpec) -> Path:
         payload = episode_spec.raw_task or asdict(episode_spec)
         self._task_payload = _json_safe(payload)
-        return self._write_json("task.json", payload)
+        path = self._write_json("task.json", payload)
+        if task_requests_subtask_segmentation(self._task_payload):
+            write_subtask_task_stub(
+                dataset_root=self.output_dir / "lerobot_dataset",
+                task=self._task_payload,
+                dataset_schema_version=SCHEMA_VERSION,
+            )
+        return path
 
     def record_event(self, event: dict[str, Any]) -> None:
         self._append_jsonl(self.events_path, event)
         self.event_count += 1
 
     def record_step(self, record: StepRecord) -> None:
-        sample_report = self._dataset_writer.record(record)
+        profiler = self._performance_profiler
+        if profiler is None:
+            sample_report = self._dataset_writer.record(record)
+        else:
+            with profiler.measure("recorder.dataset_record"):
+                sample_report = self._dataset_writer.record(record)
         metadata = dict(record.metadata)
         if sample_report is not None:
             metadata["dataset_sample"] = sample_report
+        state_changed = record.pipeline_state != self._last_logged_pipeline_state
+        self.control_step_count += 1
+        # Full-physics diagnostics follow the 5 Hz dataset grid and always keep
+        # state transitions.  Non-recording smoke/dry-run modes retain every tick.
+        should_log_frame = bool(
+            not self._lerobot_config.enabled
+            or sample_report is not None
+            or state_changed
+        )
+        self._last_logged_pipeline_state = record.pipeline_state
+        if not should_log_frame:
+            return
         payload = {
             "step_index": record.step_index,
             "timestamp": record.timestamp,
             "pipeline_state": record.pipeline_state,
-            "observation": _simulation_state_payload(record.observation),
+            "observation": _simulation_state_payload(
+                record.observation,
+                include_full_metadata=state_changed,
+            ),
             "action": _json_safe(record.action),
-            "post_step_observation": _simulation_state_payload(record.post_step_observation),
+            "post_step_observation": _simulation_state_payload(
+                record.post_step_observation,
+                include_full_metadata=state_changed,
+            ),
             "dataset_frame_index": (
                 sample_report.get("frame_index") if sample_report is not None else None
             ),
@@ -97,8 +159,15 @@ class JsonlEpisodeRecorder:
                 sample_report.get("video_features", {}) if sample_report is not None else {}
             ),
             "metadata": _json_safe(metadata),
+            "diagnostic_log_reason": (
+                "state_transition" if state_changed else "dataset_sample"
+            ),
         }
-        self._append_jsonl(self.frames_path, payload)
+        if profiler is None:
+            self._append_jsonl(self.frames_path, payload)
+        else:
+            with profiler.measure("recorder.frames_jsonl_write"):
+                self._append_jsonl(self.frames_path, payload)
         self.frame_count += 1
 
     def mark_training_eligible(self, eligible: bool, *, reason: str | None = None) -> None:
@@ -120,9 +189,21 @@ class JsonlEpisodeRecorder:
             )
         writer_report = self._dataset_writer.finalize()
         camera_keys = list(writer_report["camera_keys"])
+        vla_training_action_requested = task_requests_vla_training_action(
+            self._task_payload
+        )
+        subtask_segmentation_requested = task_requests_subtask_segmentation(
+            self._task_payload
+        )
+        action_names = (
+            VLA_TRAINING_ACTION_NAMES
+            if vla_training_action_requested
+            else ACTION_NAMES
+        )
         feature_keys = [
             "observation.state",
             "observation.base_velocity",
+            "observation.base_pose",
             "observation.object_state",
             "observation.tcp_pose",
             "pipeline_state",
@@ -135,6 +216,15 @@ class JsonlEpisodeRecorder:
             "task_index",
             *(f"observation.images.{key}" for key in camera_keys),
         ]
+        if vla_training_action_requested:
+            feature_keys.insert(feature_keys.index("next.done"), "control.action")
+        if subtask_segmentation_requested:
+            pipeline_state_index = feature_keys.index("pipeline_state") + 1
+            feature_keys[pipeline_state_index:pipeline_state_index] = [
+                "task_stage",
+                "subtask",
+                "subtask_segment_index",
+            ]
         raw_payload = {
             "schema_version": SCHEMA_VERSION,
             "recording_enabled": self._lerobot_config.enabled,
@@ -158,6 +248,22 @@ class JsonlEpisodeRecorder:
             "camera_keys_requested": list(self._lerobot_config.camera_keys),
             "camera_keys": camera_keys,
             "missing_camera_keys": writer_report["missing_camera_keys"],
+            "camera_capture_transient_missing_keys": writer_report[
+                "missing_camera_keys"
+            ],
+            "camera_state_synchronization": writer_report[
+                "camera_state_synchronization"
+            ],
+            "sampling_coverage": writer_report["sampling_coverage"],
+            "async_encoding_and_write": writer_report[
+                "async_encoding_and_write"
+            ],
+            "async_queue_size": writer_report["async_queue_size"],
+            "async_max_queue_depth": writer_report["async_max_queue_depth"],
+            "async_queue_block_seconds": writer_report[
+                "async_queue_block_seconds"
+            ],
+            "committed_frame_count": writer_report["committed_frame_count"],
             "video_paths": {
                 key: str(
                     self._dataset_writer.video_staging_root
@@ -168,9 +274,42 @@ class JsonlEpisodeRecorder:
             },
             "feature_keys": feature_keys,
             "observation_state_names": list(STATE_NAMES),
-            "action_names": list(ACTION_NAMES),
+            "action_names": list(action_names),
+            "control_action_schema": CONTROL_ACTION_SCHEMA,
+            "control_action_dimension": len(ACTION_NAMES),
+            "control_action_names": list(ACTION_NAMES),
+            "vla_training_action_schema": VLA_TRAINING_ACTION_SCHEMA,
+            "vla_training_action_dimension": VLA_TRAINING_ACTION_DIMENSION,
+            "vla_training_action_names": list(VLA_TRAINING_ACTION_NAMES),
+            "vla_training_action_requested": vla_training_action_requested,
+            "vla_training_action_available": False,
+            "vla_training_eligible": False,
+            "vla_training_ineligibility_reason": (
+                "training_action_10d_not_exported"
+                if vla_training_action_requested
+                else "task_does_not_request_vla_training_action"
+            ),
+            "training_action_alignment": VLA_TRAINING_ACTION_ALIGNMENT,
+            "training_action_horizon_frames": 1,
+            "training_action_terminal_action": VLA_TRAINING_TERMINAL_ACTION,
+            "training_action_base_pose_frame": "world",
+            "training_action_tcp_pose_frame": "base_frame",
+            "training_action_tcp_euler_order": "roll_pitch_yaw",
+            "training_action_position_unit": "m",
+            "training_action_angle_unit": "rad",
+            "training_action_gripper_range": [0.0, 1.0],
+            "subtask_segmentation_requested": subtask_segmentation_requested,
+            "subtask_segmentation_available": False,
+            "subtask_directory_export_available": False,
+            "subtask_schema_version": SUBTASK_SCHEMA_VERSION,
+            "subtask_directory_layout": SUBTASK_DIRECTORY_LAYOUT,
+            "task_stages": list(TASK_STAGES),
+            "subtask_labels": list(SUBTASK_LABELS),
+            "base_pose_names": list(BASE_POSE_NAMES),
+            "base_pose_frame": "world",
             "object_state_names": list(OBJECT_STATE_NAMES),
             "tcp_pose_names": list(TCP_POSE_NAMES),
+            "tcp_pose_frame": "world",
             "base_velocity_names": list(BASE_VELOCITY_NAMES),
             "task_index": 0,
             "task_text": str(
@@ -185,19 +324,27 @@ class JsonlEpisodeRecorder:
             "frequency_report": dict(self._dataset_writer.frequency_report),
             "source_frames": str(self.frames_path),
             "frame_count": self.frame_count,
+            "control_step_count": self.control_step_count,
             "num_frames": self._dataset_writer.frame_count,
-            "training_eligible": bool(self._training_eligible),
+            "episode_success_verified": bool(self._training_eligible),
+            "training_eligible": bool(
+                self._training_eligible
+                and self._lerobot_config.enabled
+                and self._dataset_writer.frame_count > 0
+                and writer_report["sampling_coverage"]["verified"] is True
+            ),
         }
         if not self._training_eligible:
-            return {
+            payload = {
                 **raw_payload,
                 "lerobot_exported": False,
                 "success": False,
                 "failure_reason": "episode_not_training_eligible",
                 "reason": self._training_eligibility_reason
                 or "episode_not_training_eligible",
-                "manifest_path": None,
             }
+            path = self._write_json("lerobot_manifest.json", payload)
+            return {**payload, "manifest_path": str(path)}
         if not self._lerobot_config.enabled:
             payload = {
                 **raw_payload,
@@ -209,6 +356,14 @@ class JsonlEpisodeRecorder:
                 **raw_payload,
                 "lerobot_exported": False,
                 "reason": "no_synchronized_front_camera_frames",
+            }
+        elif writer_report["sampling_coverage"]["verified"] is not True:
+            payload = {
+                **raw_payload,
+                "lerobot_exported": False,
+                "success": False,
+                "failure_reason": "episode_sampling_coverage_incomplete",
+                "reason": "episode_sampling_coverage_incomplete",
             }
         elif not self._lerobot_config.debug_per_episode_lerobot:
             # batch 模式可只保留原始 episode，结束后统一生成 dataset root。
@@ -240,29 +395,124 @@ class JsonlEpisodeRecorder:
                     "error": str(exc),
                 }
             payload = {**raw_payload, **conversion}
+        actual_camera_keys = set(payload.get("camera_keys") or ())
+        requested_camera_keys = set(raw_payload["camera_keys_requested"])
+        payload["camera_capture_transient_missing_keys"] = list(
+            raw_payload["camera_capture_transient_missing_keys"]
+        )
+        payload["missing_camera_keys"] = sorted(
+            requested_camera_keys - actual_camera_keys
+        )
+        export_ready = bool(payload.get("lerobot_exported"))
+        vla_action_available = bool(payload.get("vla_training_action_available"))
+        subtask_export_available = bool(
+            payload.get("subtask_directory_export_available")
+        )
+        training_eligible = bool(
+            raw_payload["training_eligible"]
+            and export_ready
+            and (
+                not vla_training_action_requested
+                or vla_action_available
+            )
+            and (
+                not subtask_segmentation_requested
+                or subtask_export_available
+            )
+        )
+        vla_training_eligible = bool(
+            training_eligible
+            and vla_training_action_requested
+            and vla_action_available
+        )
+        payload["episode_success_verified"] = bool(self._training_eligible)
+        payload["training_eligible"] = training_eligible
+        payload["vla_training_eligible"] = vla_training_eligible
+        if vla_training_eligible:
+            payload["vla_training_ineligibility_reason"] = None
+        elif vla_training_action_requested and not vla_action_available:
+            payload["vla_training_ineligibility_reason"] = (
+                "training_action_10d_not_exported"
+            )
+        elif vla_training_action_requested and not self._training_eligible:
+            payload["vla_training_ineligibility_reason"] = (
+                self._training_eligibility_reason
+                or "episode_success_gate_not_verified"
+            )
+        elif subtask_segmentation_requested and not subtask_export_available:
+            payload["vla_training_ineligibility_reason"] = (
+                "subtask_directory_export_not_available"
+            )
         path = self._write_json("lerobot_manifest.json", payload)
         return {**payload, "manifest_path": str(path)}
 
     def close(self, summary: dict[str, Any]) -> Path:
         self._dataset_writer.finalize()
         success = bool(summary.get("success", False))
+        physical_success_verified = physical_execution_success_verified(summary)
+        training_quality_verified = training_quality_success_verified(summary)
         if not success:
             failure_reason = str(summary.get("failure_reason") or "episode_failed")
             self.mark_training_eligible(False, reason=failure_reason)
             self._remove_lerobot_artifacts()
+        elif not training_quality_verified:
+            if not physical_success_verified:
+                ineligibility_reason = "physical_execution_provenance_not_verified"
+            elif not training_visual_source_verified(summary):
+                ineligibility_reason = "vla_rgb_camera_capture_not_verified"
+            elif not training_receptacle_support_verified(summary):
+                ineligibility_reason = (
+                    "task_receptacle_support_runtime_not_verified"
+                )
+            elif not training_mesh_truth_manipulation_targets_verified(summary):
+                ineligibility_reason = (
+                    "mesh_truth_manipulation_targets_not_verified"
+                )
+            elif not training_wrist_camera_object_clearance_verified(summary):
+                ineligibility_reason = (
+                    "wrist_camera_object_clearance_not_verified"
+                )
+            elif not training_gripper_symmetry_verified(summary):
+                ineligibility_reason = "gripper_symmetry_not_verified"
+            else:  # pragma: no cover - 未来新增质量门禁的兜底。
+                ineligibility_reason = "training_quality_gate_not_verified"
+            self.mark_training_eligible(
+                False,
+                reason=ineligibility_reason,
+            )
+        existing_export = dict(summary.get("lerobot_export") or {})
+        if not training_quality_verified:
+            existing_export.update(
+                {
+                    "training_eligible": False,
+                    "vla_training_eligible": False,
+                    "episode_success_verified": False,
+                    "vla_training_ineligibility_reason": (
+                        self._training_eligibility_reason
+                        or "physical_execution_provenance_not_verified"
+                    ),
+                }
+            )
         payload = {
             **summary,
+            "lerobot_export": existing_export,
             "event_count": self.event_count,
             "frame_count": self.frame_count,
+            "control_step_count": self.control_step_count,
             "data_output_path": str(self.output_dir),
-            "lerobot_training_eligible": success,
-            "lerobot_export_skipped": not success,
+            "lerobot_training_eligible": bool(
+                training_quality_verified
+                and existing_export.get("training_eligible")
+            ),
+            "lerobot_export_skipped": not bool(
+                existing_export.get("lerobot_exported")
+            ),
+            "training_quality_gate_passed": training_quality_verified,
         }
         if not success:
             payload["lerobot_export_skip_reason"] = (
                 self._training_eligibility_reason or "episode_failed"
             )
-            existing_export = dict(payload.get("lerobot_export") or {})
             payload["lerobot_export"] = {
                 **existing_export,
                 "lerobot_exported": False,
@@ -277,7 +527,132 @@ class JsonlEpisodeRecorder:
                 payload["lerobot_export"]["original_reason"] = existing_export.get(
                     "reason"
                 )
+        elif not training_quality_verified:
+            payload["lerobot_export_skip_reason"] = (
+                self._training_eligibility_reason
+                or "physical_execution_provenance_not_verified"
+            )
+            gate_eligible = False
+            gate_reason = payload["lerobot_export_skip_reason"]
+            self._write_export_training_gate(
+                eligible=False,
+                reason=gate_reason,
+            )
+        else:
+            gate_eligible = bool(payload["lerobot_training_eligible"])
+            gate_reason = (
+                None
+                if gate_eligible
+                else "lerobot_export_not_training_ready"
+            )
+            self._write_export_training_gate(
+                eligible=gate_eligible,
+                reason=gate_reason,
+            )
+        if success:
+            self._apply_export_training_gate(
+                payload["lerobot_export"],
+                eligible=gate_eligible,
+                reason=gate_reason,
+            )
         return self._write_json("summary.json", payload)
+
+    def _write_export_training_gate(
+        self,
+        *,
+        eligible: bool,
+        reason: str | None,
+    ) -> None:
+        """把最终物理证据门禁同步到 manifest 与 LeRobot info。"""
+
+        for path in (
+            self.output_dir / "lerobot_manifest.json",
+            self.output_dir / "lerobot_dataset/meta/info.json",
+            self.output_dir / "lerobot_dataset/validation_report.json",
+        ):
+            if not path.is_file():
+                continue
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict):
+                continue
+            self._apply_export_training_gate(
+                payload,
+                eligible=eligible,
+                reason=reason,
+            )
+            path.write_text(
+                json.dumps(_json_safe(payload), indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+        update_subtask_task_gate(
+            self.output_dir / "lerobot_dataset",
+            eligible=eligible,
+            reason=reason,
+        )
+
+    @classmethod
+    def _apply_export_training_gate(
+        cls,
+        payload: dict[str, Any],
+        *,
+        eligible: bool,
+        reason: str | None,
+    ) -> None:
+        """同步最终成功门禁，并修正导出阶段内嵌的预终态快照。"""
+
+        vla_available = bool(payload.get("vla_training_action_available"))
+        if not vla_available:
+            details = payload.get("details")
+            info = details.get("info") if isinstance(details, dict) else None
+            if isinstance(info, dict):
+                vla_available = bool(info.get("vla_training_action_available"))
+        vla_reason = (
+            None
+            if eligible and vla_available
+            else (
+                reason
+                or payload.get("vla_training_ineligibility_reason")
+                or "task_does_not_request_vla_training_action"
+            )
+        )
+        gate = {
+            "episode_success_verified": bool(eligible),
+            "training_eligible": bool(eligible),
+            "vla_training_eligible": bool(eligible and vla_available),
+            "vla_training_ineligibility_reason": vla_reason,
+        }
+        payload.update(gate)
+        if "source_episode_success_verified" in payload:
+            payload["source_episode_success_verified"] = bool(eligible)
+
+        validation_report = payload.get("validation_report")
+        if isinstance(validation_report, dict):
+            cls._apply_export_training_gate(
+                validation_report,
+                eligible=eligible,
+                reason=reason,
+            )
+        details = payload.get("details")
+        info = details.get("info") if isinstance(details, dict) else None
+        if isinstance(info, dict):
+            info_vla_available = bool(info.get("vla_training_action_available"))
+            info_reason = (
+                None
+                if eligible and info_vla_available
+                else (
+                    reason
+                    or info.get("vla_training_ineligibility_reason")
+                    or "task_does_not_request_vla_training_action"
+                )
+            )
+            info.update(
+                {
+                    "episode_success_verified": bool(eligible),
+                    "training_eligible": bool(eligible),
+                    "vla_training_eligible": bool(eligible and info_vla_available),
+                    "vla_training_ineligibility_reason": info_reason,
+                }
+            )
 
     def _remove_lerobot_artifacts(self) -> None:
         """失败 episode 不留下 LeRobot manifest/dataset，避免被后续训练误收集。"""
@@ -288,6 +663,17 @@ class JsonlEpisodeRecorder:
         dataset_path = self.output_dir / "lerobot_dataset"
         if dataset_path.exists():
             shutil.rmtree(dataset_path)
+        if task_requests_subtask_segmentation(self._task_payload):
+            write_subtask_task_stub(
+                dataset_root=dataset_path,
+                task=self._task_payload,
+                dataset_schema_version=SCHEMA_VERSION,
+            )
+            update_subtask_task_gate(
+                dataset_path,
+                eligible=False,
+                reason=self._training_eligibility_reason or "episode_failed",
+            )
 
     def _write_json(self, name: str, payload: Any) -> Path:
         path = self.output_dir / name
@@ -304,7 +690,11 @@ class JsonlEpisodeRecorder:
             stream.write("\n")
 
 
-def _simulation_state_payload(state: SimulationState) -> dict[str, Any]:
+def _simulation_state_payload(
+    state: SimulationState,
+    *,
+    include_full_metadata: bool = True,
+) -> dict[str, Any]:
     """序列化数值状态，但只记录相机名称，避免把像素写入 frames.jsonl。"""
 
     return {
@@ -318,5 +708,36 @@ def _simulation_state_payload(state: SimulationState) -> dict[str, Any]:
         "object_pose": state.object_pose,
         "object_velocity": state.object_velocity,
         "camera_images": sorted(str(name) for name in state.camera_images),
-        "metadata": state.metadata,
+        "metadata": (
+            state.metadata
+            if include_full_metadata
+            else _compact_simulation_metadata(state.metadata)
+        ),
     }
+
+
+def _compact_simulation_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
+    """Keep per-tick values without repeating static stage/planner reports."""
+
+    keys = (
+        "physics_dt",
+        "control_dt",
+        "decimation",
+        "camera_render_interval_control_steps",
+        "camera_render_hz",
+        "camera_capture_report",
+        "environment_terminated",
+        "joint_names",
+        "base_pose_xyyaw",
+        "body_velocity",
+        "body_linear_velocity",
+        "last_action_source",
+        "used_base_teleport",
+        "used_direct_joint_state",
+        "used_object_teleport",
+        "used_kinematic_object_follow",
+        "used_visual_replay",
+        "used_manipulation_base_lock",
+        "used_manipulation_support_joint_lock",
+    )
+    return {key: metadata[key] for key in keys if key in metadata}
