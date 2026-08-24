@@ -447,7 +447,7 @@ def _require_command(command: str, *, label: str) -> None:
 
 
 def _resolve_ms_bin(configured_command: str) -> str:
-    """Resolve ModelScope CLI, including the base Conda env when one is active."""
+    """Resolve ms-hub CLI from PATH or active/base Conda environments."""
 
     configured_path = Path(configured_command).expanduser()
     if configured_path.parent != Path("."):
@@ -461,24 +461,71 @@ def _resolve_ms_bin(configured_command: str) -> str:
     if configured_command != "ms":
         raise RuntimeError(f"ModelScope CLI is not available on PATH: {configured_command}")
 
+    # Depending on the installed version, the console entry point can be named
+    # `ms`, `ms-hub`, or `modelscope`.
+    for alternative_name in ("ms-hub", "modelscope"):
+        alternative_command = shutil.which(alternative_name)
+        if alternative_command:
+            print(
+                f"ModelScope `ms` command was not on PATH; using {alternative_command}",
+                flush=True,
+            )
+            return alternative_command
+
     candidates: list[Path] = []
+    conda_prefix = os.environ.get("CONDA_PREFIX")
+    if conda_prefix:
+        conda_bin = Path(conda_prefix).expanduser() / "bin"
+        candidates.extend(
+            [conda_bin / "ms", conda_bin / "ms-hub", conda_bin / "modelscope"]
+        )
+
+    # Do not resolve this path first: a Conda environment's python executable
+    # may be a symlink to the base interpreter, while its CLI lives beside the
+    # symlink in the active environment's bin directory.
+    active_python_bin = Path(sys.executable).expanduser().parent
+    candidates.extend(
+        [
+            active_python_bin / "ms",
+            active_python_bin / "ms-hub",
+            active_python_bin / "modelscope",
+        ]
+    )
+
     conda_exe = os.environ.get("CONDA_EXE")
     if conda_exe:
-        candidates.append(Path(conda_exe).expanduser().resolve().parent / "ms")
+        conda_base_bin = Path(conda_exe).expanduser().resolve().parent
+        candidates.extend(
+            [
+                conda_base_bin / "ms",
+                conda_base_bin / "ms-hub",
+                conda_base_bin / "modelscope",
+            ]
+        )
 
     python_path = Path(sys.executable).resolve()
     if "envs" in python_path.parts:
         envs_index = python_path.parts.index("envs")
         conda_root = Path(*python_path.parts[:envs_index])
-        candidates.append(conda_root / "bin/ms")
+        candidates.extend(
+            [
+                conda_root / "bin/ms",
+                conda_root / "bin/ms-hub",
+                conda_root / "bin/modelscope",
+            ]
+        )
 
     candidates.extend(
         [
             Path.home() / "miniconda3/bin/ms",
+            Path.home() / "miniconda3/bin/ms-hub",
+            Path.home() / "miniconda3/bin/modelscope",
             Path.home() / "anaconda3/bin/ms",
+            Path.home() / "anaconda3/bin/ms-hub",
+            Path.home() / "anaconda3/bin/modelscope",
         ]
     )
-    for candidate in candidates:
+    for candidate in dict.fromkeys(candidates):
         if candidate.is_file() and os.access(candidate, os.X_OK):
             print(
                 f"ModelScope CLI was not on PATH; using {candidate}",
@@ -487,8 +534,9 @@ def _resolve_ms_bin(configured_command: str) -> str:
             return str(candidate)
 
     raise RuntimeError(
-        "ModelScope CLI is not available on PATH and was not found in the base "
-        "Conda environment; install/login with ModelScope or pass --ms-bin"
+        "ModelScope CLI (`ms`, `ms-hub`, or `modelscope`) is not available on PATH "
+        "and was not found in the active/base Conda environments; pass --ms-bin "
+        "with the executable used for login"
     )
 
 
