@@ -1,0 +1,9 @@
+PYTHONDONTWRITEBYTECODE=1 "$ISAAC_PYTHON" -B \
+  scripts/pipeline/run_full_physics_batch.py \
+  --scene-profile liangzhu \
+  --output-dir "$PCT_SCENE_OUTPUT/liangzhu_0729_n200" \
+  --num-episodes 200 \
+  --seed 729 \
+  --headless \
+  --navigation-visual-mode full \
+  --continue-on-failure
