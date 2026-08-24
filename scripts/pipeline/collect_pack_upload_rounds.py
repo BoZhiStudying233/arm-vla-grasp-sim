@@ -19,6 +19,7 @@ from urllib.parse import urlparse
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 BATCH_ENTRY = PROJECT_ROOT / "scripts/pipeline/run_full_physics_batch.py"
 DEFAULT_COMMIT_MESSAGE = "原始随机化方式"
+DEFAULT_ESTIMATED_GIB_PER_EPISODE = 0.06
 GIB = 1024**3
 
 
@@ -159,7 +160,8 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "用于估算单条数据大小的既有完整批次目录；默认从 output-root 中的"
-            "无视频完整批次里选择单条占用最大的参考。"
+            "无视频完整批次里选择单条占用最大的参考；找不到时"
+            f"回退为 {DEFAULT_ESTIMATED_GIB_PER_EPISODE:.2f} GiB/条。"
         ),
     )
     space_source_group.add_argument(
@@ -329,9 +331,9 @@ def _directory_size_bytes(path: Path) -> int:
         raise RuntimeError(f"unexpected du output for {path}: {result.stdout!r}") from error
 
 
-def _find_space_reference(output_root: Path) -> tuple[Path, BatchStats]:
+def _find_space_reference(output_root: Path) -> tuple[Path, BatchStats] | None:
     candidates: list[tuple[float, Path, BatchStats]] = []
-    for summary_path in output_root.glob("*/batch_summary.jsonl"):
+    for summary_path in output_root.rglob("batch_summary.jsonl"):
         try:
             stats = _infer_batch_stats(summary_path)
         except (
@@ -355,11 +357,7 @@ def _find_space_reference(output_root: Path) -> tuple[Path, BatchStats]:
         bytes_per_episode = _directory_size_bytes(reference) / stats.attempted
         candidates.append((bytes_per_episode, reference, stats))
     if not candidates:
-        raise RuntimeError(
-            "cannot estimate disk usage: no compatible complete video-free batch was "
-            "found under "
-            f"{output_root}; pass --space-reference or --estimated-gib-per-episode"
-        )
+        return None
     # Use the largest observed per-episode footprint among compatible runs so
     # one unusually short episode cannot make the preflight optimistic.
     _, path, stats = max(candidates, key=lambda item: (item[0], str(item[1])))
@@ -380,7 +378,15 @@ def _estimate_episode_bytes(args: argparse.Namespace, output_root: Path) -> tupl
             raise RuntimeError(f"space reference is not a directory: {reference}")
         stats = _infer_batch_stats(summary_path)
     else:
-        reference, stats = _find_space_reference(output_root)
+        discovered_reference = _find_space_reference(output_root)
+        if discovered_reference is None:
+            return (
+                DEFAULT_ESTIMATED_GIB_PER_EPISODE * GIB,
+                "built-in conservative fallback "
+                f"({DEFAULT_ESTIMATED_GIB_PER_EPISODE:.2f} GiB/episode; no compatible "
+                f"complete video-free batch found under {output_root})",
+            )
+        reference, stats = discovered_reference
 
     size_bytes = _directory_size_bytes(reference)
     return size_bytes / stats.attempted, str(reference)
